@@ -346,8 +346,6 @@ def shard_args(devices: Sequence[xb.xla_client.Device],
 
 
 shard_arg_handlers: Dict[Any, Callable[[Any, Any, Any], Sequence[Any]]] = {}
-shard_arg_handlers[core.Unit] = \
-    lambda x, devices, _: device_put(core.unit, devices, replicate=True)
 def _shard_array(x, devices, indices):
   return device_put([x[i] for i in indices], devices)
 for _t in array_types:
@@ -397,7 +395,6 @@ def shard_aval(size, axis: int, aval):
   except KeyError as err:
     raise TypeError(f"No shard_aval handler for type: {type(aval)}") from err
 shard_aval_handlers: Dict[Type[core.AbstractValue], Callable[[int, int, Any], Any]] = {}
-shard_aval_handlers[core.AbstractUnit] = lambda size, axis, x: x
 def _shard_abstract_array(size, axis: int, x):
   try:
     if x.shape[axis] != size:
@@ -434,7 +431,6 @@ def aval_to_result_handler(sharding_spec: Optional[ShardingSpec],
 
 PxlaResultHandler = Callable[..., Callable[[List[xb.xla_client.Buffer]], Any]]
 pxla_result_handlers: Dict[Type[core.AbstractValue], PxlaResultHandler] = {}
-pxla_result_handlers[core.AbstractUnit] = lambda *_: lambda _: core.unit
 def array_result_handler(sharding_spec, indices, aval: ShapedArray):
   return lambda bufs: make_sharded_device_array(aval, sharding_spec, bufs,
                                                 indices)
@@ -959,7 +955,6 @@ def parallel_callable(fun: lu.WrappedFun,
   input_sharding_specs = [
       _pmap_sharding_spec(num_local_replicas, axis_size, local_num_partitions,
                           parts, aval, in_axis)
-      if aval is not core.abstract_unit else None
       for aval, parts, in_axis in safe_zip(sharded_avals, local_arg_parts_, in_axes)]
   input_indices = [spec_to_indices(aval.shape, spec)
                    if spec is not None else None
@@ -979,7 +974,6 @@ def parallel_callable(fun: lu.WrappedFun,
 
   out_specs = [_pmap_sharding_spec(num_local_replicas, axis_size, local_num_partitions,
                                     parts, aval, out_axis)
-               if aval is not core.abstract_unit else None
                for parts, aval, out_axis in safe_zip(local_out_parts, local_out_avals, out_axes)]
   handle_outs = avals_to_results_handler(
       num_local_replicas, local_num_partitions, out_specs, local_unmapped_avals)
@@ -1094,8 +1088,6 @@ def get_num_partitions(*partitions):
 
 def get_global_aval(local_aval, global_parts: PartitionsOrReplicated,
                     local_parts: PartitionsOrReplicated):
-  if local_aval is core.abstract_unit:
-    return local_aval
   if global_parts is None:
     return local_aval
   assert local_parts is not None
@@ -1107,8 +1099,6 @@ def get_global_aval(local_aval, global_parts: PartitionsOrReplicated,
 
 def get_local_aval(global_aval, global_parts: PartitionsOrReplicated,
                    local_parts: PartitionsOrReplicated):
-  if global_aval is core.abstract_unit:
-    return global_aval
   if global_parts is None:
     return global_aval
   assert local_parts is not None
@@ -1151,7 +1141,6 @@ class ResultsHandler:
 
 def avals_to_results_handler(nrep, npart, out_specs, unmapped_local_out_avals):
   out_indices = [spec_to_indices(aval.shape, spec)
-                 if aval is not core.abstract_unit else None
                  for aval, spec in safe_zip(unmapped_local_out_avals, out_specs)]  # pytype: disable=attribute-error
   handlers = [aval_to_result_handler(spec, idcs, aval)
               for spec, idcs, aval in safe_zip(out_specs, out_indices, unmapped_local_out_avals)]
@@ -1308,9 +1297,7 @@ xla.call_translations[xla_pmap_p] = _pmap_translation_rule
 ad.primitive_transposes[xla_pmap_p] = partial(ad.map_transpose, xla_pmap_p)
 
 def _xla_shard(c, aval, axis_env, x, in_axis):
-  if aval is core.abstract_unit:
-    return x
-  elif aval is core.abstract_token:
+  if aval is core.abstract_token:
     return x
   elif isinstance(aval, ShapedArray):
     dims = list(c.get_shape(x).dimensions())
@@ -1327,9 +1314,7 @@ def _xla_shard(c, aval, axis_env, x, in_axis):
 
 # TODO(b/110096942): more efficient gather
 def _xla_unshard(c, aval, axis_env, out_axis, x, backend):
-  if aval is core.abstract_unit:
-    return x
-  elif aval is core.abstract_token:
+  if aval is core.abstract_token:
     return x
   elif isinstance(aval, ShapedArray):
     # TODO(mattjj): remove this logic when AllReduce PRED supported on CPU / GPU
@@ -1479,8 +1464,6 @@ class Mesh:
 def tile_aval_nd(axis_sizes, in_axes: ArrayMapping, aval, tiling_sizes=None):
   if tiling_sizes is None:
     tiling_sizes = axis_sizes
-  if aval is core.abstract_unit:
-    return aval
   assert isinstance(aval, ShapedArray)
   shape = list(aval.shape)
   named_shape = dict(aval.named_shape)
@@ -1492,8 +1475,6 @@ def tile_aval_nd(axis_sizes, in_axes: ArrayMapping, aval, tiling_sizes=None):
   return aval.update(shape=tuple(shape), named_shape=named_shape)
 
 def untile_aval_nd(axis_sizes, out_axes: ArrayMapping, aval):
-  if aval is core.abstract_unit:
-    return aval
   assert isinstance(aval, ShapedArray)
   shape = list(aval.shape)
   named_shape = dict(aval.named_shape)
@@ -1599,7 +1580,6 @@ def lower_mesh_computation(
     replicated_args = [False] * len(in_jaxpr_avals)
     global_sharding_spec = mesh_sharding_specs(global_axis_sizes, mesh.axis_names)
     in_partitions = [global_sharding_spec(aval, aval_in_axes).sharding_proto()
-                     if aval is not core.abstract_unit else None
                      for aval, aval_in_axes in safe_zip(global_in_untiled_avals, in_axes)]
     out_partitions = [global_sharding_spec(aval, aval_out_axes).sharding_proto()
                       for aval, aval_out_axes in safe_zip(global_out_untiled_avals, out_axes)]
@@ -1695,7 +1675,6 @@ class MeshExecutable:
 
     local_sharding_spec = mesh_sharding_specs(local_axis_sizes, mesh.axis_names)
     local_input_specs = [local_sharding_spec(aval, aval_in_axes)
-                         if aval is not core.abstract_unit else None
                          for aval, aval_in_axes in safe_zip(local_in_untiled_avals, in_axes)]
     input_indices = [spec_to_indices(aval.shape, spec)
                      if spec is not None else None

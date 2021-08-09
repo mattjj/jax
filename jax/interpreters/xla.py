@@ -86,13 +86,6 @@ def identity(x): return x
 
 _scalar_types = dtypes.python_scalar_dtypes.keys()
 
-# unit representation
-def _make_unit_constant(c): return xb.constant_general(c, np.zeros((), dtype=np.dtype('bool')))
-def _make_unit_shape(_): return (xc.Shape.array_shape(np.dtype('bool'), ()),)
-def _device_put_unit(_, device):
-  backend = xb.get_device_backend(device)
-  return (backend.buffer_from_pyval(np.zeros((), dtype=np.dtype('bool')),
-                                    device),)
 def _make_array_shape(a):
   if a.dtype is dtypes.float0:
     return (xc.Shape.array_shape(np.dtype('bool'), a.shape),)
@@ -123,8 +116,6 @@ def make_op_metadata(primitive: core.Primitive,
 
 ### handlers
 
-xb.register_constant_handler(core.Unit, lambda c, *_: _make_unit_constant(c))
-
 def aval_to_xla_shapes(aval):
   try:
     return xla_shape_handlers[type(aval)](aval)
@@ -132,7 +123,6 @@ def aval_to_xla_shapes(aval):
     raise TypeError(f"No xla_shape_handler for type: {type(aval)}") from err
 
 xla_shape_handlers: Dict[Type[core.AbstractValue], Callable] = {
-    core.AbstractUnit: _make_unit_shape,
     ShapedArray: _make_array_shape,
     ConcreteArray: _make_array_shape,
 }
@@ -150,7 +140,6 @@ def array_result_handler(device: Optional[Device], aval: core.ShapedArray):
 
 
 xla_result_handlers: Dict[Type[core.AbstractValue], Callable[..., Callable]] = {
-    core.AbstractUnit: lambda _, __: lambda _: core.unit,
     ShapedArray: array_result_handler,
     ConcreteArray: array_result_handler,
 }
@@ -171,9 +160,7 @@ def _device_put_array(x, device: Optional[Device]):
 def _device_put_scalar(x, device):
   return _device_put_array(dtypes.coerce_to_array(x), device)
 
-device_put_handlers: Dict[Any, Callable[[Any, Optional[Device]], Tuple[Any]]] = {
-  core.Unit: _device_put_unit
-}
+device_put_handlers: Dict[Any, Callable[[Any, Optional[Device]], Tuple[Any]]] = {}
 device_put_handlers.update((t, _device_put_array) for t in array_types)
 device_put_handlers.update((t, _device_put_scalar) for t in _scalar_types)
 
@@ -196,7 +183,7 @@ def _canonicalize_python_scalar_dtype(typ, x):
   return np.asarray(
       x, dtypes.canonicalize_dtype(dtypes._scalar_type_to_dtype(typ, x)))
 
-canonicalize_dtype_handlers: Dict[Any, Callable] = {core.Unit: identity}
+canonicalize_dtype_handlers: Dict[Any, Callable] = {}
 canonicalize_dtype_handlers.update(
     (t, _canonicalize_ndarray_dtype) for t in array_types)
 canonicalize_dtype_handlers.update(
@@ -216,9 +203,7 @@ def abstractify(x) -> core.AbstractValue:
 def _make_abstract_python_scalar(typ, val):
   return ShapedArray((), dtypes._scalar_type_to_dtype(typ, val), weak_type=True)
 
-pytype_aval_mappings: Dict[Any, Callable[[Any], core.AbstractValue]] = {
-    core.Unit: lambda _: core.abstract_unit,
-}
+pytype_aval_mappings: Dict[Any, Callable[[Any], core.AbstractValue]] = {}
 pytype_aval_mappings.update((t, make_shaped_array) for t in array_types)
 pytype_aval_mappings.update(
     (t, partial(_make_abstract_python_scalar, t)) for t in _scalar_types)
@@ -466,7 +451,6 @@ def jaxpr_subcomp(c, jaxpr, backend, axis_env, consts, name_stack, *args):
     env[v] = node
 
   env = {}
-  _partitionmap(write, [core.unitvar], _make_unit_constant(c))
   _partitionmap(write, jaxpr.constvars, consts)
   _partitionmap(write, jaxpr.invars, args)
   for eqn in jaxpr.eqns:
@@ -983,7 +967,7 @@ def _execute_replicated(compiled: XlaExecutable, avals, handlers, kept_var_idx,
 
 def _execute_trivial(jaxpr, device: Optional[Device], consts, avals, handlers,
                      kept_var_idx, *args):
-  env = {core.unitvar: core.unit}
+  env = {}
   pruned_args = (x for i, x in enumerate(args) if i in kept_var_idx)
   map(env.setdefault, jaxpr.invars, pruned_args)
   map(env.setdefault, jaxpr.constvars, consts)
@@ -997,15 +981,15 @@ xla_call = xla_call_p.bind
 xla_call_p.def_impl(_xla_call_impl)
 
 def _xla_call_partial_eval_update_params(params, in_unknowns):
-  call_jaxpr = params['call_jaxpr']
-  donated_invars = params['donated_invars']
+  donated_invars, call_jaxpr = params['donated_invars'], params.get('call_jaxpr')
+  num_invars = len(call_jaxpr.invars) if call_jaxpr else sum(in_unknowns)
   if not in_unknowns and donated_invars:
     # JaxprTrace.post_process_call creates a call with no input tracers
-    new_donated_invars = (False,) * len(call_jaxpr.invars)
+    new_donated_invars = (False,) * num_invars
   else:
     # JaxprTrace.process_call drops known input tracers
     donated_invars = [d for d, uk in zip(donated_invars, in_unknowns) if uk]
-    new_donated_invars = ((False,) * (len(call_jaxpr.invars) - len(donated_invars))
+    new_donated_invars = ((False,) * (num_invars - len(donated_invars))
                           + tuple(donated_invars))
   return dict(params, donated_invars=new_donated_invars)
 pe.call_param_updaters[xla_call_p] = _xla_call_partial_eval_update_params

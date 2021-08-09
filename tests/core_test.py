@@ -18,6 +18,7 @@ from functools import partial
 import gc
 import itertools as it
 import operator
+from unittest import SkipTest
 
 import numpy as np
 from absl.testing import absltest
@@ -298,36 +299,36 @@ class CoreTest(jtu.JaxTestCase):
 
   def test_comparing_var(self):
     newsym = core.gensym()
-    a = newsym(core.abstract_unit)
-    b = newsym(core.abstract_unit)
-    c = newsym(core.abstract_unit)
+    a = newsym(ShapedArray((), np.dtype('float32')))
+    b = newsym(ShapedArray((), np.dtype('float32')))
+    c = newsym(ShapedArray((), np.dtype('float32')))
     assert a < b < c
     assert c > b > a
     assert a != b and b != c and a != c
 
   def test_var_ordering(self):
     newsym = core.gensym()
-    a = newsym(core.abstract_unit)
-    b = newsym(core.abstract_unit)
-    c = newsym(core.abstract_unit)
+    a = newsym(ShapedArray((), np.dtype('float32')))
+    b = newsym(ShapedArray((), np.dtype('float32')))
+    c = newsym(ShapedArray((), np.dtype('float32')))
     for ordering in it.permutations([a, b, c]):
       assert sorted(list(ordering)) == [a, b, c]
 
   def test_var_compared_by_identity(self):
-    a1 = core.gensym()(core.abstract_unit)
-    a2 = core.gensym()(core.abstract_unit)
+    a1 = core.gensym()(ShapedArray((), np.dtype('float32')))
+    a2 = core.gensym()(ShapedArray((), np.dtype('float32')))
     assert str(a1) == str(a2)
     assert a1 != a2
 
   def test_var_tree_flatten(self):
     newsym = core.gensym()
-    a, b, c, d = (
-        newsym(core.abstract_unit), newsym(core.abstract_unit),
-        newsym(core.abstract_unit), newsym(core.abstract_unit))
+    aval = ShapedArray((), np.dtype('float32'))
+    a, b, c, d = [newsym(aval) for _ in range(4)]
     syms = {c: d, a: b}
     assert 'bd' == ''.join(map(str, tree_leaves(syms)))
 
   def test_device_put_unit(self):
+    raise SkipTest("test obsoleted by removing units")
     def f(x, y):
       return x, 2 * y
     args_maker = lambda: (core.unit, 1)
@@ -442,6 +443,7 @@ class JaxprTypeChecks(jtu.JaxTestCase):
         lambda: core.check_jaxpr(jaxpr))
 
   def test_jaxpr_dropvar_from_jit_call(self):
+    raise SkipTest("test obsoleted by removing dropvars")
     def inner(x):
       return x + 1, x + 2
 
@@ -454,6 +456,7 @@ class JaxprTypeChecks(jtu.JaxTestCase):
     core.check_jaxpr(jaxpr)
 
   def test_jaxpr_dropvar_from_loop(self):
+    raise SkipTest("test obsoleted by removing dropvars")
     def f(x):
       _, y = lax.while_loop(lambda s: s[0] < 0.,
                             lambda s: (jnp.sin(s[0]), jnp.cos(s[1])),
@@ -465,6 +468,7 @@ class JaxprTypeChecks(jtu.JaxTestCase):
     core.check_jaxpr(jaxpr)
 
   def test_jaxpr_dropvar_from_cond(self):
+    raise SkipTest("test obsoleted by removing dropvars")
     def f(x):
       _, y = lax.cond(x < 0.,
                       lambda x: (jnp.sin(x), x + 1.),

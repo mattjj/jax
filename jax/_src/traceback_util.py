@@ -23,6 +23,7 @@ from jax._src import util
 _exclude_paths = [__file__, util.__file__]
 
 def register_exclusion(path):
+  return  # TODO remove
   _exclude_paths.append(path)
 
 _jax_message_append = (

@@ -15,8 +15,8 @@
 from typing import Any, Callable, Dict, Type
 
 from jax import core
-from jax.core import (lattice_join, Primitive, Unit, unit, AbstractUnit,
-                   valid_jaxtype, raise_to_shaped, get_aval)
+from jax.core import (lattice_join, Primitive, valid_jaxtype, raise_to_shaped,
+                      get_aval)
 from jax.tree_util import register_pytree_node
 from jax._src.util import safe_map
 
@@ -28,13 +28,9 @@ Array = Any
 map = safe_map
 
 jaxval_adders: Dict[type, Callable] = {}
-jaxval_adders[Unit] = lambda _, __: unit
 
 def add_jaxvals(x, y):
-  if core.get_aval(x) is core.abstract_unit is core.get_aval(y):
-    return core.unit
-  else:
-    return add_jaxvals_p.bind(x, y)
+  return add_jaxvals_p.bind(x, y)
 
 add_jaxvals_p: Primitive = Primitive('add_any')
 add_any_p = add_jaxvals_p
@@ -53,7 +49,6 @@ def zeros_like_aval(aval):
   return aval_zeros_likers[type(aval)](aval)
 
 aval_zeros_likers: Dict[Type[core.AbstractValue], Array] = {}
-aval_zeros_likers[AbstractUnit] = lambda _: unit
 
 def zeros_like_jaxval(val):
   return zeros_like_p.bind(val)

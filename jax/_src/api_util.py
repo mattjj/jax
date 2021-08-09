@@ -25,7 +25,6 @@ from .tree_util import (PyTreeDef, tree_flatten, tree_unflatten, tree_multimap,
 from .tree_util import _replace_nones
 from .. import linear_util as lu
 from .util import safe_map, WrapHashably, WrapKwArgs, Hashable
-from ..core import unit
 
 from . import traceback_util
 traceback_util.register_exclusion(__file__)
@@ -120,8 +119,8 @@ def flatten_fun_nokwargs2(in_tree, *args_flat):
 
 def argnums_partial(f, dyn_argnums, args):
   dyn_argnums = _ensure_index_tuple(dyn_argnums)
-  fixed_args = tuple(unit if i in dyn_argnums else wrap_hashably(arg)
-                     for i, arg in enumerate(args))
+  fixed_args = tuple(wrap_hashably(x) for i, x in enumerate(args)
+                     if i not in dyn_argnums)
   dyn_args = tuple(args[i] for i in dyn_argnums)
   return _argnums_partial(f, dyn_argnums, fixed_args), dyn_args
 
@@ -134,7 +133,7 @@ def argnums_partial_except(f: lu.WrappedFun, static_argnums: Tuple[int, ...],
   dyn_argnums = tuple(i for i in range(len(args)) if i not in static_argnums)
   dyn_args = tuple(args[i] for i in dyn_argnums)
 
-  fixed_args = [unit] * len(args)  # type: ignore
+  fixed_args = []
   for i in static_argnums:
     # TODO(shoyer): set allow_invalid=True permanently after enabling
     # static_argnames.
@@ -149,24 +148,27 @@ def argnums_partial_except(f: lu.WrappedFun, static_argnums: Tuple[int, ...],
           f"to unexpected cache-misses. Static argument (index {i}) of type "
           f"{type(static_arg)} for function {f.__name__} is non-hashable.")
     else:
-      fixed_args[i] = Hashable(static_arg)  # type: ignore
+      fixed_args.append(Hashable(static_arg))  # type: ignore
 
   return _argnums_partial(f, dyn_argnums, tuple(fixed_args)), dyn_args
 
 
 @lu.transformation
 def _argnums_partial(dyn_argnums, fixed_args, *dyn_args, **kwargs):
-  args = [None if arg is unit else arg.val for arg in fixed_args]
+  args = [None] * (len(fixed_args) + len(dyn_args))
   for i, arg in zip(dyn_argnums, dyn_args):
     args[i] = arg
+  fixed_args_ = iter(fixed_args)
+  args = [next(fixed_args_).val if x is None else x for x in args]
+  assert next(fixed_args_, None) is None
   ans = yield args, kwargs
   yield ans
 
 
 def argnames_partial(f, dyn_argnames, kwargs):
   dyn_argnames = _ensure_str_tuple(dyn_argnames)
-  fixed_kwargs = tuple((k, unit if k in dyn_argnames else wrap_hashably(v))
-                       for k, v in kwargs.items())
+  fixed_args = tuple((k, wrap_hashably(v)) for k, v in kwargs.items()
+                     if k in dyn_argnames)
   dyn_kwargs = {k: kwargs[k] for k in dyn_argnames}
   return _argnames_partial(f, WrapKwArgs(fixed_kwargs)), dyn_kwargs
 
@@ -179,9 +181,7 @@ def argnames_partial_except(f: lu.WrappedFun, static_argnames: Tuple[str, ...],
 
   fixed_kwargs: Dict[str, Any] = {}
   for k, arg in kwargs.items():
-    if k in dyn_kwargs:
-      fixed_kwargs[k] = unit
-    else:
+    if k not in dyn_kwargs:
       try:
         hash(arg)
       except TypeError:
@@ -197,9 +197,7 @@ def argnames_partial_except(f: lu.WrappedFun, static_argnames: Tuple[str, ...],
 
 @lu.transformation
 def _argnames_partial(fixed_kwargs: WrapKwArgs, *args, **dyn_kwargs):
-  kwargs = {k: None if arg is unit else arg.val
-            for k, arg in fixed_kwargs.val.items()}
-  kwargs.update(dyn_kwargs)
+  kwargs = dict({k: v.val for k, v in fixed_kwargs.val.items()}, **dyn_kwargs)
   ans = yield args, kwargs
   yield ans
 

@@ -40,7 +40,6 @@ def batchfun(axis_name, axis_size, in_dims, main_type, *in_vals):
     axis_size, = {x.shape[d] for x, d in zip(in_vals, in_dims) if d is not not_mapped}
   in_dims = in_dims() if callable(in_dims) else in_dims
   in_dims = [canonicalize_axis(ax, np.ndim(x)) if isinstance(ax, int)
-             and not isinstance(core.get_aval(x), core.AbstractUnit)
              else ax for x, ax in zip(in_vals, in_dims)]
   with core.new_main(main_type, axis_name=axis_name) as main:
     with core.extend_axis_env(axis_name, axis_size, main):
@@ -91,7 +90,7 @@ class BatchTracer(Tracer):
       assert type(batch_dim) in (int, NotMapped)
       if type(batch_dim) is int:
         aval = raise_to_shaped(core.get_aval(val))
-        assert aval is core.abstract_unit or 0 <= batch_dim < len(aval.shape)  # type: ignore
+        assert 0 <= batch_dim < len(aval.shape)  # type: ignore
     self._trace = trace
     self.val = val
     self.batch_dim = batch_dim
@@ -99,7 +98,7 @@ class BatchTracer(Tracer):
   @property
   def aval(self):
     aval = raise_to_shaped(core.get_aval(self.val))
-    if self.batch_dim is not_mapped or aval is core.abstract_unit:
+    if self.batch_dim is not_mapped:
       return aval
     else:
       return core.mapped_aval(aval.shape[self.batch_dim], self.batch_dim, aval)
@@ -427,7 +426,7 @@ def reducer_batcher(prim, batched_args, batch_dims, axes, **params):
 def add_batched(batched_args, batch_dims):
   bdx, bdy = batch_dims
   x, y = batched_args
-  if bdx == bdy or core.get_aval(x) == core.abstract_unit:
+  if bdx == bdy:
     return add_jaxvals(x, y), bdx
   elif bdx is not_mapped:
     x = broadcast(x, y.shape[bdy], bdy)
@@ -451,8 +450,6 @@ defvectorized(xla.device_put_p)
 ### util
 
 def broadcast(x, sz, axis):
-  if core.get_aval(x) is core.abstract_unit:
-    return core.unit
   shape = list(np.shape(x))
   shape.insert(axis, sz)
   broadcast_dims = tuple(np.delete(np.arange(len(shape)), axis))
@@ -464,8 +461,6 @@ def matchaxis(sz, src, dst, x, sum_match=False):
   except TypeError as e:
     raise TypeError(f"Output from batched function {repr(x)} with type "
                     f"{type(x)} is not a valid JAX type") from e
-  if aval is core.abstract_unit:
-    return core.unit
   if src == dst:
     return x
   elif type(src) == type(dst) == int:
@@ -478,8 +473,6 @@ def matchaxis(sz, src, dst, x, sum_match=False):
     raise ValueError((src, dst))
 
 def bdim_at_front(x, bdim, size):
-  if core.get_aval(x) is core.abstract_unit:
-    return core.unit
   if bdim is not_mapped:
     return broadcast(x, size, 0)
   else:
