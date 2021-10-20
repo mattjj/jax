@@ -384,6 +384,7 @@ from jax._src.numpy.lax_numpy import (
     zeros as zeros,
     zeros_like as zeros_like,
     _NOT_IMPLEMENTED,
+    register_stackable,
 )
 
 from jax._src.numpy.polynomial import roots as roots

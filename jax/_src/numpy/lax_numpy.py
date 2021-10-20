@@ -549,6 +549,11 @@ def _result_dtype(op, *args):
   return _dtype(op(*args))
 
 
+def _check_stackable(x):
+  return type(x) in stackables
+stackables = set()
+register_stackable = stackables.add
+
 def _arraylike(x):
   return (isinstance(x, np.ndarray) or isinstance(x, ndarray) or
           hasattr(x, '__jax_array__') or isscalar(x))
@@ -1710,7 +1715,7 @@ def polyfit(x, y, deg, rcond=None, full=False, w=None, cov=False):
 
 @_wraps(np.reshape, lax_description=_ARRAY_VIEW_DOC)
 def reshape(a, newshape, order="C"):
-  _check_arraylike("reshape", a)
+  _check_stackable(a) or _check_arraylike("reshape", a)
   try:
     return a.reshape(newshape, order=order)  # forward to method for ndarrays
   except AttributeError:
@@ -3342,14 +3347,15 @@ def stack(arrays, axis: int = 0, out=None):
     axis = _canonicalize_axis(axis, arrays.ndim)
     return concatenate(expand_dims(arrays, axis + 1), axis=axis)
   else:
-    _check_arraylike("stack", *arrays)
+    _all(_check_stackable(a) for a in arrays) or _check_arraylike("stack", *arrays)
     shape0 = shape(arrays[0])
     axis = _canonicalize_axis(axis, len(shape0) + 1)
     new_arrays = []
     for a in arrays:
       if shape(a) != shape0:
         raise ValueError("All input arrays must have the same shape.")
-      new_arrays.append(expand_dims(a, axis))
+      # new_arrays.append(expand_dims(a, axis))
+      new_arrays.append(reshape(a, (1,) + a.shape))
     return concatenate(new_arrays, axis=axis)
 
 @_wraps(np.tile)
@@ -3385,9 +3391,11 @@ def _concatenate_array(arr, axis: int):
 def concatenate(arrays, axis: int = 0):
   if isinstance(arrays, (np.ndarray, ndarray)):
     return _concatenate_array(arrays, axis)
-  _check_arraylike("concatenate", *arrays)
   if not len(arrays):
     raise ValueError("Need at least one array to concatenate.")
+  if hasattr(arrays[0], 'concatenate'):
+    return arrays[0].concatenate(arrays[1:], axis)
+  _check_arraylike("concatenate", *arrays)
   if ndim(arrays[0]) == 0:
     raise ValueError("Zero-dimensional arrays cannot be concatenated.")
   if axis is None:
