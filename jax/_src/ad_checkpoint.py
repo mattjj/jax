@@ -284,13 +284,15 @@ def remat_abstract_eval(*args, jaxpr, prevent_cse, differentiated, policy):
 def remat_translation(ctx, avals_in, avals_out, *in_nodes,
                       jaxpr, prevent_cse, differentiated, policy):
   del policy  # Unused.
+  if jaxpr.effects: raise NotImplementedError  # TODO(mattjj)
   if differentiated and prevent_cse:
     if ctx.platform == "gpu":
       return xla._remat_using_while(ctx, in_nodes, "checkpoint", jaxpr)
     else:
       return xla._remat_using_cond(ctx, in_nodes, "checkpoint", jaxpr)
   else:
-    return xla.jaxpr_subcomp(ctx, jaxpr, (), *in_nodes)
+    _, outs = xla.jaxpr_subcomp(ctx, jaxpr, None, (), *in_nodes)
+    return outs
 xla.register_translation(remat_p, remat_translation)
 
 def remat_jvp(primals, tangents, jaxpr, prevent_cse, differentiated, policy):

@@ -444,7 +444,7 @@ def _cpp_jit(
         all(device_array.type_is_device_array(x) for x in out_flat))
     ### If we can use the fastpath, we return required info to the caller.
     if use_fastpath:
-      _, xla_executable, _, result_handlers, kept_var_idx = execute.args
+      _, _, xla_executable, _, result_handlers, kept_var_idx = execute.args
       sticky_device = None
       avals = []
       lazy_exprs = [None] * len(result_handlers)
@@ -842,6 +842,7 @@ def xla_computation(fun: Callable,
       for axis_name, size in axis_env or []:
         stack.enter_context(core.extend_axis_env(axis_name, size, None))
       jaxpr, out_avals, consts = pe.trace_to_jaxpr_dynamic(jaxtree_fun, avals)
+      if jaxpr.effects: raise NotImplementedError  # TODO(mattjj)
       jaxpr = dispatch.apply_outfeed_rewriter(jaxpr)
       axis_env_ = make_axis_env(dispatch.jaxpr_replicas(jaxpr))
       if out_parts is None:
@@ -857,7 +858,7 @@ def xla_computation(fun: Callable,
       ctx = xla.TranslationContext(
           c, backend, axis_env_,
           extend_name_stack(wrap_name(fun_name, "xla_computation")))
-      out_nodes = xla.jaxpr_subcomp(ctx, jaxpr, xla_consts, *xla_args)
+      _, out_nodes = xla.jaxpr_subcomp(ctx, jaxpr, None, xla_consts, *xla_args)
     build_out_tuple = partial(xc.ops.Tuple, c, out_nodes)
     if out_parts is not None:
       out_tuple = xb.with_sharding(c, out_parts_flat, build_out_tuple)

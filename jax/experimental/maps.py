@@ -1353,7 +1353,8 @@ def _xmap_translation_rule_replica(c, axis_env,
   ctx = xla.TranslationContext(
       c, backend, axis_env,
       xla.extend_name_stack(name_stack, xla.wrap_name(name, 'xmap')))
-  tiled_outs = xla.jaxpr_subcomp(ctx, vectorized_jaxpr, (), *tiled_ins)
+  if vectorized_jaxpr.effects: raise NotImplementedError  # TODO(mattjj)
+  _, tiled_outs = xla.jaxpr_subcomp(ctx, vectorized_jaxpr, None, (), *tiled_ins)
 
   outs = [_xla_untile(c, axis_env, tiled_out, ans_out_axes, local_mesh_shape, backend)
           if v.aval is not core.abstract_unit else tiled_out
@@ -1474,8 +1475,9 @@ def _xmap_translation_rule_spmd(c, axis_env,
   ctx = xla.TranslationContext(
       c, backend, axis_env,
       xla.extend_name_stack(name_stack, xla.wrap_name(name, 'xmap')))
-  global_out_nodes = xla.jaxpr_subcomp(ctx, vectorized_jaxpr, (),
-                                       *sharded_global_in_nodes)
+  if vectorized_jaxpr.effects: raise NotImplementedError  # TODO(mattjj)
+  _, global_out_nodes = xla.jaxpr_subcomp(ctx, vectorized_jaxpr, None, (),
+                                          *sharded_global_in_nodes)
 
   sharded_global_out_nodes = [
     xb.set_sharding_proto(c, node, global_sharding_spec(aval, aval_axes).sharding_proto())

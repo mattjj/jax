@@ -942,6 +942,7 @@ def lower_parallel_callable(
       out_axes_thunk, avals)
   jaxpr, consts, replicas, parts, shards = stage_parallel_callable(
       pci, fun, global_arg_shapes)
+  if jaxpr.effects: raise NotImplementedError  # TODO(mattjj)
 
   if logging.vlog_is_on(2):
     logging.vlog(2, "sharded_avals: %s", shards.sharded_avals)
@@ -1003,7 +1004,7 @@ def lower_parallel_callable(
   with maybe_extend_axis_env(axis_name, global_axis_size, None):  # type: ignore
     ctx = xla.TranslationContext(c, backend.platform, axis_env,
                                  extend_name_stack(wrap_name(name, 'pmap')))
-    out_nodes = xla.jaxpr_subcomp(ctx, jaxpr, xla_consts, *xla_args)
+    _, out_nodes = xla.jaxpr_subcomp(ctx, jaxpr, None, xla_consts, *xla_args)
   build_out_tuple = partial(xops.Tuple, c, out_nodes)
   if parts.out_parts is not None:
     out_tuple = xb.with_sharding(c, parts.out_parts, build_out_tuple)
@@ -1494,6 +1495,7 @@ def _pmap_translation_rule(c, axis_env,
                            call_jaxpr, *, backend=None, in_axes, out_axes,
                            donated_invars, global_arg_shapes):
   del donated_invars  # Unused.
+  if call_jaxpr.effects: raise NotImplementedError  # TODO(mattjj)
   # We in-line here rather than generating a Call HLO as in the xla_call
   # translation rule just because the extra tuple stuff is a pain.
   if axis_env.names and devices is not None:
@@ -1511,7 +1513,8 @@ def _pmap_translation_rule(c, axis_env,
     ctx = xla.TranslationContext(
         c, backend, new_env,
         extend_name_stack(name_stack, wrap_name(name, 'pmap')))
-    sharded_outs = xla.jaxpr_subcomp(ctx, call_jaxpr, (), *in_nodes_sharded)
+    _, sharded_outs = xla.jaxpr_subcomp(ctx, call_jaxpr, None, (),
+                                        *in_nodes_sharded)
   out_avals = [v.aval for v in call_jaxpr.outvars]
   outs = [_xla_unshard(c, aval, new_env, out_axis, shard, backend=backend)
           for aval, out_axis, shard in safe_zip(out_avals, out_axes, sharded_outs)]
@@ -1778,6 +1781,7 @@ def lower_mesh_computation(
     in_jaxpr_avals = in_tiled_avals
   with core.extend_axis_env_nd(mesh.shape.items()):
     jaxpr, out_jaxpr_avals, consts = pe.trace_to_jaxpr_final(fun, in_jaxpr_avals)
+  if jaxpr.effects: raise NotImplementedError  # TODO(mattjj)
   if callable(out_axes):
     out_axes = out_axes()
   assert len(out_axes) == len(out_jaxpr_avals)
@@ -1826,7 +1830,7 @@ def lower_mesh_computation(
     ctx = xla.TranslationContext(
         c, backend.platform, axis_env,
         extend_name_stack(wrap_name(transformed_name, 'xmap')))
-    out_nodes = xla.jaxpr_subcomp(ctx, jaxpr, xla_consts, *xla_args)
+    _, out_nodes = xla.jaxpr_subcomp(ctx, jaxpr, None, xla_consts, *xla_args)
   if spmd_lowering:
     out_partitions_t = xb.tuple_sharding_proto(out_partitions)
     out_tuple = xb.with_sharding_proto(c, out_partitions_t, xops.Tuple, c, out_nodes)

@@ -347,8 +347,9 @@ def _while_loop_translation_rule(ctx, avals_in, avals_out, *args, cond_jaxpr,
   x, _, z = split_list(cond_carry_elts, [cond_nconsts, body_nconsts])
   cond_ctx = ctx.replace(builder=cond_c,
                          name_stack=extend_name_stack(ctx.name_stack, 'cond'))
-  pred, = xla.jaxpr_subcomp(
-      cond_ctx, cond_jaxpr.jaxpr,
+  if cond_jaxpr.jaxpr.effects: raise NotImplementedError  # TODO(mattjj)
+  _, (pred,) = xla.jaxpr_subcomp(
+      cond_ctx, cond_jaxpr.jaxpr, None,
       _map(partial(xla.pyval_to_ir_constant, cond_c), cond_jaxpr.consts),
       *(x + z))
   if batched:
@@ -363,15 +364,16 @@ def _while_loop_translation_rule(ctx, avals_in, avals_out, *args, cond_jaxpr,
   x, y, z = split_list(body_carry_elts, [cond_nconsts, body_nconsts])
   body_ctx = ctx.replace(builder=body_c,
                          name_stack=extend_name_stack(ctx.name_stack, 'body'))
-  new_z = xla.jaxpr_subcomp(
-      body_ctx, body_jaxpr.jaxpr,
+  if body_jaxpr.jaxpr.effects: raise NotImplementedError  # TODO(mattjj)
+  _, new_z = xla.jaxpr_subcomp(
+      body_ctx, body_jaxpr.jaxpr, None,
       _map(partial(xla.pyval_to_ir_constant, body_c), body_jaxpr.consts),
       *(y + z))
   if batched:
     body_pred_ctx = body_ctx.replace(
         name_stack=extend_name_stack(ctx.name_stack, 'body_pred'))
-    body_pred, = xla.jaxpr_subcomp(
-        body_pred_ctx, cond_jaxpr.jaxpr,
+    _, (body_pred,) = xla.jaxpr_subcomp(
+        body_pred_ctx, cond_jaxpr.jaxpr, None,
         _map(partial(xla.pyval_to_ir_constant, body_c), cond_jaxpr.consts),
         *(x + z))
     new_z = _map(partial(_pred_bcast_select, body_c, body_pred), new_z, z,
@@ -934,8 +936,9 @@ def _cond_translation_rule(ctx, avals_in, avals_out, index, *args, branches,
     ops = [xops.GetTupleElement(op, i) for i in range(len(jaxpr.in_avals))]
     subctx = ctx.replace(
         builder=c, name_stack=extend_name_stack(name_stack, name + '_fun'))
-    outs = xla.jaxpr_subcomp(
-        subctx, jaxpr.jaxpr,
+    if jaxpr.jaxpr.effects: raise NotImplementedError  # TODO(mattjj)
+    _, outs = xla.jaxpr_subcomp(
+        subctx, jaxpr.jaxpr, None,
         _map(partial(xla.pyval_to_ir_constant, c), jaxpr.consts), *ops)
     return c.build(xops.Tuple(c, outs))
 

@@ -446,7 +446,8 @@ class TranslationContext:
 
 
 def jaxpr_subcomp(ctx: TranslationContext, jaxpr: core.Jaxpr,
-                  consts: Sequence[XlaOp], *args: XlaOp) -> Sequence[XlaOp]:
+                  token: Optional[XlaOp], consts: Sequence[XlaOp], *args: XlaOp
+                  ) -> Tuple[Optional[XlaOp], Sequence[XlaOp]]:
   assert ctx.platform is not None
   def read(v):
     if type(v) is Literal:
@@ -485,15 +486,15 @@ def jaxpr_subcomp(ctx: TranslationContext, jaxpr: core.Jaxpr,
           f"XLA translation rule for primitive '{eqn.primitive.name}' not found")
 
     with source_info_util.user_context(eqn.source_info.traceback):
-      ans = rule(ctx, map(aval, eqn.invars), map(aval, eqn.outvars),
-                 *in_nodes, **eqn.params)
+      token, ans = rule(ctx, map(aval, eqn.invars), map(aval, eqn.outvars),
+                        token, *in_nodes, **eqn.params)
 
     assert isinstance(ans, collections.abc.Sequence), (ans, eqn)
     assert all(isinstance(x, xe.XlaOp) for x in ans), (ans, eqn)
     map(ctx.builder.get_shape, ans)  # force xla to do shape error checking
     ctx.builder.clear_op_metadata()
     _partitionmap(write, eqn.outvars, ans)
-  return _flatmap(read, jaxpr.outvars)
+  return token, _flatmap(read, jaxpr.outvars)
 
 
 def xla_destructure(c, ans):
@@ -685,7 +686,7 @@ def _xla_call_translation_rule(ctx, avals_in, avals_out, *in_nodes, name,
   sub_ctx = ctx.replace(
       builder=subc,
       name_stack=extend_name_stack(ctx.name_stack, wrap_name(name, 'jit')))
-  out_nodes = jaxpr_subcomp(sub_ctx, call_jaxpr, (), *args)
+  _, out_nodes = jaxpr_subcomp(sub_ctx, call_jaxpr, None, (), *args)
   subc = subc.build(xops.Tuple(subc, out_nodes))
   return xla_destructure(c, xops.Call(c, subc, list(in_nodes)))
 ad.primitive_transposes[xla_call_p] = partial(ad.call_transpose, xla_call_p)
@@ -728,8 +729,8 @@ if not MYPY:
     def __call__(self, ctx: TranslationContext,
                  avals_in: Sequence[core.AbstractValue],
                  avals_out: Sequence[core.AbstractValue],
-                 *args: XlaOp, **kw
-                ) -> Sequence[XlaOp]:
+                 token: Optional[XlaOp], *args: XlaOp, **kw
+                 ) -> Tuple[Optional[XlaOp], Sequence[XlaOp]]:
       """A translation rule lowers a primitive invocation into an XLA HLO."""
 else:
   TranslationRule = Any
@@ -744,14 +745,24 @@ _initial_style_primitives: Set[core.Primitive] = set()
 def register_translation(prim: core.Primitive, rule: TranslationRule, *,
                          platform: Optional[str] = None,
                          is_collective: bool = False,
-                         initial_style: bool = False) -> None:
+                         initial_style: bool = False,
+                         maybe_effectful: bool = False) -> None:
   ts = (_translations if platform is None
         else _backend_specific_translations[platform])
-  ts[prim] = rule
+  if maybe_effectful:
+    ts[prim] = rule
+  else:
+    ts[prim] = _wrap_pure_translation(rule)
   if is_collective:
     _collective_primitives.add(prim)
   if initial_style:
     _initial_style_primitives.add(prim)
+
+def _wrap_pure_translation(rule: TranslationRule) -> TranslationRule:
+  def new_rule(ctx, avals_in, avals_out, token, *args, **kw):
+    return token, rule(ctx, avals_in, avals_out, *args, **kw)
+  return new_rule
+
 
 # As a temporary backward compatibility measure, we use an adapter class to
 # convert from the old styles of translation rules to the newer ones.
@@ -769,15 +780,17 @@ class _TranslationRuleAdapter:
 
 def _wrap_old_translation(prim: core.Primitive, f: Callable) -> TranslationRule:
   @functools.wraps(f)
-  def wrapped(ctx: TranslationContext, avals_in: Sequence[core.AbstractValue],
+  def wrapped(ctx: TranslationContext,
+              avals_in: Sequence[core.AbstractValue],
               avals_out: Sequence[core.AbstractValue],
-               *args: XlaOp, **kw) -> Sequence[XlaOp]:
+              token: Optional[XlaOp], *args: XlaOp, **kw
+              ) -> Tuple[Optional[XlaOp], Sequence[XlaOp]]:
     ans = f(ctx.builder, *args, **kw)
     if (prim.multiple_results or
         any(len(aval_to_xla_shapes(aval)) > 1 for aval in avals_out)):
-      return xla_destructure(ctx.builder, ans)
+      return token, xla_destructure(ctx.builder, ans)
     else:
-      return [ans]
+      return token, [ans]
   return wrapped
 
 
@@ -786,16 +799,17 @@ def _wrap_old_call_translation(prim: core.Primitive,
   @functools.wraps(f)
   def wrapped(ctx: TranslationContext, avals_in: Sequence[core.AbstractValue],
               avals_out: Sequence[core.AbstractValue],
-               *args: XlaOp, **kw) -> Sequence[XlaOp]:
+              token: Optional[XlaOp], *args: XlaOp, **kw
+              ) -> Tuple[Optional[XlaOp], Sequence[XlaOp]]:
     platform = kw.pop("backend", None)
     check_backend_matches(platform, ctx.platform)
     ans = f(ctx.builder, ctx.axis_env, args, ctx.name_stack,
             backend=ctx.platform, **kw)
     if (prim.multiple_results or
         any(len(aval_to_xla_shapes(aval)) > 1 for aval in avals_out)):
-      return xla_destructure(ctx.builder, ans)
+      return token, xla_destructure(ctx.builder, ans)
     else:
-      return [ans]
+      return token, [ans]
   return wrapped
 
 translations : _TranslationRuleAdapter
@@ -841,17 +855,20 @@ def _tuple_output(*args, **kwargs):
 def lower_fun(fun: Callable, *, multiple_results: bool, backend=None,
               new_style: bool = False) -> Callable:
   if new_style:
-    def f_new(ctx: TranslationContext, avals_in: Sequence[core.AbstractValue],
+    # TODO(mattjj): allow lower_fun to handle ffectful lowerings
+    def f_new(ctx: TranslationContext,
+              avals_in: Sequence[core.AbstractValue],
               avals_out: Sequence[core.AbstractValue],
-              *xla_args: xc.XlaOp,
-              **params) -> Sequence[xc.XlaOp]:
+              *xla_args: XlaOp, **params) -> Sequence[XlaOp]:
       wrapped_fun = lu.wrap_init(fun, params)
       if not multiple_results:
         wrapped_fun = _tuple_output(wrapped_fun)
       with core.extend_axis_env_nd(zip(ctx.axis_env.names, ctx.axis_env.sizes)):
         jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(wrapped_fun, avals_in)
-      return jaxpr_subcomp(ctx, jaxpr, _xla_consts(ctx.builder, consts),
-                           *xla_args)
+      if jaxpr.effects: raise NotImplementedError  # TODO(mattjj)
+      _, out = jaxpr_subcomp(ctx, jaxpr, None, _xla_consts(ctx.builder, consts),
+                             *xla_args)
+      return out
     return f_new
 
   # TODO(phawkins): migrate dependent code & always use new_style=True.
@@ -873,8 +890,9 @@ def lower_fun(fun: Callable, *, multiple_results: bool, backend=None,
       wrapped_fun = _tuple_output(wrapped_fun)
     with core.extend_axis_env_nd(zip(axis_env.names, axis_env.sizes)):
       jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(wrapped_fun, avals)
+    if jaxpr.effects: raise NotImplementedError  # TODO(mattjj)
     ctx = TranslationContext(c, backend, axis_env, '')
-    outs = jaxpr_subcomp(ctx, jaxpr, _xla_consts(c, consts), *xla_args)
+    _, outs = jaxpr_subcomp(ctx, jaxpr, None, _xla_consts(c, consts), *xla_args)
     if (multiple_results or
         any(len(aval_to_xla_shapes(v.aval)) > 1 for v in jaxpr.outvars)):
       return xops.Tuple(c, outs)
@@ -922,7 +940,8 @@ def _remat_using_cond(ctx, in_nodes, name, call_jaxpr):
   sub_ctx = ctx.replace(
       builder=remat_subc,
       name_stack=extend_name_stack(ctx.name_stack, wrap_name(name, 'remat')))
-  out_nodes = jaxpr_subcomp(sub_ctx, call_jaxpr, (), *args)
+  if call_jaxpr.effects: raise NotImplementedError  # TODO(mattjj)
+  _, out_nodes = jaxpr_subcomp(sub_ctx, call_jaxpr, None, (), *args)
   out_node_shapes = [remat_subc.get_shape(o) for o in out_nodes]
   remat_subc = remat_subc.build(xops.Tuple(remat_subc, out_nodes))
 
@@ -947,7 +966,9 @@ def _remat_using_while(ctx, in_nodes, name, call_jaxpr):
   dummy_ctx = ctx.replace(
       builder=dummy_subc,
       name_stack=extend_name_stack(ctx.name_stack, wrap_name(name, 'remat')))
-  dummy_subcomp_outs = jaxpr_subcomp(dummy_ctx, call_jaxpr, (), *dummy_args)
+  if call_jaxpr.effects: raise NotImplementedError  # TODO(mattjj)
+  _, dummy_subcomp_outs = jaxpr_subcomp(dummy_ctx, call_jaxpr, None, (),
+                                        *dummy_args)
   out_node_shapes = [dummy_subc.get_shape(o) for o in dummy_subcomp_outs]
 
   i_init = xops.Constant(c, np.array(0, dtype=np.int32))
@@ -969,7 +990,8 @@ def _remat_using_while(ctx, in_nodes, name, call_jaxpr):
   body_ctx = ctx.replace(
       builder=body_subc,
       name_stack=extend_name_stack(ctx.name_stack, wrap_name(name, 'remat')))
-  subcomp_outs = jaxpr_subcomp(body_ctx, call_jaxpr, (), *args)
+  if call_jaxpr.effects: raise NotImplementedError  # TODO(mattjj)
+  _, subcomp_outs = jaxpr_subcomp(body_ctx, call_jaxpr, None, (), *args)
   out_nodes = [i_next] + args + list(subcomp_outs)
   body_subc = body_subc.build(xops.Tuple(body_subc, out_nodes))
   outs = xops.While(cond_subc, body_subc, inputs)
@@ -988,7 +1010,9 @@ def _remat_translation_rule(ctx, avals_in, avals_out, *in_nodes,
     else:
       return _remat_using_cond(ctx, in_nodes, name, call_jaxpr)
   else:
-    return jaxpr_subcomp(ctx, call_jaxpr, (), *in_nodes)
+    if call_jaxpr.effects: raise NotImplementedError  # TODO(mattjj)
+    _, out = jaxpr_subcomp(ctx, call_jaxpr, None, (), *in_nodes)
+    return out
 
 register_translation(pe.remat_call_p, _remat_translation_rule)
 
@@ -1005,7 +1029,8 @@ def _named_call_translation_rule(ctx, avals_in, avals_out, *in_nodes,
   args = [xb.parameter(subc, i, c.GetShape(n)) for i, n in enumerate(in_nodes)]
   sub_ctx = ctx.replace(builder=subc,
                         name_stack=extend_name_stack(ctx.name_stack, name))
-  out_nodes = jaxpr_subcomp(sub_ctx, call_jaxpr, (), *args)
+  if call_jaxpr.effects: raise NotImplementedError  # TODO(mattjj)
+  _, out_nodes = jaxpr_subcomp(sub_ctx, call_jaxpr, None, (), *args)
   subc = subc.Build(xops.Tuple(subc, out_nodes))
   return xla_destructure(c, xops.Call(c, subc, list(in_nodes)))
 register_translation(core.named_call_p, _named_call_translation_rule)

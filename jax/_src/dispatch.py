@@ -14,6 +14,7 @@
 
 # Primitive dispatch and jit dispatch.
 
+import atexit
 from functools import partial
 import itertools
 from typing import (
@@ -42,8 +43,8 @@ from jax._src import traceback_util
 
 traceback_util.register_exclusion(__file__)
 
-
 xe = xc._xla
+xops = xc._xla.ops
 
 Backend = xe.Client
 Device = xc.Device
@@ -178,9 +179,7 @@ def lower_xla_callable(fun: lu.WrappedFun, device, backend, name,
   consts = [c for i, c in enumerate(consts) if i in kept_const_idx]
   pruned_arg_specs = (a for i, a in enumerate(arg_specs) if i in kept_var_idx)
   abstract_args, arg_devices = util.unzip2(pruned_arg_specs)
-  donated_invars = [
-      x for i, x in enumerate(donated_invars) if i in kept_var_idx
-  ]
+  donated_invars = [x for i, x in enumerate(donated_invars) if i in kept_var_idx]
   map(prefetch, itertools.chain(consts, jaxpr_literals(jaxpr)))
   jaxpr = apply_outfeed_rewriter(jaxpr)
 
@@ -193,8 +192,8 @@ def lower_xla_callable(fun: lu.WrappedFun, device, backend, name,
   # and don't need to evaluate their arguments.
   if not jaxpr.eqns:
     return XlaComputation(
-        name, None, True, None, jaxpr, consts, device, abstract_args, out_avals,
-        kept_var_idx)
+        name, None, True, False, None, jaxpr, consts, device, abstract_args,
+        out_avals, kept_var_idx)
 
   if not _on_exit:
     log_priority = logging.WARNING if config.jax_log_compiles else logging.DEBUG
@@ -226,10 +225,17 @@ def lower_xla_callable(fun: lu.WrappedFun, device, backend, name,
   xla_consts = xla._xla_consts(c, consts)
   xla_args, donated_invars = xla._xla_callable_args(c, abstract_args, tuple_args,
                                                 donated_invars=donated_invars)
+  if jaxpr.effects:
+    num_args = len(xla_args) if not tuple_args else 1
+    xb.parameter(c, num_args, xc.Shape.array_shape(np.dtype('uint8'), (0,)))
   platform = backend.platform
   ctx = xla.TranslationContext(c, platform, xla.AxisEnv(nreps, (), ()),
                                xla.extend_name_stack(xla.wrap_name(name, 'jit')))
-  out_nodes = xla.jaxpr_subcomp(ctx, jaxpr, xla_consts, *xla_args)
+  token, out_nodes = xla.jaxpr_subcomp(ctx, jaxpr, xops.CreateToken(c),
+                                       xla_consts, *xla_args)
+  if jaxpr.effects:
+    assert token is not None
+    out_nodes = [*out_nodes, token, xops.Constant(c, np.array((), 'uint8'))]
   # There is a non-zero cost to building an output tuple, particularly on TPU.
   # Avoid it if the output arity is 1.
   output = out_nodes[0] if len(out_nodes) == 1 else xc.ops.Tuple(c, out_nodes)
@@ -244,8 +250,8 @@ def lower_xla_callable(fun: lu.WrappedFun, device, backend, name,
         ", ".join(unused_donations)))
   built = c.build(output)
   return XlaComputation(
-      name, built, False, donated_invars, nreps, device, backend, tuple_args,
-      abstract_args, out_avals, kept_var_idx)
+      name, built, False, jaxpr.effects, donated_invars, nreps, device, backend,
+      tuple_args, abstract_args, out_avals, kept_var_idx)
 
 
 def prefetch(x):
@@ -286,7 +292,8 @@ def _prune_unused_inputs(
       (i, v) for i, v in enumerate(jaxpr.constvars) if v in used)
   kept_var_idx, new_invars = util.unzip2(
       (i, v) for i, v in enumerate(jaxpr.invars) if v in used)
-  new_jaxpr = core.Jaxpr(new_constvars, new_invars, jaxpr.outvars, jaxpr.eqns)
+  new_jaxpr = core.Jaxpr(new_constvars, new_invars, jaxpr.outvars, jaxpr.eqns,
+                         jaxpr.effects)
   return new_jaxpr, set(kept_const_idx), set(kept_var_idx)
 
 
@@ -409,45 +416,47 @@ def _check_special(name, xla_shape, buf):
       raise FloatingPointError(f"invalid value (inf) encountered in {name}")
 
 
-def _execute_compiled(name: str, compiled: XlaExecutable,
+def _execute_compiled(name: str, is_effectful: bool, compiled: XlaExecutable,
                       output_buffer_counts: Optional[Sequence[int]], handlers,
                       kept_var_idx, *args):
+  global global_token
   device, = compiled.local_devices()
-  input_bufs = list(
-      itertools.chain.from_iterable(
-          device_put(x, device)
-          for i, x in enumerate(args)
-          if x is not core.token and i in kept_var_idx))
+  input_bufs = _flatten(device_put(x, device) for i, x in enumerate(args)
+                        if x is not core.token and i in kept_var_idx)
+  if is_effectful:
+    input_bufs.append(global_token if global_token is not None else
+                      _device_put_array(np.array((), 'uint8'), device)[0])
   out_bufs = compiled.execute(input_bufs)
+  if is_effectful:
+    *out_bufs, _, global_token = out_bufs
   check_special(name, out_bufs)
   if output_buffer_counts is None:
     return (handlers[0](*out_bufs),)
-  return tuple(
-      handler(*bs) for handler, bs in
-      unsafe_zip(handlers, util.unflatten(out_bufs, output_buffer_counts)))
+  partitioned_outs = util.unflatten(out_bufs, output_buffer_counts)
+  return [h(*bs) for h, bs in unsafe_zip(handlers, partitioned_outs)]
+
+def _flatten(lol):
+  return list(itertools.chain.from_iterable(lol))
+
+global_token: Optional[device_array.DeviceArray] = None
+atexit.register(lambda: None if global_token is None else
+                global_token.block_until_ready())
 
 
-def _execute_replicated(name: str, compiled: XlaExecutable,
+def _execute_replicated(name: str, is_effectful: bool, compiled: XlaExecutable,
                         output_buffer_counts: Optional[Sequence[int]], handlers,
                         kept_var_idx, *args):
-  input_bufs = [
-      list(
-          itertools.chain.from_iterable(
-              device_put(x, device)
-              for i, x in enumerate(args)
-              if x is not core.token and i in kept_var_idx))
-      for device in compiled.local_devices()
-  ]
-  out_bufs = [
-      buf[0] for buf in compiled.execute_sharded_on_local_devices(
-          list(zip(*input_bufs)))
-  ]
+  if is_effectful: raise NotImplementedError  # TODO(mattjj): handle effects
+  input_bufs = [[buf for i, x in enumerate(args) for buf in device_put(x, device)
+                 if x is not core.token and i in kept_var_idx]
+                for device in compiled.local_devices()]
+  outs = compiled.execute_sharded_on_local_devices(list(zip(*input_bufs)))
+  out_bufs = [bufs[0] for bufs in outs]
   check_special(name, out_bufs)
   if output_buffer_counts is None:
     return (handlers[0](*out_bufs),)
-  return tuple(
-      handler(*bs) for handler, bs in
-      unsafe_zip(handlers, util.unflatten(out_bufs, output_buffer_counts)))
+  partitioned_outs = util.unflatten(out_bufs, output_buffer_counts)
+  return [h(*bs) for h, bs in unsafe_zip(handlers, partitioned_outs)]
 
 
 def _execute_trivial(jaxpr, device: Optional[Device], consts, avals, handlers,
@@ -465,14 +474,16 @@ def _execute_trivial(jaxpr, device: Optional[Device], consts, avals, handlers,
 class XlaComputation:
   name: str
   _is_trivial: bool
+  _is_effectful: bool
   _executable: Optional['XlaCompiledComputation']
   _donated_invars: Optional[Sequence[bool]]
 
-  def __init__(self, name: str, hlo, is_trivial: bool,
+  def __init__(self, name: str, hlo, is_trivial: bool, is_effectful: bool,
                donated_invars: Optional[Sequence[bool]], *compile_args):
     self.name = name
     self._hlo = hlo
     self._is_trivial = is_trivial
+    self._is_effectful = is_effectful
     self._donated_invars = donated_invars
     self._executable = None
     self.compile_args = compile_args
@@ -492,7 +503,7 @@ class XlaComputation:
             *self.compile_args)
       else:
         self._executable = XlaCompiledComputation.from_xla_computation(
-            self.name, self.hlo(), *self.compile_args)
+            self.name, self._is_effectful, self.hlo(), *self.compile_args)
     return self._executable
 
 def backend_compile(backend, built_c, options):
@@ -530,6 +541,7 @@ class XlaCompiledComputation:
   @staticmethod
   def from_xla_computation(
       name: str,
+      is_effectful: bool,
       xla_computation,
       nreps: int,
       device,
@@ -548,7 +560,7 @@ class XlaCompiledComputation:
     buffer_counts = (None if len(out_avals) == 1 else
                      [len(xla.aval_to_xla_shapes(aval)) for aval in out_avals])
     execute = _execute_compiled if nreps == 1 else _execute_replicated
-    unsafe_call = partial(execute, name, compiled, buffer_counts,
+    unsafe_call = partial(execute, name, is_effectful, compiled, buffer_counts,
                           result_handlers, kept_var_idx)
     return XlaCompiledComputation(compiled, in_avals, kept_var_idx, unsafe_call)
 

@@ -3250,7 +3250,8 @@ def _reduction_computation(ctx, jaxpr, consts, init_values, singleton=True):
   assert len(consts) == 0, "Reduction computations cannot have constants"
   args = [xb.parameter(subc, i, shape) for i, shape in enumerate(shapes)]
   ctx = xla.TranslationContext(subc, platform, axis_env, '')
-  out_nodes = xla.jaxpr_subcomp(ctx, jaxpr, consts, *args)
+  if jaxpr.effects: raise TypeError
+  _, out_nodes = xla.jaxpr_subcomp(ctx, jaxpr, None, consts, *args)
   if singleton:
     return subc.build(out_nodes[0])
   out_nodes = xops.Tuple(subc, out_nodes)

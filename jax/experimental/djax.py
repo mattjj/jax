@@ -807,9 +807,11 @@ def traceable_to_padded_translation(traceable):
     operands_ = it.chain.from_iterable([*dims.values(), *operands])
     platform = "cpu"  # TODO: don't hardwire in the CPU translation.
     ctx = xla.TranslationContext(c, platform, xla.AxisEnv(1, (), ()), '')
-    outs = xla.jaxpr_subcomp(ctx, jaxpr, xla._xla_consts(c, consts), *operands_)
-    return util.unflatten(outs,
-                          [aval_to_num_buffers(aval) for aval in out_avals])
+    assert not jaxpr.effects
+    _, outs = xla.jaxpr_subcomp(ctx, jaxpr, None, xla._xla_consts(c, consts),
+                                *operands_)
+    buf_counts = [aval_to_num_buffers(aval) for aval in out_avals]
+    return util.unflatten(outs, buf_counts)
   return translation
 
 def _replace_vars_with_bounds(aval):
@@ -1042,7 +1044,7 @@ def _sin_abstract_eval(x):
   if isinstance(x, AbsArray):
     return AbsArray(x.shape, x._eltTy)
   else:
-    return lax.sin_p.abstract_eval(x)
+    return lax.sin_p.abstract_eval(x)[0]
 
 def _sin_typecheck_rule(invar):
   return [invar.aval]
@@ -1067,7 +1069,7 @@ def _cos_abstract_eval(x):
   if isinstance(x, AbsArray):
     return AbsArray(x.shape, x._eltTy)
   else:
-    return lax.cos_p.abstract_eval(x)
+    return lax.cos_p.abstract_eval(x)[0]
 
 def _cos_typecheck_rule(invar):
   return [invar.aval]
@@ -1101,7 +1103,7 @@ def _sum_abstract_eval(operand, *, axes):
     return lax.reduce_sum_p.reduce_sum_abstract_eval(operand, axes=axes)
 
 def _reduce_sum_typecheck_rule(x, *, axes):
-  return [reduce_sum_p.abstract_eval(x.aval, axes=axes)]
+  return [reduce_sum_p.abstract_eval(x.aval, axes=axes)[0]]
 typecheck_rules[reduce_sum_p] = _reduce_sum_typecheck_rule
 
 def _reduce_sum_translation_traceable(logical_shapes, x, *, axes):
@@ -1141,10 +1143,10 @@ def _lt_abstract_eval(x, y):
     map(_dims_must_equal, x.shape, y.shape)
     return AbsArray(x.shape, BaseType(np.dtype('bool')))
   else:
-    return lax.lt_p.abstract_eval(x, y)
+    return lax.lt_p.abstract_eval(x, y)[0]
 
 def _lt_typecheck_rule(x, y):
-  return [lt_p.abstract_eval(x.aval, y.aval)]
+  return [lt_p.abstract_eval(x.aval, y.aval)[0]]
 
 def _lt_translation_rule(c, dims, avals, operands):
   (x,), (y,) = operands
@@ -1199,7 +1201,7 @@ def _add_abstract_eval(x, y):
     map(_dims_must_equal, x.shape, y.shape)  # TODO broadcasting?
     return AbsArray(x.shape, x._eltTy)
   else:
-    return lax.add_p.abstract_eval(x, y)
+    return lax.add_p.abstract_eval(x, y)[0]
 
 def _dims_must_equal(d1, d2):
   if isinstance(d1, (Tracer, Var)) and isinstance(d2, (Tracer, Var)):
@@ -1209,7 +1211,7 @@ def _dims_must_equal(d1, d2):
   raise Exception("can't prove shapes equal (or unequal)!")
 
 def _add_typecheck_rule(x, y):
-  return [add_p.abstract_eval(x.aval, y.aval)]
+  return [add_p.abstract_eval(x.aval, y.aval)[0]]
 typecheck_rules[add_p] = _add_typecheck_rule
 
 def _add_translation_rule(c, dims, avals, operands):
@@ -1230,10 +1232,10 @@ def _mul_abstract_eval(x, y):
     map(_dims_must_equal, x.shape, y.shape)  # TODO broadcasting?
     return AbsArray(x.shape, x._eltTy)
   else:
-    return lax.mul_p.abstract_eval(x, y)
+    return lax.mul_p.abstract_eval(x, y)[0]
 
 def _mul_typecheck_rule(x, y):
-  return [mul_p.abstract_eval(x.aval, y.aval)]
+  return [mul_p.abstract_eval(x.aval, y.aval)[0]]
 typecheck_rules[mul_p] = _mul_typecheck_rule
 
 def _mul_translation_rule(c, dims, avals, operands):

@@ -146,7 +146,8 @@ def _sharded_callable(
   axis_env = xla.AxisEnv(nrep, (), ())
   ctx = xla.TranslationContext(
       c, platform, axis_env, extend_name_stack(wrap_name(name, "sharded_jit")))
-  out_nodes = xla.jaxpr_subcomp(ctx, jaxpr, xla_consts, *xla_args)
+  if jaxpr.effects: raise NotImplementedError  # TODO(mattjj)
+  _, out_nodes = xla.jaxpr_subcomp(ctx, jaxpr, None, xla_consts, *xla_args)
   out_tuple = xb.with_sharding(c, out_parts, xops.Tuple, c, out_nodes)
   built = c.Build(out_tuple)
 
@@ -199,7 +200,8 @@ def _sharded_jit_translation_rule(c, axis_env, in_nodes, name_stack,
   ctx = xla.TranslationContext(
       subc, backend, axis_env,
       extend_name_stack(wrap_name(name, "sharded_jit")))
-  out_nodes = xla.jaxpr_subcomp(ctx, call_jaxpr, (), *args)
+  if call_jaxpr.effects: raise NotImplementedError  # TODO(mattjj)
+  _, out_nodes = xla.jaxpr_subcomp(ctx, call_jaxpr, None, (), *args)
   out_parts = out_parts_thunk()
   assert len(out_parts) == len(out_nodes)
   out_nodes = [xb.set_sharding(subc, out, sharding)

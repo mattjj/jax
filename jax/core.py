@@ -58,9 +58,11 @@ class Jaxpr:
   invars: List['Var']
   outvars: List['Atom']
   eqns: List['JaxprEqn']
+  effects: bool
 
   def __init__(self, constvars: Sequence['Var'], invars: Sequence['Var'],
-               outvars: Sequence['Atom'], eqns: Sequence['JaxprEqn']):
+               outvars: Sequence['Atom'], eqns: Sequence['JaxprEqn'],
+               effects: Optional[bool] = None):
     """
     Args:
       constvars: list of variables introduced for constants. Array constants are
@@ -74,6 +76,7 @@ class Jaxpr:
     self.invars = list(invars)
     self.outvars = list(outvars)
     self.eqns = list(eqns)
+    self.effects = bool(effects)
 
   def __str__(self):
     return str(pp_jaxpr(self, JaxprPpContext(), custom_pp_eqn_rules=True))
@@ -283,7 +286,7 @@ class Primitive:
     return impl
 
   def def_abstract_eval(self, abstract_eval):
-    self.abstract_eval = abstract_eval
+    self.abstract_eval = _effect_free_abstract_eval(abstract_eval)
     return abstract_eval
 
   def def_custom_bind(self, bind):
@@ -297,6 +300,11 @@ class Primitive:
   def abstract_eval(self, *args, **params):
     raise NotImplementedError("Abstract evaluation for '{}' not implemented"
                               .format(self.name))
+
+def _effect_free_abstract_eval(abstract_eval):
+  def abstract_eval_(*args, **kwargs):
+    return abstract_eval(*args, **kwargs), False
+  return abstract_eval_
 
 
 # -------------------- lifting --------------------
@@ -1951,6 +1959,7 @@ def check_jaxpr(jaxpr: Jaxpr):
     msg = "\n\n".join([msg, "while checking jaxpr:", jaxpr_str])
     raise JaxprTypeError(msg) from None
 
+# TODO(mattjj): upadte me to check effects
 def _check_jaxpr(jaxpr: Jaxpr, in_avals: Sequence[AbstractValue]):
 
   def read(v: Atom) -> AbstractValue:
@@ -2005,7 +2014,7 @@ def check_eqn(prim, in_avals, params):
   for jaxpr in jaxprs_in_params(params):
     check_jaxpr(jaxpr)
 
-  out_avals = prim.abstract_eval(*in_avals, **params)
+  out_avals, _ = prim.abstract_eval(*in_avals, **params)
   if not prim.multiple_results:
     out_avals = [out_avals]
   return out_avals

@@ -522,8 +522,9 @@ def _pjit_translation_rule(c, axis_env, in_nodes, name_stack, backend, name,
   ctx = xla.TranslationContext(
       subc, backend, axis_env,
       extend_name_stack(name_stack, wrap_name(name, "pjit")))
-  out_nodes = xla.jaxpr_subcomp(
-      ctx, jaxpr.jaxpr, xla._xla_consts(subc, jaxpr.consts), *args)
+  if jaxpr.jaxpr.effects: raise NotImplementedError  # TODO(mattjj)
+  _, out_nodes = xla.jaxpr_subcomp(
+      ctx, jaxpr.jaxpr, None, xla._xla_consts(subc, jaxpr.consts), *args)
   out_nodes = [
       xb.set_sharding_proto(subc, out,
                             get_sharding_proto(subc, out, axis_resources, mesh))
