@@ -837,8 +837,8 @@ ad.call_transpose_param_updaters[xla_call_p] = _xla_call_transpose_update_params
 
 def _xla_call_translation_rule(ctx, avals_in, avals_out, *in_nodes, name,
                                backend=None, call_jaxpr, donated_invars,
-                               inline=None, device=None):
-  del device, donated_invars, inline  # Ignored.
+                               inline=None, device=None, axes_specs=None):
+  del device, donated_invars, inline, axes_specs  # Ignored.
   c = ctx.builder
   check_backend_matches(backend, ctx.platform)
   subc = xc.XlaBuilder(f"jit_{name}")

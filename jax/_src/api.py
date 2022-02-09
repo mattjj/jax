@@ -309,12 +309,12 @@ def jit(
   [-0.54485  0.27744 -0.29255 -0.91421 -0.62452 -0.24748
    -0.85743 -0.78232  0.76827  0.59566 ]
   """
-  if FLAGS.experimental_cpp_jit:
+  if FLAGS.experimental_cpp_jit and not abstracted_axes:
     return _cpp_jit(fun, static_argnums, static_argnames, device, backend,
                     donate_argnums, inline)
   else:
     return _python_jit(fun, static_argnums, static_argnames, device, backend,
-                       donate_argnums, inline)
+                       donate_argnums, inline, abstracted_axes)
 
 
 def _prepare_jit(fun, static_argnums, static_argnames, donate_argnums,
@@ -344,6 +344,7 @@ def _python_jit(
     backend: Optional[str] = None,
     donate_argnums: Union[int, Iterable[int]] = (),
     inline: bool = False,
+    abstracted_axes: Optional[Any] = None,
 ) -> F:
   # The Python implementation of `jax.jit`, being slowly replaced by _cpp_jit.
   _check_callable(fun)
@@ -362,11 +363,15 @@ def _python_jit(
         fun, static_argnums, static_argnames, donate_argnums, args, kwargs)
     for arg in args_flat:
       _check_arg(arg)
+    if abstracted_axes is not None:
+      axes_specs = _abstracted_axes_specs(abstracted_axes, *args, **kwargs)
+    else:
+      axes_specs = None
     flat_fun, out_tree = flatten_fun(closed_fun, in_tree)
     out_flat = xla.xla_call(
         flat_fun, *args_flat,
         device=device, backend=backend, name=flat_fun.__name__,
-        donated_invars=donated_invars, inline=inline)
+        donated_invars=donated_invars, inline=inline, axes_specs=axes_specs)
     return tree_unflatten(out_tree(), out_flat)
 
   f_jitted.lower = _jit_lower(fun, static_argnums, static_argnames, device,
@@ -2693,10 +2698,7 @@ def make_jaxpr(fun: Callable,
     if abstracted_axes is None:
       return map(shaped_abstractify, flat_args), in_tree, [True] * len(flat_args)
     else:
-      if kwargs: raise NotImplementedError
-      ax_leaf = lambda l: (isinstance(l, dict) and all_leaves(l.values()) or
-                           isinstance(l, tuple) and all_leaves(l))
-      axes_specs = broadcast_prefix(abstracted_axes, args, ax_leaf)
+      axes_specs = _abstracted_axes_specs(abstracted_axes, *args, **kwargs)
       sizes: Dict[Hashable, int] = {}
       env: Dict[Hashable, core.AbstractValue] = {}
       def make_aval(arg, spec):
@@ -2735,6 +2737,12 @@ def make_jaxpr(fun: Callable,
 
   jaxpr_maker.__name__ = f"make_jaxpr({jaxpr_maker.__name__})"
   return jaxpr_maker
+
+def _abstracted_axes_specs(abstracted_axes, *args, **kwargs) -> Tuple:
+  if kwargs: raise NotImplementedError
+  ax_leaf = lambda l: (isinstance(l, dict) and all_leaves(l.values()) or
+                        isinstance(l, tuple) and all_leaves(l))
+  return tuple(broadcast_prefix(abstracted_axes, args, ax_leaf))
 
 
 def device_put(x, device: Optional[xc.Device] = None):
