@@ -2090,6 +2090,16 @@ def _mul_inverse(r, x, y):
   yr = r / x
   return xr, yr
 
+def _mul_padding_rule(avals, x, y):
+  if type(x) is type(y) is xla.BoundedInt:
+    return [xla.BoundedInt(mul(x.val, y.val), x.hi * y.hi)]
+  elif type(x) is xla.BoundedInt:
+    return [xla.BoundedInt(mul(x.val, y), x.hi * y)]
+  elif type(y) is xla.BoundedInt:
+    return [xla.BoundedInt(mul(x, y.val), x * y.hi)]
+  else:
+    return [mul(x, y)]
+
 mul_p = standard_naryop([_num, _num], 'mul')
 ad.defjvp(mul_p,
           lambda xdot, x, y: mul(xdot, y),
@@ -2097,6 +2107,7 @@ ad.defjvp(mul_p,
 ad.primitive_transposes[mul_p] = _mul_transpose
 iad.definverse(mul_p, _mul_inverse)
 mlir.register_lowering(mul_p, partial(_nary_lower_mhlo, mhlo.MulOp))
+xla.padding_rules[mul_p] = _mul_padding_rule
 
 def _div_transpose_rule(cotangent, x, y):
   assert ad.is_undefined_primal(x) and not ad.is_undefined_primal(y)
@@ -2702,12 +2713,21 @@ def _broadcast_in_dim_staging_rule(
 
   return out_tracer
 
+def _broadcast_in_dim_padding_rule(in_avals, x, *dyn_shape, shape,
+                                   broadcast_dimensions):
+  assert all(type(d) is xla.BoundedInt for d in dyn_shape)
+  dyn_shape = iter(dyn_shape)
+  padded_shape = [next(dyn_shape).hi if d is None else d for d in shape]
+  return [broadcast_in_dim_p.bind(x, shape=tuple(padded_shape),
+                                  broadcast_dimensions=broadcast_dimensions)]
+
 broadcast_in_dim_p = standard_primitive(
     _broadcast_in_dim_shape_rule, _input_dtype, 'broadcast_in_dim')
 ad.deflinear2(broadcast_in_dim_p, _broadcast_in_dim_transpose_rule)
 batching.primitive_batchers[broadcast_in_dim_p] = _broadcast_in_dim_batch_rule
 pe.forwarding_rules[broadcast_in_dim_p] = _broadcast_in_dim_fwd_rule
 pe.custom_staging_rules[broadcast_in_dim_p] = _broadcast_in_dim_staging_rule
+xla.padding_rules[broadcast_in_dim_p] = _broadcast_in_dim_padding_rule
 
 def _broadcast_in_dim_lower(ctx, x, *, shape, broadcast_dimensions):
   del shape
@@ -3541,6 +3561,20 @@ def _reduce_sum_transpose_rule(cotangent, operand, *, axes):
   assert result.shape == input_shape
   return [result]
 
+def _reduce_sum_padding_rule(in_avals, operand, *, axes):
+  aval, = in_avals
+  padded_axes = [(i, d.val) for i, d in enumerate(aval.shape)
+                 if isinstance(d, xla.BoundedInt)]
+  masked_operand = _replace_masked_values(operand, 0, padded_axes)
+  return [_reduce_sum(masked_operand, axes)]
+
+def _replace_masked_values(x, val, padded_axes):
+  masks = [broadcasted_iota(np.dtype('int32'), x.shape, i) < d
+           for i, d in padded_axes]
+  if masks:
+    x = select(_reduce(operator.and_, masks), x, full_like(x, val))
+  return x
+
 reduce_sum_p = standard_primitive(
   _reduce_sum_shape_rule, partial(_reduce_number_dtype_rule, 'reduce_sum'),
   'reduce_sum', _reduce_sum_translation_rule)
@@ -3548,6 +3582,7 @@ ad.deflinear2(reduce_sum_p, _reduce_sum_transpose_rule)
 batching.defreducer(reduce_sum_p)
 _masking_defreducer(reduce_sum_p,
                     lambda shape, dtype: np.broadcast_to(np.array(0, dtype), shape))
+xla.padding_rules[reduce_sum_p] = _reduce_sum_padding_rule
 
 
 def _reduce_op_shape_rule(operand, *, axes, input_shape=None):
