@@ -233,6 +233,7 @@ def jit(
   backend: Optional[str] = None,
   donate_argnums: Union[int, Iterable[int]] = (),
   inline: bool = False,
+  abstracted_axes: Optional[Any] = None,
 ) -> F:
   """Sets up ``fun`` for just-in-time compilation with XLA.
 
@@ -365,18 +366,39 @@ def _python_jit(
       _check_arg(arg)
     if abstracted_axes is not None:
       axes_specs = _abstracted_axes_specs(abstracted_axes, *args, **kwargs)
-    else:
-      axes_specs = None
+      input_type = _input_type(axes_specs, args_flat)
+      closed_fun = lu.annotate_input_type(closed_fun, input_type)
     flat_fun, out_tree = flatten_fun(closed_fun, in_tree)
     out_flat = xla.xla_call(
         flat_fun, *args_flat,
         device=device, backend=backend, name=flat_fun.__name__,
-        donated_invars=donated_invars, inline=inline, axes_specs=axes_specs)
+        donated_invars=donated_invars, inline=inline)
     return tree_unflatten(out_tree(), out_flat)
 
   f_jitted.lower = _jit_lower(fun, static_argnums, static_argnames, device,
                               backend, donate_argnums, inline)
   return f_jitted
+
+def _abstracted_axes_specs(abstracted_axes, *args, **kwargs) -> Tuple:
+  if kwargs: raise NotImplementedError
+  ax_leaf = lambda l: (isinstance(l, dict) and all_leaves(l.values()) or
+                        isinstance(l, tuple) and all_leaves(l))
+  return tuple(broadcast_prefix(abstracted_axes, args, ax_leaf))
+
+def _input_type(axes_specs, flat_args):
+  sizes: Dict[Hashable, int] = {}
+  env: Dict[Hashable, core.AbstractValue] = {}
+  def make_aval(arg, spec):
+    if isinstance(spec, tuple):
+      spec = dict(zip(range(len(arg.shape)), spec))  # ('n',) -> {0: 'n'}
+    if not spec: return shaped_abstractify(arg)
+    assert all(arg.shape[i] == sizes.setdefault(name, arg.shape[i])
+               for i, name in spec.items())
+    shape = [env.setdefault(spec[i], ShapedArray((), dtypes.dtype('int32')))
+             if i in spec else d for i, d in enumerate(arg.shape)]
+    return core.DShapedArray(tuple(shape), arg.dtype, False)
+  in_avals_ = map(make_aval, flat_args, axes_specs)
+  return [*env.values(), *in_avals_]
 
 
 class _BackendAndDeviceInfo(NamedTuple):
@@ -2699,20 +2721,9 @@ def make_jaxpr(fun: Callable,
       return map(shaped_abstractify, flat_args), in_tree, [True] * len(flat_args)
     else:
       axes_specs = _abstracted_axes_specs(abstracted_axes, *args, **kwargs)
-      sizes: Dict[Hashable, int] = {}
-      env: Dict[Hashable, core.AbstractValue] = {}
-      def make_aval(arg, spec):
-        if isinstance(spec, tuple):
-            spec = dict(zip(range(len(arg.shape)), spec))
-        if not spec: return shaped_abstractify(arg)
-        assert all(arg.shape[i] == sizes.setdefault(name, arg.shape[i])
-                   for i, name in spec.items())
-        shape = [env.setdefault(spec[i], ShapedArray((), dtypes.dtype('int32')))
-                 if i in spec else d for i, d in enumerate(arg.shape)]
-        return core.DShapedArray(tuple(shape), arg.dtype, False)
-      in_avals = map(make_aval, flat_args, axes_specs)
-      keep_inputs = [False] * len(env) + [True] * len(flat_args)
-      return [*env.values(), *in_avals], in_tree, keep_inputs
+      in_avals = _input_type(axes_specs, flat_args)
+      keep_inputs = [False] * (len(in_avals) - len(flat_args)) + [True] * len(flat_args)
+      return in_avals, in_tree, keep_inputs
 
   @wraps(fun)
   @api_boundary
@@ -2737,12 +2748,6 @@ def make_jaxpr(fun: Callable,
 
   jaxpr_maker.__name__ = f"make_jaxpr({jaxpr_maker.__name__})"
   return jaxpr_maker
-
-def _abstracted_axes_specs(abstracted_axes, *args, **kwargs) -> Tuple:
-  if kwargs: raise NotImplementedError
-  ax_leaf = lambda l: (isinstance(l, dict) and all_leaves(l.values()) or
-                        isinstance(l, tuple) and all_leaves(l))
-  return tuple(broadcast_prefix(abstracted_axes, args, ax_leaf))
 
 
 def device_put(x, device: Optional[xc.Device] = None):
