@@ -1416,12 +1416,10 @@ class DynamicJaxprTrace(core.Trace):
     return out_tracers if primitive.multiple_results else out_tracers.pop()
 
   def process_call(self, call_primitive, f, tracers, params):
-    dim_tracers = _get_tracers_only_in_shapes(tracers)
-    in_avals = _tracers_to_avals(dim_tracers + tracers)
-    keep_inputs = [False] * len(dim_tracers) + [True] * len(tracers)
+    input_type, keep_inputs = _input_type_from_tracers(f, tracers)
     with core.new_sublevel():
       jaxpr, out_avals, consts = trace_to_subjaxpr_dynamic(
-        f, self.main, in_avals, keep_inputs=keep_inputs)
+        f, self.main, input_type, keep_inputs)
     if params.get('inline', False):
       return core.eval_jaxpr(jaxpr, consts, *dim_tracers, *tracers)
     source_info = source_info_util.current()
@@ -1652,7 +1650,7 @@ def trace_to_subjaxpr_dynamic(fun: lu.WrappedFun, main: core.MainTrace,
   frame = JaxprStackFrame()
   with extend_jaxpr_stack(main, frame):
     trace = DynamicJaxprTrace(main, core.cur_sublevel())
-    in_tracers = _avals_to_tracers(trace, in_avals)
+    in_tracers = _input_type_to_tracers(trace, in_avals)
     in_tracers_ = [t for t, keep in zip(in_tracers, keep_inputs) if keep]
     ans = fun.call_wrapped(*in_tracers_)
     out_tracers = map(trace.full_raise, ans)
@@ -1690,28 +1688,36 @@ def partial_eval_to_jaxpr_dynamic(fun: lu.WrappedFun, in_pvals: Sequence[Partial
     return trace_to_jaxpr(fun, in_pvals)
 
 
-def _avals_to_tracers(
+def _input_type_from_tracers(f, tracers):
+  # Compute the input type of a function to be applied. The input type is
+  # inferred from the tracers' types as well as any type annotation on f.
+  breakpoint()  # TODO
+  dim_tracers = _get_tracers_only_in_shapes(tracers)
+  in_avals = _tracers_to_avals(dim_tracers + tracers)
+  keep_inputs = [False] * len(dim_tracers) + [True] * len(tracers)
+
+def _input_type_to_tracers(
     trace: DynamicJaxprTrace, in_avals: Sequence[AbstractValue]
   )  -> Sequence[Tracer]:
   # Create input Tracers given input AbstractValues, each of which can contain
-  # other AbstractValues. That is, each element `a` of `in_avals` can have
-  # abstract values in its shape, which must occur to the left of `a`.
-  env: Dict[AvalId, Tracer] = {}
+  # DeBruijn indices which refer to positions in the input argument list. That
+  # is, each element `a` of `in_avals` can have DBIdx instances in its shape,
+  # which must occur to the left of `a`.
   in_tracers: List[Tracer] = []
-  for a in in_avals:
-    t = env[id(a)] = trace.new_arg(_substitute_tracers_in_aval(env, a))
-    in_tracers.append(t)
-  return in_tracers
+  return [trace.new_arg(_substitute_tracers_in_aval(in_tracers, a))
+          for a in in_avals]
+
+class DBIdx(NamedTuple):
+  val: int
 
 def _substitute_tracers_in_aval(
-    env: Dict[AvalId, Tracer], a: AbstractValue
+    in_tracers: List[Tracer], a: AbstractValue
   ) -> AbstractValue:
   # Substitute Tracers into a given AbstractValue using the given environment.
-  # That is, the input is an AbstractValue possibly containing AbstractValues,
-  # and the output is an AbstractValue possibly containing Tracers.
-  if (isinstance(a, DShapedArray) and
-      any(isinstance(d, AbstractValue) for d in a.shape)):
-    shape = [env[id(d)] if isinstance(d, AbstractValue) else d for d in a.shape]
+  # That is, the input is an AbstractValue possibly containing DeBruijnIndex
+  # instances, and the output is an AbstractValue possibly containing Tracers.
+  if isinstance(a, DShapedArray) and any(type(d) is DBIdx for d in a.shape):
+    shape = [in_tracers[d.val] if type(d) is DBIdx else d for d in a.shape]
     return a.update(shape=tuple(shape))
   return a
 

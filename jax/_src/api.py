@@ -387,18 +387,19 @@ def _abstracted_axes_specs(abstracted_axes, *args, **kwargs) -> Tuple:
 
 def _input_type(axes_specs, flat_args):
   sizes: Dict[Hashable, int] = {}
-  env: Dict[Hashable, core.AbstractValue] = {}
+  env: Dict[Hashable, int] = defaultdict(it.count().__next__)
   def make_aval(arg, spec):
     if isinstance(spec, tuple):
       spec = dict(zip(range(len(arg.shape)), spec))  # ('n',) -> {0: 'n'}
     if not spec: return shaped_abstractify(arg)
     assert all(arg.shape[i] == sizes.setdefault(name, arg.shape[i])
                for i, name in spec.items())
-    shape = [env.setdefault(spec[i], ShapedArray((), dtypes.dtype('int32')))
-             if i in spec else d for i, d in enumerate(arg.shape)]
+    shape = [pe.DBIdx(env[spec[i]]) if i in spec else d
+             for i, d in enumerate(arg.shape)]
     return core.DShapedArray(tuple(shape), arg.dtype, False)
-  in_avals_ = map(make_aval, flat_args, axes_specs)
-  return [*env.values(), *in_avals_]
+  non_dim_avals = map(make_aval, flat_args, axes_specs)
+  dim_avals = [ShapedArray((), dtypes.dtype('int32'))] * len(env)
+  return dim_avals + non_dim_avals
 
 
 class _BackendAndDeviceInfo(NamedTuple):
