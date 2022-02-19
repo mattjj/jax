@@ -32,7 +32,8 @@ import threading
 import weakref
 import types
 from typing import (Any, Callable, Iterable, NamedTuple, Mapping, Optional,
-                    Sequence, Tuple, TypeVar, Union, overload, Dict, Hashable)
+                    Sequence, Tuple, List, TypeVar, Union, overload, Dict,
+                    Hashable)
 from warnings import warn
 
 import numpy as np
@@ -337,6 +338,11 @@ def _prepare_jit(fun, static_argnums, static_argnames, donate_argnums,
   return f, in_tree, args_flat, donated_invars
 
 
+PytreeOfAbstractedAxesSpec = Any
+class AnnotatedFun(NamedTuple):
+  fun: lu.WrappedFun
+
+
 def _python_jit(
     fun: F,
     static_argnums: Union[int, Iterable[int], None] = None,
@@ -345,8 +351,8 @@ def _python_jit(
     backend: Optional[str] = None,
     donate_argnums: Union[int, Iterable[int]] = (),
     inline: bool = False,
-    abstracted_axes: Optional[Any] = None,
-) -> F:
+    abstracted_axes: Optional[PytreeOfAbstractedAxesSpec] = None,
+  ) -> F:
   # The Python implementation of `jax.jit`, being slowly replaced by _cpp_jit.
   _check_callable(fun)
   static_argnums, static_argnames = _infer_argnums_and_argnames(
@@ -364,13 +370,14 @@ def _python_jit(
         fun, static_argnums, static_argnames, donate_argnums, args, kwargs)
     for arg in args_flat:
       _check_arg(arg)
-    if abstracted_axes is not None:
-      axes_specs = _abstracted_axes_specs(abstracted_axes, *args, **kwargs)
-      input_type = _input_type(axes_specs, args_flat)
-      closed_fun = lu.annotate_input_type(closed_fun, input_type)
+    if abstracted_axes is None:
+      input_type = map(shaped_abstractify, args_flat)
+    else:
+      axes_specs = _flat_axes_specs_from_pytree(abstracted_axes, *args, **kwargs)
+      input_type = pe.infer_lambda_input_type(axes_specs, args_flat)
     flat_fun, out_tree = flatten_fun(closed_fun, in_tree)
     out_flat = xla.xla_call(
-        flat_fun, *args_flat,
+        AnnotatedFun(flat_fun, input_type), *args_flat,
         device=device, backend=backend, name=flat_fun.__name__,
         donated_invars=donated_invars, inline=inline)
     return tree_unflatten(out_tree(), out_flat)
@@ -379,27 +386,13 @@ def _python_jit(
                               backend, donate_argnums, inline)
   return f_jitted
 
-def _abstracted_axes_specs(abstracted_axes, *args, **kwargs) -> Tuple:
+def _flat_axes_specs_from_pytree(
+    abstracted_axes, *args, **kwargs
+  ) -> List[pe.AbstractedAxesSpec]:
   if kwargs: raise NotImplementedError
   ax_leaf = lambda l: (isinstance(l, dict) and all_leaves(l.values()) or
                         isinstance(l, tuple) and all_leaves(l))
-  return tuple(broadcast_prefix(abstracted_axes, args, ax_leaf))
-
-def _input_type(axes_specs, flat_args):
-  sizes: Dict[Hashable, int] = {}
-  env: Dict[Hashable, int] = defaultdict(it.count().__next__)
-  def make_aval(arg, spec):
-    if isinstance(spec, tuple):
-      spec = dict(zip(range(len(arg.shape)), spec))  # ('n',) -> {0: 'n'}
-    if not spec: return shaped_abstractify(arg)
-    assert all(arg.shape[i] == sizes.setdefault(name, arg.shape[i])
-               for i, name in spec.items())
-    shape = [pe.DBIdx(env[spec[i]]) if i in spec else d
-             for i, d in enumerate(arg.shape)]
-    return core.DShapedArray(tuple(shape), arg.dtype, False)
-  non_dim_avals = map(make_aval, flat_args, axes_specs)
-  dim_avals = [ShapedArray((), dtypes.dtype('int32'))] * len(env)
-  return dim_avals + non_dim_avals
+  return broadcast_prefix(abstracted_axes, args, ax_leaf)
 
 
 class _BackendAndDeviceInfo(NamedTuple):
@@ -2721,8 +2714,8 @@ def make_jaxpr(fun: Callable,
     if abstracted_axes is None:
       return map(shaped_abstractify, flat_args), in_tree, [True] * len(flat_args)
     else:
-      axes_specs = _abstracted_axes_specs(abstracted_axes, *args, **kwargs)
-      in_avals = _input_type(axes_specs, flat_args)
+      axes_specs = _flat_axes_specs_from_pytree(abstracted_axes, *args, **kwargs)
+      in_avals = pe.infer_lambda_input_type(axes_specs, flat_args)
       keep_inputs = [False] * (len(in_avals) - len(flat_args)) + [True] * len(flat_args)
       return in_avals, in_tree, keep_inputs
 

@@ -11,8 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from __future__ import annotations
 
-from collections import namedtuple
+from collections import namedtuple, defaultdict
 import contextlib
 import functools
 from functools import partial
@@ -20,7 +21,7 @@ import inspect
 import itertools as it
 import operator as op
 from typing import (Any, Callable, Dict, NamedTuple, Optional, Sequence, Tuple,
-                    List, Union, Set, cast)
+                    List, Union, Set, cast, Hashable)
 from weakref import ref
 
 import numpy as np
@@ -1687,6 +1688,33 @@ def partial_eval_to_jaxpr_dynamic(fun: lu.WrappedFun, in_pvals: Sequence[Partial
   with core.new_main(core.EvalTrace, dynamic=True) as _:  # type: ignore
     return trace_to_jaxpr(fun, in_pvals)
 
+AbstractedAxisName = Hashable
+AbstractedAxesSpec = Union[Dict[int, AbstractedAxisName], Tuple[AbstractedAxisName, ...]]
+
+class DBIdx(NamedTuple):
+  val: int
+
+InputType = Tuple[Tuple[AbstractValue, bool], ...]
+
+def infer_lambda_input_type(
+    axes_specs: Sequence[AbstractedAxesSpec], flat_args: Sequence[Any]
+  ) -> InputType:
+  sizes: Dict[AbstractedAxisName, int] = {}
+  env: Dict[AbstractedAxisName, int] = defaultdict(it.count().__next__)
+  def arg_type(x: Any, spec: AbstractedAxesSpec):
+    if isinstance(spec, tuple):
+      spec: Dict[int, Hashable] = dict(zip(range(len(x.shape)), spec))
+    if not spec:
+      return raise_to_shaped(get_aval(x))
+    assert all(x.shape[i] == sizes.setdefault(name, x.shape[i])
+               for i, name in spec.items())   # TODO(mattjj): better shape error
+    s = [DBIdx(env[spec[i]]) if i in spec else d for i, d in enumerate(x.shape)]
+    return DShapedArray(tuple(s), x.dtype, False)
+  explicit_args = map(arg_type, flat_args, axes_specs)
+  implicit_args = [core.ShapedArray((), dtypes.dtype('int32'))] * len(env)
+  which_explicit = [False] * len(implicit_args) + [True] * len(explicit_args)
+  return tuple(zip(implicit_args + explicit_args, which_explicit))
+
 
 def _input_type_from_tracers(f, tracers):
   # Compute the input type of a function to be applied. The input type is
@@ -1706,9 +1734,6 @@ def _input_type_to_tracers(
   in_tracers: List[Tracer] = []
   return [trace.new_arg(_substitute_tracers_in_aval(in_tracers, a))
           for a in in_avals]
-
-class DBIdx(NamedTuple):
-  val: int
 
 def _substitute_tracers_in_aval(
     in_tracers: List[Tracer], a: AbstractValue
