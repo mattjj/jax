@@ -510,12 +510,12 @@ class CheckifyTransformTests(jtu.JaxTestCase):
   def test_scan_consts(self):
     def f(xs):
       def scan_body(carry, _):
+        # closes oves xs
         return carry+1, xs[carry]
       return lax.scan(scan_body, 1, xs)[1]
 
     checked_f = checkify.checkify(f, errors=checkify.index_checks)
-    _, xs = 1, jnp.ones((7, 3))
-    err, _ = checked_f(xs)
+    err, _ = checked_f(jnp.ones((7, 3)))
     self.assertIsNotNone(err.get())
     self.assertStartsWith(err.get(), "out-of-bounds indexing")
 
@@ -528,30 +528,29 @@ class CheckifyTransformTests(jtu.JaxTestCase):
       return lax.scan(scan_body, 1, xs)[1]
 
     checked_f = checkify.checkify(f, errors=checkify.index_checks)
-    _, xs = 1, jnp.ones((7, 3))
-    err, _ = checked_f(xs)
+    err, _ = checked_f(jnp.ones((7, 3)))
     self.assertIsNotNone(err.get())
     self.assertStartsWith(err.get(), "out-of-bounds indexing")
 
   def test_while_consts(self):
-    raise unittest.SkipTest("not quite working...")
     def f(xs):
-
       def while_cond(carry):
         i, _ = carry
-        return i < 2
+        # TODO(lenamartens): fix consts in cond
+        # _ = xs[i]
+        return i > -1
 
       def while_body(carry):
         i, _ = carry
-        return i + 1, xs[i]
+        x = xs[i]
+        return i - 1, x/i
 
       return lax.while_loop(while_cond, while_body, (0, jnp.zeros_like(xs[0])))
 
-    checked_f = checkify.checkify(f, errors=checkify.index_checks)
-    _, xs = 1, jnp.ones((7, 3))
-    err, _ = checked_f(xs)
+    checked_f = checkify.checkify(f, errors=checkify.float_checks)
+    err, _ = checked_f(jnp.ones((7, 3)))
     self.assertIsNotNone(err.get())
-    self.assertStartsWith(err.get(), "out-of-bounds indexing")
+    self.assertStartsWith(err.get(), "divided by zero")
 
 
 
