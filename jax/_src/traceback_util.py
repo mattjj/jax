@@ -26,6 +26,7 @@ C = TypeVar("C", bound=Callable[..., Any])
 _exclude_paths = [__file__, util.__file__]
 
 def register_exclusion(path):
+  return
   _exclude_paths.append(path)
 
 _jax_message_append = (

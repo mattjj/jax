@@ -311,7 +311,7 @@ def jit(
   [-0.54485  0.27744 -0.29255 -0.91421 -0.62452 -0.24748
    -0.85743 -0.78232  0.76827  0.59566 ]
   """
-  if FLAGS.experimental_cpp_jit and not abstracted_axes:
+  if FLAGS.experimental_cpp_jit and not config.jax_dynamic_shapes:
     return _cpp_jit(fun, static_argnums, static_argnames, device, backend,
                     donate_argnums, inline)
   else:
@@ -339,9 +339,6 @@ def _prepare_jit(fun, static_argnums, static_argnames, donate_argnums,
 
 
 PytreeOfAbstractedAxesSpec = Any
-class AnnotatedFun(NamedTuple):
-  fun: lu.WrappedFun
-
 
 def _python_jit(
     fun: F,
@@ -377,7 +374,7 @@ def _python_jit(
       input_type = pe.infer_lambda_input_type(axes_specs, args_flat)
     flat_fun, out_tree = flatten_fun(closed_fun, in_tree)
     out_flat = xla.xla_call(
-        AnnotatedFun(flat_fun, input_type), *args_flat,
+        xla.AnnotatedFun(flat_fun, input_type), *args_flat,
         device=device, backend=backend, name=flat_fun.__name__,
         donated_invars=donated_invars, inline=inline)
     return tree_unflatten(out_tree(), out_flat)

@@ -804,7 +804,21 @@ def lower_jaxpr_to_xla_module(
 
 
 xla_call_p: core.CallPrimitive = core.CallPrimitive('xla_call')
-xla_call = xla_call_p.bind
+
+class AnnotatedFun(NamedTuple):
+  fun: lu.WrappedFun
+  input_type: pe.InputType
+
+def xla_call_bind(annotated_fun: AnnotatedFun, *args, **params):
+  fun, input_type = annotated_fun
+  top_trace = core.find_top_trace(args)
+  fun, env_trace_todo = core.process_env_traces_call(
+      fun, xla_call_p, top_trace and top_trace.level, tuple(params.items()))
+  tracers = map(top_trace.full_raise, args)
+  outs = top_trace.process_call(xla_call_p, AnnotatedFun(fun, input_type),
+                                tracers, params)
+  return map(full_lower, core.apply_todos(env_trace_todo(), outs))
+xla_call = xla_call_p.bind = xla_call_bind
 
 def _xla_call_partial_eval_update_params(params, in_unknowns):
   call_jaxpr = params['call_jaxpr']

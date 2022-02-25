@@ -136,9 +136,11 @@ def _device_from_arg_devices(devices: Sequence[Optional[Device]]) -> Optional[De
 
 # JIT execution
 
-def _xla_call_impl(fun: lu.WrappedFun, *args, device, backend, name,
-                   donated_invars, inline):
+def _xla_call_impl(annotated_fun: xla.AnnotatedFun, *args, device, backend,
+                   name, donated_invars, inline):
   del inline  # Only used at tracing time
+  fun, input_type = annotated_fun
+  breakpoint()
   compiled_fun = _xla_callable(fun, device, backend, name, donated_invars,
                                *unsafe_map(arg_spec, args))
   try:
