@@ -118,6 +118,10 @@ def dtype_to_ir_type(dtype: Union[np.dtype, np.generic]) -> ir.Type:
 def _array_ir_types(aval: core.ShapedArray) -> Sequence[ir.Type]:
   return (ir.RankedTensorType.get(aval.shape, dtype_to_ir_type(aval.dtype)),)
 
+def _dynamic_array_ir_types(aval: core.ShapedArray) -> ir.Type:
+  shape = [d if type(d) is int else -1 for d in aval.shape]
+  return (ir.RankedTensorType.get(shape, dtype_to_ir_type(aval.dtype)),)
+
 ir_type_handlers: Dict[Type[core.AbstractValue],
                         Callable[[Any], Sequence[ir.Type]]] = {}
 
@@ -135,6 +139,7 @@ ir_type_handlers[core.AbstractUnit] = lambda _: ()
 ir_type_handlers[core.ShapedArray] = _array_ir_types
 ir_type_handlers[core.ConcreteArray] = _array_ir_types
 ir_type_handlers[core.AbstractToken] = lambda _: [mhlo.TokenType.get()]
+ir_type_handlers[core.DShapedArray] = _dynamic_array_ir_types
 
 def aval_to_ir_type(aval: core.AbstractValue) -> ir.Type:
   """Convenience wrapper around aval_to_ir_types for single types.

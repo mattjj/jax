@@ -1714,14 +1714,17 @@ class CallPrimitive(Primitive):
     new_params = dict(params)
     jaxpr = new_params.pop('call_jaxpr')
     subfun = lu.hashable_partial(lu.wrap_init(eval_jaxpr), jaxpr, ())
+    if config.jax_dynamic_shapes:
+      subfun = lu.annotate(subfun, tuple((v.aval, True) for v in jaxpr.invars))
     return [subfun], new_params
 
 def call_bind(primitive: CallPrimitive, fun, *args, **params):
   top_trace = find_top_trace(args)
-  fun, env_trace_todo = process_env_traces_call(
+  fun_, env_trace_todo = process_env_traces_call(
       fun, primitive, top_trace and top_trace.level, tuple(params.items()))
   tracers = map(top_trace.full_raise, args)
-  outs = top_trace.process_call(primitive, fun, tracers, params)
+  fun_ = lu.annotate(fun_, fun.in_type)
+  outs = top_trace.process_call(primitive, fun_, tracers, params)
   return map(full_lower, apply_todos(env_trace_todo(), outs))
 
 @lu.transformation_with_aux
@@ -1887,7 +1890,7 @@ def _unmap_shaped_array(size: int, axis_name, axis: Optional[int],
   named_shape = dict(aval.named_shape)
   # TODO: Make this mandatory
   named_shape.pop(axis_name, None)
-  if axis is None: return aval.replace(named_shape=named_shape)
+  if axis is None: return aval.update(named_shape=named_shape)
   return ShapedArray(tuple_insert(aval.shape, axis, size), aval.dtype,
                      named_shape=named_shape, weak_type=aval.weak_type)
 
