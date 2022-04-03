@@ -1102,3 +1102,63 @@ def _call_translation_rule(ctx, avals_in, avals_out, *in_nodes, backend=None,
       ctx, avals_in, avals_out, *in_nodes, name="core_call", backend=backend,
       call_jaxpr=call_jaxpr)
 register_translation(core.call_p, _call_translation_rule)
+
+
+def pad_jaxpr(jaxpr: core.Jaxpr, consts: List[Any],
+              *bounds: Optional[int]) -> Tuple[core.Jaxpr, List[Any]]:
+  @lu.wrap_init
+  def eval_padded(*args):
+    in_vals = [BoundedInt(x, bound) if bound is not None else x
+               for x, bound in zip(args, bounds)]
+    out_vals = _eval_jaxpr_padded(jaxpr, consts, *in_vals)
+    if any(type(x) is BoundedInt for x in out_vals): raise NotImplementedError
+    return out_vals
+
+  in_avals = [v.aval for v in jaxpr.invars]
+  padded_jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(eval_padded, in_avals)
+  return padded_jaxpr, consts
+
+class BoundedInt(NamedTuple):
+  val: core.Tracer  # integral dtype, any shape
+  hi: Optional[int]
+
+LiteralVal = Any
+def _eval_jaxpr_padded(jaxpr: core.Jaxpr, consts: List[Any],
+                       *args: Union[core.Tracer, BoundedInt]):
+  env: Dict[core.Var, Union[core.Tracer, BoundedInt]] = {}
+
+  def read(x: core.Atom) -> Union[LiteralVal, core.Tracer, BoundedInt]:
+    return x.val if type(x) is core.Literal else env[x]
+
+  def write(v: core.Var, val: Union[core.Tracer, BoundedInt]) -> None:
+    env[v] = val
+
+  def aval(x: core.Atom) -> core.AbstractValue:
+    return abstractify(x.val) if type(x) is Literal else x.aval
+
+  write(core.unitvar, core.unit)
+  map(write, jaxpr.constvars, consts)
+  map(write, jaxpr.invars, args)
+  for eqn in jaxpr.eqns:
+    in_avals = [_substitute_into_aval(env, aval(x)) for x in eqn.invars]
+    rule = padding_rules[eqn.primitive]
+    outs = rule(in_avals, *map(read, eqn.invars), **eqn.params)
+    map(write, eqn.outvars, outs)
+  return map(read, jaxpr.outvars)
+
+def _substitute_into_aval(env: Dict[core.Var, Union[core.Tracer, BoundedInt]],
+                          aval: core.AbstractValue) -> core.AbstractValue:
+  if isinstance(aval, core.DShapedArray):
+    shape = tuple(env.get(d, d) for d in aval.shape)
+    if any(isinstance(d, core.Tracer) for d in shape):
+      raise Exception(f"no bound for axis size: {aval}")
+    return aval.update(shape=shape)
+  else:
+    return aval
+
+padding_rules: Dict[core.Primitive, Callable] = {}
+
+def _call_padding_rule(in_avals, *args, name, backend, call_jaxpr,
+                       donated_invars, inline, device):
+  breakpoint()  # TODO(mattjj, dougalm)
+padding_rules[xla_call_p] = _call_padding_rule
