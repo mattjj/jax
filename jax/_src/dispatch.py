@@ -214,6 +214,8 @@ def lower_xla_callable(fun: lu.WrappedFun, device, backend, name,
     donated_invars = [x for i, x in enumerate(donated_invars) if i in kept_var_idx]
     del kept_const_idx
   else:
+    jaxpr_ = xla.pad_jaxpr(jaxpr, (), 3, None, None)
+    breakpoint()
     kept_var_idx = set(range(len(abstract_args)))
   map(prefetch, itertools.chain(consts, jaxpr_literals(jaxpr)))
   jaxpr = apply_outfeed_rewriter(jaxpr)

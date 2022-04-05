@@ -2054,12 +2054,24 @@ def _add_inverse(r, x, y):
   yr = r - x
   return xr, yr
 
+# TODO dedup with _mul_padding_rule
+def _add_padding_rule(avals, x, y):
+  if type(x) is type(y) is xla.BoundedInt:
+    return [xla.BoundedInt(add(x.val, y.val), x.hi * y.hi)]
+  elif type(x) is xla.BoundedInt:
+    return [xla.BoundedInt(add(x.val, y), x.hi * y)]
+  elif type(y) is xla.BoundedInt:
+    return [xla.BoundedInt(add(x, y.val), x * y.hi)]
+  else:
+    return [add(x, y)]
+
 # TODO(slebedev): Why does mypy fail to infer the type here?
 add_p: Primitive = standard_naryop([_num, _num], 'add')
 ad.primitive_jvps[add_p] = _add_jvp
 ad.primitive_transposes[add_p] = _add_transpose
 iad.definverse(add_p, _add_inverse)
 mlir.register_lowering(add_p, partial(_nary_lower_mhlo, mhlo.AddOp))
+xla.padding_rules[add_p] = _add_padding_rule
 
 def _sub_jvp(primals, tangents):
   x, y = primals

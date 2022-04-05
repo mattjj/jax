@@ -50,6 +50,7 @@ from jax.interpreters import ad
 from jax.interpreters import mlir
 from jax.interpreters import xla
 from jax.interpreters import pxla
+from jax.interpreters import partial_eval as pe
 from jax.interpreters.sharded_jit import PartitionSpec as P
 from jax._src import device_array
 import jax._src.lib
@@ -8129,6 +8130,26 @@ class DynamicShapeTest(jtu.JaxTestCase):
       return jnp.sum(jnp.ones(i, dtype='float32'))
 
     self.assertAllClose(f(3), jnp.array(3., dtype='float32'), check_dtypes=True)
+
+  def test_staging_bint(self):
+    b = pe.Bound(3)
+    x = jnp.arange(3)
+    f = lambda x, y: x + y
+    jaxpr = jax.make_jaxpr(f, abstracted_axes=((b,), (b,)))(x, x)
+    # { lambda a:bint{≤3}[] b:i32[a] c:i32[a]. let d:i32[a] = add b c in (d,) }
+    a, b, c = jaxpr.jaxpr.invars
+    self.assertIsInstance(a.aval, core.AbstractBInt)
+    self.assertEqual(a.aval.bound, 3)
+    self.assertLen(b.aval.shape, 1)
+    self.assertIs(b.aval.shape[0], a)
+    self.assertLen(c.aval.shape, 1)
+    self.assertIs(c.aval.shape[0], a)
+
+  def test_jit_abstracted_axes_bint(self):
+    b = pe.Bound(3)
+    x = np.arange(3, dtype='int32')
+    f = jax.jit(lambda x, y: (x + y).sum(), abstracted_axes=((b,), (b,)))
+    f(x, x)
 
 
 if __name__ == '__main__':

@@ -368,7 +368,6 @@ def _python_jit(
     inline: bool = False,
     abstracted_axes: Optional[PytreeOfAbstractedAxesSpec] = None,
   ) -> stages.Wrapped:
-  # The Python implementation of `jax.jit`, being slowly replaced by _cpp_jit.
   _check_callable(fun)
   static_argnums, static_argnames = _infer_argnums_and_argnames(
       fun, static_argnums, static_argnames)

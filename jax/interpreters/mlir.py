@@ -122,6 +122,9 @@ def _dynamic_array_ir_types(aval: core.ShapedArray) -> ir.Type:
   shape = [d if type(d) is int else -1 for d in aval.shape]
   return (ir.RankedTensorType.get(shape, dtype_to_ir_type(aval.dtype)),)
 
+def _bint_ir_types(aval: core.AbstractBInt) -> Sequence[ir.Type]:
+  return (ir.RankedTensorType.get((), dtype_to_ir_type(np.dtype('int32'))),)
+
 ir_type_handlers: Dict[Type[core.AbstractValue],
                         Callable[[Any], Sequence[ir.Type]]] = {}
 
@@ -136,6 +139,7 @@ def aval_to_ir_types(aval: core.AbstractValue) -> Sequence[ir.Type]:
     raise TypeError(f"No ir_type_handler for aval type: {type(aval)}") from err
 
 ir_type_handlers[core.AbstractUnit] = lambda _: ()
+ir_type_handlers[core.AbstractBInt] = _bint_ir_types
 ir_type_handlers[core.ShapedArray] = _array_ir_types
 ir_type_handlers[core.ConcreteArray] = _array_ir_types
 ir_type_handlers[core.AbstractToken] = lambda _: [mhlo.TokenType.get()]

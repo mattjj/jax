@@ -14,6 +14,7 @@
 
 from collections import namedtuple, defaultdict
 import contextlib
+from dataclasses import dataclass
 import functools
 from functools import partial
 import inspect
@@ -1824,6 +1825,10 @@ def partial_eval_to_jaxpr_dynamic(fun: lu.WrappedFun, in_pvals: Sequence[Partial
 AbstractedAxisName = Hashable
 AbstractedAxesSpec = Union[Dict[int, AbstractedAxisName], Tuple[AbstractedAxisName, ...]]
 
+@dataclass(frozen=True, eq=False)
+class Bound:
+  bound: int
+
 class DBIdx(NamedTuple):
   val: int
 
@@ -1850,7 +1855,9 @@ def infer_lambda_input_type(
     return DShapedArray(tuple(s), x.dtype, False)
   explicit_args = [arg_type(x, canon_spec(len(x.shape), s))
                    for x, s in zip(flat_args, axes_specs)]
-  implicit_args = [ShapedArray((), dtypes.dtype('int32'))] * len(env)
+  implicit_args = [ShapedArray((), dtypes.dtype('int32'))
+                   if type(spec) is not Bound else core.AbstractBInt(spec.bound)
+                   for spec in env]
   which_explicit = [False] * len(implicit_args) + [True] * len(explicit_args)
   return tuple(zip(implicit_args + explicit_args, which_explicit))
 

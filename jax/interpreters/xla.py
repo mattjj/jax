@@ -1114,10 +1114,16 @@ def pad_jaxpr(jaxpr: core.Jaxpr, consts: List[Any],
     if any(type(x) is BoundedInt for x in out_vals): raise NotImplementedError
     return out_vals
 
-  in_avals = [v.aval for v in jaxpr.invars]
+  env: Dict[core.Var, int] = {v: bd for v, bd in zip(jaxpr.invars, bounds)
+                              if bd is not None}
+  in_avals = [ShapedArray((), dtypes.dtype('int32'))
+              if isinstance(v.aval, core.AbstractBInt)
+              else _substitute_into_aval(env, v.aval)
+              for v in jaxpr.invars]
   padded_jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(eval_padded, in_avals)
   return padded_jaxpr, consts
 
+# TODO with bints in jaxprs, don't need this wrapper
 class BoundedInt(NamedTuple):
   val: core.Tracer  # integral dtype, any shape
   hi: Optional[int]
@@ -1146,7 +1152,7 @@ def _eval_jaxpr_padded(jaxpr: core.Jaxpr, consts: List[Any],
     map(write, eqn.outvars, outs)
   return map(read, jaxpr.outvars)
 
-def _substitute_into_aval(env: Dict[core.Var, Union[core.Tracer, BoundedInt]],
+def _substitute_into_aval(env: Dict[core.Var, Union[core.Tracer, BoundedInt, int]],
                           aval: core.AbstractValue) -> core.AbstractValue:
   if isinstance(aval, core.DShapedArray):
     shape = tuple(env.get(d, d) for d in aval.shape)
@@ -1157,8 +1163,3 @@ def _substitute_into_aval(env: Dict[core.Var, Union[core.Tracer, BoundedInt]],
     return aval
 
 padding_rules: Dict[core.Primitive, Callable] = {}
-
-def _call_padding_rule(in_avals, *args, name, backend, call_jaxpr,
-                       donated_invars, inline, device):
-  breakpoint()  # TODO(mattjj, dougalm)
-padding_rules[xla_call_p] = _call_padding_rule

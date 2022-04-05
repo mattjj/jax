@@ -990,6 +990,16 @@ class AbstractUnit(AbstractValue):
 
 abstract_unit = AbstractUnit()
 
+class AbstractBInt(AbstractValue):
+  __slots__ = ['bound']
+  bound: int
+
+  def __init__(self, bound):
+    self.bound = bound
+
+  def str_short(self, short_dtypes=False) -> str:
+    return f'bint{{≤{self.bound}}}[]'
+
 def lattice_join(x: Optional[AbstractValue],
                  y: Optional[AbstractValue]) -> AbstractValue:
   if x is None:
@@ -1371,6 +1381,7 @@ def raise_to_shaped(aval: AbstractValue, weak_type=None):
 
 raise_to_shaped_mappings : Dict[type, Callable] = {
   AbstractUnit: lambda aval, _: aval,
+  AbstractBInt: lambda aval, _: aval,
   AbstractToken: lambda aval, _: aval,
   Bot: lambda aval, _: aval,
   UnshapedArray: lambda aval, _: aval,
