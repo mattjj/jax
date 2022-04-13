@@ -441,10 +441,25 @@ def check_error(error: Error) -> None:
   >>> # can re-checkify
   >>> error, _ = checkify.checkify(with_inner_jit)(-1)
   """
+
   if np.shape(error.err):
     err, code, payload = _reduce_any_error(error.err, error.code, error.payload)
   else:
     err, code, payload = error.err, error.code, error.payload
+
+  # find 'true' bottom of trace stack
+  trace_stack = core.thread_local_state.trace_state.trace_stack.stack
+  idx = next(i for i, m in enumerate(trace_stack) if m is
+             core.thread_local_state.trace_state.trace_stack.dynamic)
+
+  # only pay attention to 'true' part of trace stack
+  trace_stack = trace_stack[idx:]
+
+  # lift into everything
+  for m in trace_stack:
+    if (not isinstance(err, core.Tracer) or err._trace.level < len(trace_stack) - 1):
+      err = m.with_cur_sublevel().full_raise(err)
+
   return assert_p.bind(~err, code, payload, msgs=error.msgs)
 
 assert_p = core.Primitive('assert') # TODO: rename to check?
