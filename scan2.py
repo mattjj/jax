@@ -355,6 +355,44 @@ def _for_jvp(primals, tangents, *, jaxpr, nsteps):
   return split_list(out_flat, [len(out_flat) // 2])
 ad.primitive_jvps[for_p] = _for_jvp
 
+def _for_partial_eval(trace, *tracers, jaxpr, nsteps):
+  in_unknowns = [not t.pval.is_known() for t in tracers]
+  jaxpr_known_resout, jaxpr_unknown, out_unknowns, _, num_res = \
+      pe._partial_eval_jaxpr_custom(jaxpr, [False, *in_unknowns], _save_anything)
+  jaxpr_known, res_avals = convert_outputs_to_writes(nsteps, jaxpr_known_resout)
+  empty_res = [jax._src.lax.lax.zeros_like_shaped_array(a) for a in res_avals]
+  tracers_known = [t.pval.get_known() for t in tracers if t.pval.is_known()]
+  out_flat = for_p.bind(*tracers_known, *empty_res, jaxpr=jaxpr_known,
+                        nsteps=nsteps)
+  out_knowns, res = split_list(out_flat, [len(out_flat) - len(empty_res)])
+  # TODO need to munge jaxpr_unknown to read residuals at front
+  # TODO should we have a special 'immutable' path
+  # NOTE we think we'll need 'loop invariant' optimization
+  pass
+pe.custom_partial_eval_rules[for_p] = _for_partial_eval
+
+def convert_outputs_to_writes(
+    nsteps: int, jaxpr: core.Jaxpr
+  ) -> Tuple[core.Jaxpr, List[core.ShapedArray]]:
+  if jaxpr.constvars: raise NotImplementedError  # TODO?
+
+  @lu.wrap_init
+  def eval_jaxpr(*args_and_refs):
+    args, refs = split_list(args_and_refs, [len(jaxpr.invars)])
+    outs = core.eval_jaxpr(jaxpr, (), *args)
+    for r, o in zip(refs, outs):
+      r[args[0]] = o
+    return []
+
+  in_avals = [v.aval for v in jaxpr.invars]
+  ref_avals = [ShapedArrayRef((nsteps, *x.aval.shape), x.aval.dtype)
+              for x in jaxpr.outvars]
+  jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(eval_jaxpr, [*in_avals, *ref_avals])
+  assert not consts
+  return jaxpr, [core.ShapedArray(a.shape, a.dtype) for a in ref_avals]
+
+def _save_anything(*_, **__): return True
+
 #
 
 def f():
@@ -370,13 +408,27 @@ def f(x):
   def body(i, ref):
     x = ref[i]
     ref[i] = x
-    ref[i] = (ref[i] + x) / 2.
+    # ref[i] = (ref[i] + x) / 2.
+    ref[i] = (ref[i] * x) / 2.
   return for_loop(1, body, jnp.array([x]))
 
 prnt(jax.make_jaxpr(f)(3.))
 print(f(3.)[0])
 print(jax.jvp(f, (3.,), (1.,)))
-# print(jax.grad(f)(3.))
+
+y, f_lin = jax.linearize(f, 3.)
+y_dot = f_lin(1.)
+print(y, y_dot)
+print(jax.grad(f)(3.))
+
+# def f(x, y):
+#   def body(i, refs):
+#     x_ref, y_ref = refs
+#     x_ref[0] = jnp.sin(i)
+#     y_ref[i] = x_ref[0] * y_ref[i]
+#   return for_loop(1, body, (x, y))
+
+# f(jnp.array([1.]), jnp.array([1., 2.]))
 
 
 # TODO loop partial eval
