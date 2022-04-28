@@ -21,7 +21,8 @@ from jax.interpreters import mlir
 from jax._src import ad_util
 from jax._src import source_info_util
 from jax._src.api_util import flatten_fun_nokwargs
-from jax._src.util import safe_map, safe_zip, split_list, merge_lists
+from jax._src.util import (safe_map, safe_zip, split_list, merge_lists,
+                           partition_list)
 import jax._src.pretty_printer as pp
 
 map, unsafe_map = safe_map, map
@@ -208,7 +209,6 @@ ad.primitive_transposes[get_p] = _get_transpose
 def _swap_transpose(g, ref, *idx_x):
   *idx, x = idx_x
   x_bar = ref_swap(ref, idx, ad_util.instantiate(g))
-  breakpoint()
   return [None] + [None] * len(idx) + [x_bar]
 ad.primitive_transposes[swap_p] = _swap_transpose
 
@@ -262,7 +262,7 @@ def _eval_jaxpr_discharge_state(jaxpr, consts: List[Any], *args: Any):
     elif eqn.primitive is addupdate_p:
       # `x[i] += val` becomes `x = dus x i (val + (ds x i))
       x, *idx, val = in_vals
-      ans = jax.lax.dynamic_update_index(x, idx, val + dynamic_index(x, idx))
+      ans = dynamic_update_index(x, idx, val + dynamic_index(x, idx))
       write(eqn.invars[0], ans)
     else:
       # standard eval_jaxpr stuff (NOTE assumes no State effects possible here!)
@@ -433,21 +433,28 @@ def convert_inputs_to_reads(
 def _save_anything(*_, **__): return True
 
 
-# TODO add reverse flag
 def _for_transpose(in_cts, *args, jaxpr, nsteps, reverse):
   args_ = [ct if ad.is_undefined_primal(x) else x
            for x, ct in zip(args, in_cts)]
-  jaxpr_transpose = transpose_jaxpr(jaxpr)
-  breakpoint()
+  jaxpr_transpose = transpose_jaxpr(jaxpr, map(ad.is_undefined_primal, args))
   all_outs = for_p.bind(*args_, jaxpr=jaxpr_transpose, nsteps=nsteps,
                         reverse=not reverse)
   return [ct if ad.is_undefined_primal(x) else None
           for x, ct in zip(args, all_outs)]
 ad.primitive_transposes[for_p] = _for_transpose
 
-def transpose_jaxpr(jaxpr: core.Jaxpr) -> core.Jaxpr:
-  def trans(*args):
-    ad.backward_pass(jaxpr, (), False, (), args, ())
+# TODO better not dce the index
+def transpose_jaxpr(jaxpr: core.Jaxpr, which_linear: List[bool]) -> core.Jaxpr:
+  def trans(i, *args):
+    primal_jaxpr, tangent_jaxpr_, _, _, _ = \
+        pe._partial_eval_jaxpr_custom(jaxpr, [False, *which_linear],
+                                      _save_anything)
+    tangent_jaxpr, used = pe.dce_jaxpr(tangent_jaxpr_, [])
+    primal_args = [x for x, lin in zip(args, which_linear) if not lin]
+    res = core.eval_jaxpr(primal_jaxpr, (), i, *primal_args)
+    ct_args = [x for x, lin, used in zip(args, which_linear, used[1+len(res):])
+               if lin and used]
+    ad.backward_pass(tangent_jaxpr, (), False, (), (*res, i, *ct_args), ())
     return []
   jaxpr_trans, _, _ = pe.trace_to_jaxpr_dynamic(
       lu.wrap_init(trans), [v.aval for v in jaxpr.invars])
@@ -467,9 +474,9 @@ print(f())
 def f(x):
   def body(i, ref):
     x = ref[i]
-    ref[i] = jnp.sin(x)
-    # ref[i] = x
-    # ref[i] = (ref[i] + x) / 2.
+    # ref[i] = jnp.sin(x)
+    ref[i] = x
+    ref[i] = (ref[i] + x) / 2.
     # ref[i] = (ref[i] * x) / 2.
   return for_loop(1, body, jnp.array([x]))
 
@@ -490,6 +497,32 @@ print(jax.grad(lambda x: f(x)[0])(3.))
 #   return for_loop(1, body, (x, y))
 
 # f(jnp.array([1.]), jnp.array([1., 2.]))
+
+
+def f(x):
+  def body(i, refs):
+    x_ref, y_ref = refs
+    y_ref[i] = x_ref[i] * x_ref[i+1]
+  n = x.shape[0]
+  _, y = for_loop(n - 1, body, (x, jnp.zeros(n - 1)))
+  return y
+
+def f_ref(x):
+  return x[:-1] * x[1:]
+
+x = jnp.arange(10.)
+print(f(x))
+print(f_ref(x))
+
+print(jax.jvp(f, [x], [x]))
+print(jax.jvp(f_ref, [x], [x]))
+
+# TODO wrong!!
+# print(jax.linearize(f, x)[1](x))
+# print(jax.linearize(f_ref, x)[1](x))
+
+# print(jax.grad(lambda x: f(x).sum())(x))
+# print(jax.grad(lambda x: f_ref(x).sum())(x))
 
 
 # TODO loop transpose
