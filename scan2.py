@@ -12,7 +12,6 @@ import jax.numpy as jnp
 
 from jax import core
 from jax import linear_util as lu
-from jax.util import safe_map, safe_zip, split_list
 from jax.tree_util import (tree_flatten, tree_unflatten, tree_structure,
                            treedef_tuple)
 from jax.interpreters import ad
@@ -20,7 +19,9 @@ from jax.interpreters import partial_eval as pe
 from jax.interpreters import xla
 from jax.interpreters import mlir
 from jax._src import ad_util
+from jax._src import source_info_util
 from jax._src.api_util import flatten_fun_nokwargs
+from jax._src.util import safe_map, safe_zip, split_list, merge_lists
 import jax._src.pretty_printer as pp
 
 map, unsafe_map = safe_map, map
@@ -199,26 +200,27 @@ prnt(jaxpr_staged)
 
 
 def _get_transpose(g, ref, *idx):
-  ref_addupdate(ref, idx, g)
+  if type(g) is not ad_util.Zero:
+    ref_addupdate(ref, idx, g)
   return [None, None]
 ad.primitive_transposes[get_p] = _get_transpose
 
 def _swap_transpose(g, ref, *idx_x):
   *idx, x = idx_x
   x_bar = ref_swap(ref, idx, ad_util.instantiate(g))
-  return [None, None, x_bar]
+  breakpoint()
+  return [None] + [None] * len(idx) + [x_bar]
 ad.primitive_transposes[swap_p] = _swap_transpose
 
-print("==> TRANSPOSE ==>")
-
-avals = [x.aval for x in jaxpr_staged.outvars]
-def trans(res, ref):
-  ad.backward_pass(jaxpr_staged, (), (), (), (res, ref), ())
-  return []
-jaxpr_trans, _, _ = pe.trace_to_jaxpr_dynamic(
-    lu.wrap_init(trans), [core.ShapedArray((), jnp.dtype('float32')),
-                          ShapedArrayRef((4,), jnp.dtype('float32'))])
-prnt(jaxpr_trans)
+# print("==> TRANSPOSE ==>")
+# avals = [x.aval for x in jaxpr_staged.outvars]
+# def trans(res, ref):
+#   ad.backward_pass(jaxpr_staged, (), (), (), (res, ref), ())
+#   return []
+# jaxpr_trans, _, _ = pe.trace_to_jaxpr_dynamic(
+#     lu.wrap_init(trans), [core.ShapedArray((), jnp.dtype('float32')),
+#                           ShapedArrayRef((4,), jnp.dtype('float32'))])
+# prnt(jaxpr_trans)
 
 
 # discharge!
@@ -304,7 +306,8 @@ def for_loop(nsteps: int, body: Callable[[int, Ref[S]], None],
              init_state: S) -> S:
   init_state, state_tree = tree_flatten(init_state)
   jaxpr, consts = _trace_to_jaxpr(body, state_tree, map(make_ref, init_state))
-  out_flat = for_p.bind(*consts, *init_state, jaxpr=jaxpr, nsteps=int(nsteps))
+  out_flat = for_p.bind(*consts, *init_state, jaxpr=jaxpr, nsteps=int(nsteps),
+                        reverse=False)
   return tree_unflatten(state_tree, out_flat)
 for_p = core.Primitive('for')
 for_p.multiple_results = True
@@ -332,44 +335,60 @@ def _for_abstract_eval(*_, jaxpr, **__):
 
 for_p.def_impl(partial(xla.apply_primitive, for_p))
 
-def _for_impl(*args, jaxpr, nsteps):
+def _for_impl(*args, jaxpr, nsteps, reverse):
   lowered_jaxpr, consts = discharge_state(jaxpr, ())
   def cond(carry):
     i, _ = carry
     return i < nsteps
   def body(carry):
     i, state = carry
-    new_state = core.eval_jaxpr(lowered_jaxpr, consts, i, *state)
+    i_ = nsteps - i - 1 if reverse else i
+    new_state = core.eval_jaxpr(lowered_jaxpr, consts, i_, *state)
     return i + 1, new_state
   _, state = jax.lax.while_loop(cond, body, (0, [*args]))
   return state
 mlir.register_lowering(for_p, mlir.lower_fun(_for_impl, multiple_results=True))
 
-def _for_jvp(primals, tangents, *, jaxpr, nsteps):
+def _for_jvp(primals, tangents, *, jaxpr, nsteps, reverse):
   tangents = map(ad.instantiate_zeros, tangents)  # TODO handle symbolic zero
   jaxpr_ = core.ClosedJaxpr(jaxpr, ())
   jvp_jaxpr_, _ = ad.jvp_jaxpr(jaxpr_, [False] + [True] * len(tangents), True)
   jvp_jaxpr, jvp_consts = jvp_jaxpr_.jaxpr, jvp_jaxpr_.consts
   out_flat = for_p.bind(*jvp_consts, *primals, *tangents, jaxpr=jvp_jaxpr,
-                        nsteps=nsteps)
+                        nsteps=nsteps, reverse=reverse)
   return split_list(out_flat, [len(out_flat) // 2])
 ad.primitive_jvps[for_p] = _for_jvp
 
-def _for_partial_eval(trace, *tracers, jaxpr, nsteps):
+def _for_partial_eval(trace, *tracers, jaxpr, nsteps, reverse):
   in_unknowns = [not t.pval.is_known() for t in tracers]
-  jaxpr_known_resout, jaxpr_unknown, out_unknowns, _, num_res = \
+  jaxpr_known_resout, jaxpr_unknown_resin_, _, _, num_res = \
       pe._partial_eval_jaxpr_custom(jaxpr, [False, *in_unknowns], _save_anything)
+  jaxpr_unknown_resin, used_inputs = pe.dce_jaxpr(jaxpr_unknown_resin_, [])
+  assert used_inputs[0]  # TODO dont dce i! or maybe just munge input binders
   jaxpr_known, res_avals = convert_outputs_to_writes(nsteps, jaxpr_known_resout)
-  empty_res = [jax._src.lax.lax.zeros_like_shaped_array(a) for a in res_avals]
+  empty_res = [ad_util.zeros_like_aval(a) for a in res_avals]
   tracers_known = [t.pval.get_known() for t in tracers if t.pval.is_known()]
   out_flat = for_p.bind(*tracers_known, *empty_res, jaxpr=jaxpr_known,
-                        nsteps=nsteps)
-  out_knowns, res = split_list(out_flat, [len(out_flat) - len(empty_res)])
-  # TODO need to munge jaxpr_unknown to read residuals at front
-  # TODO should we have a special 'immutable' path
-  # NOTE we think we'll need 'loop invariant' optimization
-  pass
+                        nsteps=nsteps, reverse=reverse)
+  known_outputs, res = split_list(out_flat, [len(out_flat) - len(empty_res)])
+  jaxpr_unknown = convert_inputs_to_reads(nsteps, len(res_avals),
+                                          jaxpr_unknown_resin)
+
+  res = map(trace.new_instantiated_const, res)
+  unknown_inputs = res + [t for t in tracers if not t.pval.is_known()]
+  unknown_outputs_ = [pe.JaxprTracer(trace, pe.PartialVal.unknown(t.aval), None)
+                      for t in unknown_inputs]
+  name_stack = source_info_util.current_name_stack()[len(trace.name_stack):]
+  source = source_info_util.current().replace(name_stack=name_stack)
+  eqn = pe.new_eqn_recipe(unknown_inputs, unknown_outputs_,
+                          for_p, dict(jaxpr=jaxpr_unknown, nsteps=nsteps,
+                                      reverse=reverse),
+                          jaxpr_unknown.effects, source)
+  _, unknown_outputs = split_list(unknown_outputs_, [num_res])
+  for t in unknown_outputs: t.recipe = eqn
+  return merge_lists(in_unknowns, known_outputs, unknown_outputs)
 pe.custom_partial_eval_rules[for_p] = _for_partial_eval
+# NOTE we think we'll need 'loop invariant' optimization
 
 def convert_outputs_to_writes(
     nsteps: int, jaxpr: core.Jaxpr
@@ -377,21 +396,62 @@ def convert_outputs_to_writes(
   if jaxpr.constvars: raise NotImplementedError  # TODO?
 
   @lu.wrap_init
-  def eval_jaxpr(*args_and_refs):
-    args, refs = split_list(args_and_refs, [len(jaxpr.invars)])
-    outs = core.eval_jaxpr(jaxpr, (), *args)
-    for r, o in zip(refs, outs):
-      r[args[0]] = o
+  def eval_jaxpr(i, *refs):
+    orig_refs, res_refs = split_list(refs, [len(jaxpr.invars) - 1])
+    outs = core.eval_jaxpr(jaxpr, (), i, *orig_refs)
+    for r, o in zip(res_refs, outs):
+      r[i] = o
     return []
 
-  in_avals = [v.aval for v in jaxpr.invars]
-  ref_avals = [ShapedArrayRef((nsteps, *x.aval.shape), x.aval.dtype)
-              for x in jaxpr.outvars]
-  jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(eval_jaxpr, [*in_avals, *ref_avals])
-  assert not consts
-  return jaxpr, [core.ShapedArray(a.shape, a.dtype) for a in ref_avals]
+  in_avals = [v.aval for v in jaxpr.invars]  # [i, *orig_ref_avals]
+  res_ref_avals = [ShapedArrayRef((nsteps, *x.aval.shape), x.aval.dtype)
+                   for x in jaxpr.outvars]
+  jaxpr, _, () = pe.trace_to_jaxpr_dynamic(eval_jaxpr, [*in_avals, *res_ref_avals])
+  return jaxpr, [core.ShapedArray(a.shape, a.dtype) for a in res_ref_avals]
+
+def convert_inputs_to_reads(
+    nsteps: int, num_res: int, jaxpr: core.Jaxpr
+  ) -> core.Jaxpr:
+  if jaxpr.constvars: raise NotImplementedError  # TODO?
+
+  @lu.wrap_init
+  def eval_jaxpr(i, *refs):
+    res_refs, orig_refs = split_list(refs, [num_res])
+    res_vals = [r[i] for r in res_refs]
+    () = core.eval_jaxpr(jaxpr, (), *res_vals, i, *orig_refs)
+    return []
+
+  res_val_avals, (i_aval,), orig_ref_avals = \
+      split_list([v.aval for v in jaxpr.invars], [num_res, 1])
+  res_ref_avals = [ShapedArrayRef((nsteps, *x.shape), x.dtype)
+                   for x in res_val_avals]
+
+  jaxpr, _, () = pe.trace_to_jaxpr_dynamic(
+      eval_jaxpr, [i_aval, *res_ref_avals, *orig_ref_avals])
+  return jaxpr
 
 def _save_anything(*_, **__): return True
+
+
+# TODO add reverse flag
+def _for_transpose(in_cts, *args, jaxpr, nsteps, reverse):
+  args_ = [ct if ad.is_undefined_primal(x) else x
+           for x, ct in zip(args, in_cts)]
+  jaxpr_transpose = transpose_jaxpr(jaxpr)
+  breakpoint()
+  all_outs = for_p.bind(*args_, jaxpr=jaxpr_transpose, nsteps=nsteps,
+                        reverse=not reverse)
+  return [ct if ad.is_undefined_primal(x) else None
+          for x, ct in zip(args, all_outs)]
+ad.primitive_transposes[for_p] = _for_transpose
+
+def transpose_jaxpr(jaxpr: core.Jaxpr) -> core.Jaxpr:
+  def trans(*args):
+    ad.backward_pass(jaxpr, (), False, (), args, ())
+    return []
+  jaxpr_trans, _, _ = pe.trace_to_jaxpr_dynamic(
+      lu.wrap_init(trans), [v.aval for v in jaxpr.invars])
+  return jaxpr_trans
 
 #
 
@@ -407,9 +467,10 @@ print(f())
 def f(x):
   def body(i, ref):
     x = ref[i]
-    ref[i] = x
+    ref[i] = jnp.sin(x)
+    # ref[i] = x
     # ref[i] = (ref[i] + x) / 2.
-    ref[i] = (ref[i] * x) / 2.
+    # ref[i] = (ref[i] * x) / 2.
   return for_loop(1, body, jnp.array([x]))
 
 prnt(jax.make_jaxpr(f)(3.))
@@ -419,7 +480,7 @@ print(jax.jvp(f, (3.,), (1.,)))
 y, f_lin = jax.linearize(f, 3.)
 y_dot = f_lin(1.)
 print(y, y_dot)
-print(jax.grad(f)(3.))
+print(jax.grad(lambda x: f(x)[0])(3.))
 
 # def f(x, y):
 #   def body(i, refs):
@@ -431,8 +492,8 @@ print(jax.grad(f)(3.))
 # f(jnp.array([1.]), jnp.array([1., 2.]))
 
 
-# TODO loop partial eval
 # TODO loop transpose
+# TODO addupdate transpose rule
 # TODO loop batching
 # TODO fixpoints, need jvp_jaxpr with extra state-is-differentiated input/output
 # TODO nested scans leaving something on the table? how could we nest these
@@ -448,3 +509,5 @@ print(jax.grad(f)(3.))
 # have out-of-line functions)
 # OR maybe not actually leaving anything on the table...
 
+
+# TODO pe.partial_eval_jaxpr_custom which does the dce (o/w caller must)
