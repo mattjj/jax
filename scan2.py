@@ -125,9 +125,11 @@ def _addupdate_pp_rule(eqn, context, settings):
   x, *idx, v = eqn.invars
   # pretty-print ` = addupdate x i v` as `x[i] += v`
   idx = ','.join(core.pp_var(i, context) for i in idx)
-  return pp.concat([pp.text(core.pp_var(x, context)),
-                    pp.text('['), pp.text(idx), pp.text('] += '),
-                    pp.text(core.pp_var(v, context))])
+  return pp.concat([
+    pp_ref(pp.concat([
+        pp.text(core.pp_var(x, context)),
+        pp.text('['), pp.text(idx), pp.text(']')
+      ])), pp.text(' += '), pp.text(core.pp_var(v, context))])
 core.pp_eqn_rules[addupdate_p] = _addupdate_pp_rule
 
 def addupdate_jvp_rule(primals, tangents):
