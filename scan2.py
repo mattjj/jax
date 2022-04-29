@@ -633,9 +633,8 @@ print(jax.grad(h_ref)(x))
 # TODO don't dce loop counter (maybe add 'instantiate' to dce_jaxpr?)
 # TODO partial eval is being wasteful by saving (not rematerializing) pure fns
 #      of loop counter
-# TODO addupdate transpose rule
 # TODO loop batching
-# TODO fixpoints, need jvp_jaxpr with extra state-is-differentiated input/output
+# TODO fixpoints
 # TODO nested scans leaving something on the table? how could we nest these
 # loops? may need 'heap tags'. could statically give each for an id, and mention
 # it in the reference. that doesn't work for standalone functions. maybe can be
