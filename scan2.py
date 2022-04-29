@@ -378,8 +378,8 @@ def _for_partial_eval(trace, *tracers, jaxpr, nsteps, reverse):
   assert used_inputs[0]  # TODO dont dce i! or maybe just munge input binders
   jaxpr_known, res_avals = convert_outputs_to_writes(nsteps, jaxpr_known_resout)
   empty_res = [ad_util.zeros_like_aval(a) for a in res_avals]
-  tracers_known = [t.pval.get_known() for t, uk in zip(tracers, out_unknowns) if
-      not uk]
+  tracers_known = [t.pval.get_known() for t, uk in zip(tracers, out_unknowns)
+                   if not uk]
   out_flat = for_p.bind(*tracers_known, *empty_res, jaxpr=jaxpr_known,
                         nsteps=nsteps, reverse=reverse)
   known_outputs, res = split_list(out_flat, [len(out_flat) - len(empty_res)])
