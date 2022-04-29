@@ -352,13 +352,30 @@ def _for_impl(*args, jaxpr, nsteps, reverse):
 mlir.register_lowering(for_p, mlir.lower_fun(_for_impl, multiple_results=True))
 
 def _for_jvp(primals, tangents, *, jaxpr, nsteps, reverse):
-  tangents = map(ad.instantiate_zeros, tangents)  # TODO handle symbolic zero
+  nonzero_tangents = [type(t) is not ad_util.Zero for t in tangents]
+  body_jaxpr, body_consts = discharge_state(jaxpr, ())
+  for _ in range(len(nonzero_tangents)):
+    _, out_nonzero_tangents = ad.jvp_jaxpr(
+        core.ClosedJaxpr(body_jaxpr, body_consts), [False] + nonzero_tangents,
+        instantiate=nonzero_tangents)
+    if out_nonzero_tangents == nonzero_tangents:
+      break
+    nonzero_tangents = map(operator.or_, nonzero_tangents, out_nonzero_tangents)
+  else:
+    raise Exception
+  tangents = [ad.instantiate_zeros(t) if inst else t for t, inst in
+      zip(tangents, nonzero_tangents)]
+  tangents = [t for t in tangents if type(t) is not ad_util.Zero]
   jaxpr_ = core.ClosedJaxpr(jaxpr, ())
-  jvp_jaxpr_, _ = ad.jvp_jaxpr(jaxpr_, [False] + [True] * len(tangents), True)
+  jvp_jaxpr_, _ = ad.jvp_jaxpr(jaxpr_, [False] + nonzero_tangents, [])
   jvp_jaxpr, jvp_consts = jvp_jaxpr_.jaxpr, jvp_jaxpr_.consts
   out_flat = for_p.bind(*jvp_consts, *primals, *tangents, jaxpr=jvp_jaxpr,
                         nsteps=nsteps, reverse=reverse)
-  return split_list(out_flat, [len(out_flat) // 2])
+  _, out_primals, out_tangents = split_list(out_flat, [len(jvp_consts), len(primals)])
+  out_tangents_iter = iter(out_tangents)
+  out_tangents = [next(out_tangents_iter) if nz else ad_util.Zero.from_value(p)
+                  for p, nz in zip(out_primals, nonzero_tangents)]
+  return out_primals, out_tangents
 ad.primitive_jvps[for_p] = _for_jvp
 
 def _for_partial_eval(trace, *tracers, jaxpr, nsteps, reverse):
