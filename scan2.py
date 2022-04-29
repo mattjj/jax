@@ -388,7 +388,6 @@ def _for_partial_eval(trace, *tracers, jaxpr, nsteps, reverse):
   known_outputs, res = split_list(out_flat, [len(out_flat) - len(empty_res)])
   jaxpr_unknown = convert_inputs_to_reads(nsteps, len(res_avals),
                                           jaxpr_unknown_resin)
-
   res = map(trace.new_instantiated_const, res)
   unknown_inputs = res + [t for t in tracers if not t.pval.is_known()]
   unknown_outputs_ = [pe.JaxprTracer(trace, pe.PartialVal.unknown(t.aval), None)
@@ -449,8 +448,10 @@ def _save_anything(*_, **__): return True
 
 
 def _for_transpose(in_cts, *args, jaxpr, nsteps, reverse):
-  args_ = [ct if ad.is_undefined_primal(x) else x
+  args_ = [ct if ad.is_undefined_primal(x) or not type(ct) is ad_util.Zero else x
            for x, ct in zip(args, in_cts)]
+  args_ = [ad_util.zeros_like_aval(x.aval) if type(y) is ad_util.Zero else y
+           for x, y in zip(args, args_)]
   jaxpr_transpose = transpose_jaxpr(jaxpr, map(ad.is_undefined_primal, args))
   all_outs = for_p.bind(*args_, jaxpr=jaxpr_transpose, nsteps=nsteps,
                         reverse=not reverse)
@@ -461,14 +462,20 @@ ad.primitive_transposes[for_p] = _for_transpose
 # TODO better not dce the index
 def transpose_jaxpr(jaxpr: core.Jaxpr, which_linear: List[bool]) -> core.Jaxpr:
   def trans(i, *args):
-    primal_jaxpr, tangent_jaxpr_, _, _, _ = \
+    # First we want to run the computation to read all the residual refs. We can
+    # do that by using partial evaluation with all linear inputs unknown.
+    res_jaxpr, tangent_jaxpr_, *_ = \
         pe._partial_eval_jaxpr_custom(jaxpr, [False, *which_linear],
                                       _save_anything)
+    res_args = [x for x, lin in zip(args, which_linear) if not lin]
+    res = core.eval_jaxpr(res_jaxpr, (), i, *res_args)
+
+    # Now that we have residual values, we run the tangent jaxpr. It takes as
+    # input the residuals, the loop index, and all the refs (at least, the ones
+    # that are used in the body). Luckily, `tangent_jaxpr_` has all known and
+    # unknown inputs!
     tangent_jaxpr, used = pe.dce_jaxpr(tangent_jaxpr_, [])
-    primal_args = [x for x, lin in zip(args, which_linear) if not lin]
-    res = core.eval_jaxpr(primal_jaxpr, (), i, *primal_args)
-    ct_args = [x for x, lin, u in zip(args, which_linear, used[1+len(res):])
-               if lin and u]
+    ct_args = [x for x, u in zip(args, used[1+len(res):]) if u]
     ad.backward_pass(tangent_jaxpr, (), False, (), (*res, i, *ct_args), ())
     return []
   jaxpr_trans, _, _ = pe.trace_to_jaxpr_dynamic(
@@ -495,14 +502,14 @@ def f(x):
     # ref[i] = (ref[i] * x) / 2.
   return for_loop(1, body, jnp.array([x]))
 
-prnt(jax.make_jaxpr(f)(3.))
-print(f(3.)[0])
-print(jax.jvp(f, (3.,), (1.,)))
+# prnt(jax.make_jaxpr(f)(3.))
+# print(f(3.)[0])
+# print(jax.jvp(f, (3.,), (1.,)))
 
-y, f_lin = jax.linearize(f, 3.)
-y_dot = f_lin(1.)
-print(y, y_dot)
-print(jax.grad(lambda x: f(x)[0])(3.))
+# y, f_lin = jax.linearize(f, 3.)
+# y_dot = f_lin(1.)
+# print(y, y_dot)
+# print(jax.grad(lambda x: f(x)[0])(3.))
 
 # def f(x, y):
 #   def body(i, refs):
@@ -537,13 +544,12 @@ print(jax.jvp(f, [x], [x]))
 print(jax.jvp(f_ref, [x], [x]))
 
 print("========== F LIN ===========")
-# TODO wrong!!
 print(jax.linearize(f, x)[1](x))
 print(jax.linearize(f_ref, x)[1](x))
 
-print("========== F LIN ===========")
+print("========== F GRAD ===========")
 print(jax.grad(lambda x: f(x).sum())(x))
-# print(jax.grad(lambda x: f_ref(x).sum())(x))
+print(jax.grad(lambda x: f_ref(x).sum())(x))
 
 
 # TODO loop transpose
