@@ -78,6 +78,7 @@ def swap_abstract_eval(ref, *idx_x):
 def _swap_jvp(primals, tangents):
   primal_ref, *idx, x = primals
   tangent_ref, *_, xdot = tangents
+  xdot = ad_util.instantiate(xdot)
   return ref_swap(primal_ref, idx, x), ref_swap(tangent_ref, idx, xdot)
 ad.primitive_jvps[swap_p] = _swap_jvp
 
@@ -562,23 +563,30 @@ def f_ref(x):
   return jnp.cos(x[:-1]) * x[1:]
 
 x = jnp.arange(10.)
-print("============= F ===========")
-prnt(jax.make_jaxpr(f)(x))
-print(f(x))
-print(f_ref(x))
+# print("============= F ===========")
+# prnt(jax.make_jaxpr(f)(x))
+# print(f(x))
+# print(f_ref(x))
 
-print("========== F JVP ===========")
-# prnt(jax.make_jaxpr(lambda x, t: jax.jvp(f, (x,), (t,)))(x, x))
-print(jax.jvp(f, [x], [x]))
-print(jax.jvp(f_ref, [x], [x]))
+# print("========== F JVP ===========")
+# # prnt(jax.make_jaxpr(lambda x, t: jax.jvp(f, (x,), (t,)))(x, x))
+# print(jax.jvp(f, [x], [x]))
+# print(jax.jvp(f_ref, [x], [x]))
 
-print("========== F LIN ===========")
-print(jax.linearize(f, x)[1](x))
-print(jax.linearize(f_ref, x)[1](x))
+# print("========== F LIN ===========")
+# print(jax.linearize(f, x)[1](x))
+# print(jax.linearize(f_ref, x)[1](x))
 
-print("========== F GRAD ===========")
-print(jax.grad(lambda x: f(x).sum())(x))
-print(jax.grad(lambda x: f_ref(x).sum())(x))
+# print("========== F GRAD ===========")
+# print(jax.grad(lambda x: f(x).sum())(x))
+# print(jax.grad(lambda x: f_ref(x).sum())(x))
+
+print("========== F 2xGRAD ===========")
+g     = lambda x: jax.grad(lambda x: f(x).sum())(x).sum()
+g_ref = lambda x: jax.grad(lambda x: f_ref(x).sum())(x).sum()
+print(jax.grad(g)(x))
+print(jax.grad(g_ref)(x))
+
 
 
 # TODO closing over consts, what do? convert to refs?
