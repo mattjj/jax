@@ -1,3 +1,4 @@
+import operator
 import ipdb, sys, traceback
 def info(type, value, tb):
     traceback.print_exception(type, value, tb)
@@ -361,13 +362,24 @@ ad.primitive_jvps[for_p] = _for_jvp
 
 def _for_partial_eval(trace, *tracers, jaxpr, nsteps, reverse):
   in_unknowns = [not t.pval.is_known() for t in tracers]
+  body_jaxpr, () = discharge_state(jaxpr, ())
+  for _ in range(len(in_unknowns)):
+    _, _, out_unknowns, _, num_res = \
+        pe._partial_eval_jaxpr_custom(body_jaxpr, [False, *in_unknowns], _save_anything)
+    if out_unknowns == in_unknowns:
+      break
+    in_unknowns = safe_map(operator.or_, in_unknowns, out_unknowns)
+  else:
+    raise Exception
+  tracers = [trace.instantiate_const(t) if uk else t for t, uk in zip(tracers, out_unknowns)]
   jaxpr_known_resout, jaxpr_unknown_resin_, _, _, num_res = \
-      pe._partial_eval_jaxpr_custom(jaxpr, [False, *in_unknowns], _save_anything)
+      pe._partial_eval_jaxpr_custom(jaxpr, [False, *out_unknowns], _save_anything)
   jaxpr_unknown_resin, used_inputs = pe.dce_jaxpr(jaxpr_unknown_resin_, [])
   assert used_inputs[0]  # TODO dont dce i! or maybe just munge input binders
   jaxpr_known, res_avals = convert_outputs_to_writes(nsteps, jaxpr_known_resout)
   empty_res = [ad_util.zeros_like_aval(a) for a in res_avals]
-  tracers_known = [t.pval.get_known() for t in tracers if t.pval.is_known()]
+  tracers_known = [t.pval.get_known() for t, uk in zip(tracers, out_unknowns)
+                   if not uk]
   out_flat = for_p.bind(*tracers_known, *empty_res, jaxpr=jaxpr_known,
                         nsteps=nsteps, reverse=reverse)
   known_outputs, res = split_list(out_flat, [len(out_flat) - len(empty_res)])
@@ -386,7 +398,7 @@ def _for_partial_eval(trace, *tracers, jaxpr, nsteps, reverse):
                           jaxpr_unknown.effects, source)
   _, unknown_outputs = split_list(unknown_outputs_, [num_res])
   for t in unknown_outputs: t.recipe = eqn
-  return merge_lists(in_unknowns, known_outputs, unknown_outputs)
+  return merge_lists(out_unknowns, known_outputs, unknown_outputs)
 pe.custom_partial_eval_rules[for_p] = _for_partial_eval
 # NOTE we think we'll need 'loop invariant' optimization
 
@@ -511,17 +523,23 @@ def f_ref(x):
   return x[:-1] * x[1:]
 
 x = jnp.arange(10.)
+print("============= F ===========")
+prnt(jax.make_jaxpr(f)(x))
 print(f(x))
 print(f_ref(x))
 
+print("========== F JVP ===========")
+# prnt(jax.make_jaxpr(lambda x, t: jax.jvp(f, (x,), (t,)))(x, x))
 print(jax.jvp(f, [x], [x]))
 print(jax.jvp(f_ref, [x], [x]))
 
+print("========== F LIN ===========")
 # TODO wrong!!
-# print(jax.linearize(f, x)[1](x))
-# print(jax.linearize(f_ref, x)[1](x))
+print(jax.linearize(f, x)[1](x))
+print(jax.linearize(f_ref, x)[1](x))
 
-# print(jax.grad(lambda x: f(x).sum())(x))
+print("========== F LIN ===========")
+print(jax.grad(lambda x: f(x).sum())(x))
 # print(jax.grad(lambda x: f_ref(x).sum())(x))
 
 
