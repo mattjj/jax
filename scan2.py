@@ -54,10 +54,10 @@ ad.primitive_jvps[get_p] = _get_jvp
 def _get_pp_rule(eqn, context, settings):
   y, = eqn.outvars
   x, *idx = eqn.invars
-  # pretty-print `y = get x i` as `x[i] := v`
+  # pretty-print `y = get x i` as `x[i] <- v`
   idx = ','.join(core.pp_var(i, context) for i in idx)
   lhs = core.pp_vars([y], context, print_shapes=settings.print_shapes)
-  return pp.concat([lhs, pp.text(' = '),
+  return pp.concat([lhs, pp.text(' <- '),
                     pp.text(core.pp_var(x, context)),
                     pp.text('['), pp.text(idx), pp.text(']')])
 core.pp_eqn_rules[get_p] = _get_pp_rule
@@ -87,17 +87,17 @@ def _swap_pp_rule(eqn, context, settings):
   x, *idx, v = eqn.invars
   idx = ','.join(core.pp_var(i, context) for i in idx)
   if type(y) is core.DropVar:
-    # pretty-print `_ = swap x i v` as `x[i] := v`
+    # pretty-print `_ = swap x i v` as `x[i] <- v`
     del y
     return pp.concat([pp.text(core.pp_var(x, context)),
-                      pp.text('['), pp.text(idx), pp.text('] := '),
+                      pp.text('['), pp.text(idx), pp.text('] <- '),
                       pp.text(core.pp_var(v, context))])
   else:
-    # pretty-print `y:T = swap x i v` as `y:T, x[i] = x[i], v`
+    # pretty-print `y:T = swap x i v` as `y:T, x[i] <- x[i], v`
     x_i = pp.concat([pp.text(core.pp_var(x, context)),
                      pp.text('['), pp.text(idx), pp.text(']')])
     y = core.pp_vars([y], context, print_shapes=settings.print_shapes)
-    return pp.concat([y, pp.text(', '), x_i, pp.text(' := '),
+    return pp.concat([y, pp.text(', '), x_i, pp.text(' <- '),
                       x_i, pp.text(', '), pp.text(core.pp_var(v, context))])
 core.pp_eqn_rules[swap_p] = _swap_pp_rule
 
