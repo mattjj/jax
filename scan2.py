@@ -547,6 +547,8 @@ def f(x):
     x = x_ref[i]
     x_ref[i] = (x + x) / 2.
 
+    x_ref[i] = (x_ref[i] + x_ref[i]) / 2.
+
     y_ref[i] = jnp.cos(x_ref[i]) * x_ref[i+1]
 
     y = y_ref[i]
@@ -579,7 +581,10 @@ print(jax.grad(lambda x: f(x).sum())(x))
 print(jax.grad(lambda x: f_ref(x).sum())(x))
 
 
-# TODO loop transpose
+# TODO closing over consts, what do? convert to refs?
+# TODO don't dce loop counter (maybe add 'instantiate' to dce_jaxpr?)
+# TODO partial eval is being wasteful by saving (not rematerializing) pure fns
+#      of loop counter
 # TODO addupdate transpose rule
 # TODO loop batching
 # TODO fixpoints, need jvp_jaxpr with extra state-is-differentiated input/output
