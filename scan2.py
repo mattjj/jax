@@ -422,7 +422,7 @@ def _for_partial_eval(trace, *tracers, jaxpr, nsteps, reverse):
   jaxpr_known_resout, jaxpr_unknown_resin_, _, _, num_res = \
       pe._partial_eval_jaxpr_custom(jaxpr, [False, *out_unknowns], _save_anything)
   jaxpr_unknown_resin, used_inputs = pe.dce_jaxpr(jaxpr_unknown_resin_, [])
-  assert used_inputs[0]  # TODO dont dce i! or maybe just munge input binders
+  # assert used_inputs[0]  # TODO dont dce i! or maybe just munge input binders
   jaxpr_known, res_avals = convert_outputs_to_writes(nsteps, jaxpr_known_resout)
   empty_res = [ad_util.zeros_like_aval(a) for a in res_avals]
   tracers_known = [t.pval.get_known() for t, uk in zip(tracers, out_unknowns)
@@ -596,7 +596,7 @@ def f(x):
     y_ref[i] = jnp.cos(x_ref[i]) * x_ref[i+1]
 
     y = y_ref[i]
-    y_ref[i] = (y + y) / 2.
+    y_ref[i] = jnp.sqrt(y * y)
     y_ref[i] = y_ref[i]
   n = x.shape[0]
   _, y = for_loop(n - 1, body, (x, jnp.zeros(n - 1)))
