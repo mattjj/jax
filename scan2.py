@@ -51,6 +51,9 @@ def _get_jvp(primals, tangents):
   return ref_get(primal_ref, idx), ref_get(tangent_ref, idx)
 ad.primitive_jvps[get_p] = _get_jvp
 
+pp_ref = partial(pp.color, intensity=pp.Intensity.NORMAL,
+                 foreground=pp.Color.GREEN)
+
 def _get_pp_rule(eqn, context, settings):
   y, = eqn.outvars
   x, *idx = eqn.invars
@@ -58,8 +61,11 @@ def _get_pp_rule(eqn, context, settings):
   idx = ','.join(core.pp_var(i, context) for i in idx)
   lhs = core.pp_vars([y], context, print_shapes=settings.print_shapes)
   return pp.concat([lhs, pp.text(' <- '),
-                    pp.text(core.pp_var(x, context)),
-                    pp.text('['), pp.text(idx), pp.text(']')])
+                    pp_ref(
+                    pp.concat([
+                      pp.text(core.pp_var(x, context)),
+                      pp.text('['), pp.text(idx), pp.text(']')
+                    ]))])
 core.pp_eqn_rules[get_p] = _get_pp_rule
 
 
@@ -89,9 +95,11 @@ def _swap_pp_rule(eqn, context, settings):
   if type(y) is core.DropVar:
     # pretty-print `_ = swap x i v` as `x[i] <- v`
     del y
-    return pp.concat([pp.text(core.pp_var(x, context)),
-                      pp.text('['), pp.text(idx), pp.text('] <- '),
-                      pp.text(core.pp_var(v, context))])
+    return pp.concat([
+      pp_ref(pp.concat([
+        pp.text(core.pp_var(x, context)),
+        pp.text('['), pp.text(idx), pp.text(']')
+      ])), pp.text(' <- '), pp.text(core.pp_var(v, context))])
   else:
     # pretty-print `y:T = swap x i v` as `y:T, x[i] <- x[i], v`
     x_i = pp.concat([pp.text(core.pp_var(x, context)),
@@ -624,7 +632,7 @@ print(jax.grad(g_ref)(x))
 print("========== F 3xGRAD ===========")
 h     = lambda x: jax.grad(lambda x: g(x).sum())(x).sum()
 h_ref = lambda x: jax.grad(lambda x: g_ref(x).sum())(x).sum()
-print(jax.grad(h)(x))
+print(jax.make_jaxpr(jax.grad(h))(x).pretty_print(use_color=True))
 print(jax.grad(h_ref)(x))
 
 
