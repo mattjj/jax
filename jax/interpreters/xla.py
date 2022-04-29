@@ -461,7 +461,7 @@ def _pp_xla_call(eqn: core.JaxprEqn, context: core.JaxprPpContext,
                     k == 'backend' and v is not None or
                     k == 'device' and v is not None or
                     k == 'donated_invars' and any(v)}
-  lhs = pp_vars(eqn.outvars, context, print_shapes=settings.print_shapes)
+  lhs = core.pp_vars(eqn.outvars, context, print_shapes=settings.print_shapes)
   rhs = [pp.text(eqn.primitive.name),
          core.pp_kv_pairs(sorted(printed_params.items()), context, settings),
          pp.text(" ") + core.pp_vars(eqn.invars, context)]
