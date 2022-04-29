@@ -363,14 +363,14 @@ ad.primitive_jvps[for_p] = _for_jvp
 def _for_partial_eval(trace, *tracers, jaxpr, nsteps, reverse):
   in_unknowns = [not t.pval.is_known() for t in tracers]
   body_jaxpr, () = discharge_state(jaxpr, ())
-  out_unknowns = in_unknowns
-  in_unknowns_ = in_unknowns
   for _ in range(len(in_unknowns)):
     _, _, out_unknowns, _, num_res = \
-        pe._partial_eval_jaxpr_custom(body_jaxpr, [False, *in_unknowns_], _save_anything)
-    if out_unknowns == in_unknowns_:
+        pe._partial_eval_jaxpr_custom(body_jaxpr, [False, *in_unknowns], _save_anything)
+    if out_unknowns == in_unknowns:
       break
-    in_unknowns_ = safe_map(operator.or_, in_unknowns_, out_unknowns)
+    in_unknowns = safe_map(operator.or_, in_unknowns, out_unknowns)
+  else:
+    raise Exception
   tracers = [trace.instantiate_const(t) if uk else t for t, uk in zip(tracers, out_unknowns)]
   jaxpr_known_resout, jaxpr_unknown_resin_, _, _, num_res = \
       pe._partial_eval_jaxpr_custom(jaxpr, [False, *out_unknowns], _save_anything)
