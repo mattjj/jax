@@ -544,13 +544,20 @@ def f(x):
 def f(x):
   def body(i, refs):
     x_ref, y_ref = refs
-    y_ref[i] = x_ref[i] * x_ref[i+1]
+    x = x_ref[i]
+    x_ref[i] = (x + x) / 2.
+
+    y_ref[i] = jnp.cos(x_ref[i]) * x_ref[i+1]
+
+    y = y_ref[i]
+    y_ref[i] = (y + y) / 2.
+    y_ref[i] = y_ref[i]
   n = x.shape[0]
   _, y = for_loop(n - 1, body, (x, jnp.zeros(n - 1)))
   return y
 
 def f_ref(x):
-  return x[:-1] * x[1:]
+  return jnp.cos(x[:-1]) * x[1:]
 
 x = jnp.arange(10.)
 print("============= F ===========")
