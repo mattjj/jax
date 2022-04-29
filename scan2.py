@@ -365,13 +365,16 @@ def _for_partial_eval(trace, *tracers, jaxpr, nsteps, reverse):
   body_jaxpr, () = discharge_state(jaxpr, ())
   for _ in range(len(in_unknowns)):
     _, _, out_unknowns, _, num_res = \
-        pe._partial_eval_jaxpr_custom(body_jaxpr, [False, *in_unknowns], _save_anything)
+        pe._partial_eval_jaxpr_custom(body_jaxpr, [False, *in_unknowns],
+                                      _save_anything)
+    out_unknowns = list(out_unknowns)
     if out_unknowns == in_unknowns:
       break
-    in_unknowns = safe_map(operator.or_, in_unknowns, out_unknowns)
+    in_unknowns = map(operator.or_, in_unknowns, out_unknowns)
   else:
     raise Exception
-  tracers = [trace.instantiate_const(t) if uk else t for t, uk in zip(tracers, out_unknowns)]
+  tracers = [trace.instantiate_const(t) if uk else t for t, uk in 
+             zip(tracers, out_unknowns)]
   jaxpr_known_resout, jaxpr_unknown_resin_, _, _, num_res = \
       pe._partial_eval_jaxpr_custom(jaxpr, [False, *out_unknowns], _save_anything)
   jaxpr_unknown_resin, used_inputs = pe.dce_jaxpr(jaxpr_unknown_resin_, [])
@@ -464,8 +467,8 @@ def transpose_jaxpr(jaxpr: core.Jaxpr, which_linear: List[bool]) -> core.Jaxpr:
     tangent_jaxpr, used = pe.dce_jaxpr(tangent_jaxpr_, [])
     primal_args = [x for x, lin in zip(args, which_linear) if not lin]
     res = core.eval_jaxpr(primal_jaxpr, (), i, *primal_args)
-    ct_args = [x for x, lin, used in zip(args, which_linear, used[1+len(res):])
-               if lin and used]
+    ct_args = [x for x, lin, u in zip(args, which_linear, used[1+len(res):])
+               if lin and u]
     ad.backward_pass(tangent_jaxpr, (), False, (), (*res, i, *ct_args), ())
     return []
   jaxpr_trans, _, _ = pe.trace_to_jaxpr_dynamic(
