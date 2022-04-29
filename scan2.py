@@ -122,7 +122,22 @@ def _addupdate_pp_rule(eqn, context, settings):
                     pp.text(core.pp_var(v, context))])
 core.pp_eqn_rules[addupdate_p] = _addupdate_pp_rule
 
+def addupdate_jvp_rule(primals, tangents):
+  ref_primal, *idx_primal, x_primal = primals
+  ref_tangent, *_, x_tangent = tangents
+  x_tangent = ad_util.instantiate(x_tangent)
+  addupdate_p.bind(ref_primal, *idx_primal, x_primal)
+  addupdate_p.bind(ref_tangent, *idx_primal, x_tangent)
+  return [], []
+ad.primitive_jvps[addupdate_p] = addupdate_jvp_rule
 
+
+def addupdate_transpose(ctx_in, *ref_idx_x):
+  del ctx_in
+  ref, *idx, x = ref_idx_x
+  g = ref_get(ref, idx)
+  return [None, None, g]
+ad.primitive_transposes[addupdate_p] = addupdate_transpose
 
 ## aval for refs
 
@@ -380,11 +395,14 @@ ad.primitive_jvps[for_p] = _for_jvp
 
 def _for_partial_eval(trace, *tracers, jaxpr, nsteps, reverse):
   in_unknowns = [not t.pval.is_known() for t in tracers]
-  body_jaxpr, () = discharge_state(jaxpr, ())
+  body_jaxpr, body_consts = discharge_state(jaxpr, ())
+  body_jaxpr = body_jaxpr.replace(
+      invars=body_jaxpr.constvars + body_jaxpr.invars,
+      constvars=[])
   for _ in range(len(in_unknowns)):
     _, _, out_unknowns, _, num_res = \
-        pe._partial_eval_jaxpr_custom(body_jaxpr, [False, *in_unknowns],
-                                      _save_anything)
+        pe._partial_eval_jaxpr_custom(body_jaxpr,
+            [False] * len(body_consts) + [False, *in_unknowns], _save_anything)
     out_unknowns = list(out_unknowns)
     if out_unknowns == in_unknowns:
       break
