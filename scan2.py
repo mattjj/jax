@@ -270,7 +270,6 @@ def _eval_jaxpr_discharge_state(jaxpr, consts: List[Any], *args: Any):
   def write(v: core.Var, val: Any) -> None:
     env[v] = val
 
-  write(core.unitvar, core.unit)
   map(write, jaxpr.constvars, consts)
   map(write, jaxpr.invars, args)
   for eqn in jaxpr.eqns:
@@ -417,12 +416,14 @@ def _for_partial_eval(trace, *tracers, jaxpr, nsteps, reverse):
     in_unknowns = map(operator.or_, in_unknowns, out_unknowns)
   else:
     raise Exception
-  tracers = [trace.instantiate_const(t) if uk else t for t, uk in 
-             zip(tracers, out_unknowns)]
+  tracers = [trace.instantiate_const(t) if uk else t
+             for t, uk in zip(tracers, out_unknowns)]
   jaxpr_known_resout, jaxpr_unknown_resin_, _, _, num_res = \
       pe._partial_eval_jaxpr_custom(jaxpr, [False, *out_unknowns], _save_anything)
-  jaxpr_unknown_resin, used_inputs = pe.dce_jaxpr(jaxpr_unknown_resin_, [])
-  # assert used_inputs[0]  # TODO dont dce i! or maybe just munge input binders
+  jaxpr_unknown_resin, used_inputs = pe.dce_jaxpr(
+      jaxpr_unknown_resin_, [], [True] * num_res + [True, *in_unknowns])
+  _, (used_i,), used_refs = split_list(used_inputs, [num_res, 1])
+  assert list(used_refs) == list(in_unknowns)
   jaxpr_known, res_avals = convert_outputs_to_writes(nsteps, jaxpr_known_resout)
   empty_res = [ad_util.zeros_like_aval(a) for a in res_avals]
   tracers_known = [t.pval.get_known() for t, uk in zip(tracers, out_unknowns)
@@ -438,15 +439,20 @@ def _for_partial_eval(trace, *tracers, jaxpr, nsteps, reverse):
                       for t in unknown_inputs]
   name_stack = source_info_util.current_name_stack()[len(trace.name_stack):]
   source = source_info_util.current().replace(name_stack=name_stack)
-  eqn = pe.new_eqn_recipe(unknown_inputs, unknown_outputs_,
-                          for_p, dict(jaxpr=jaxpr_unknown, nsteps=nsteps,
-                                      reverse=reverse),
-                          jaxpr_unknown.effects, source)
+  eqn = new_eqn_recipe(unknown_inputs, unknown_outputs_,
+                       for_p, dict(jaxpr=jaxpr_unknown, nsteps=nsteps,
+                                   reverse=reverse),
+                       jaxpr_unknown.effects, source)
   _, unknown_outputs = split_list(unknown_outputs_, [num_res])
   for t in unknown_outputs: t.recipe = eqn
   return merge_lists(out_unknowns, known_outputs, unknown_outputs)
 pe.custom_partial_eval_rules[for_p] = _for_partial_eval
 # NOTE we think we'll need 'loop invariant' optimization
+
+def new_eqn_recipe(in_tracers, out_tracers, prim, params, eff, src):
+  assert prim is for_p
+  assert len(in_tracers) + 1 == len(params['jaxpr'].invars)
+  return pe.new_eqn_recipe(in_tracers, out_tracers, prim, params, eff, src)
 
 def convert_outputs_to_writes(
     nsteps: int, jaxpr: core.Jaxpr
@@ -507,7 +513,6 @@ def _for_transpose(in_cts, *args, jaxpr, nsteps, reverse):
       args_.append(x)
     elif type(ct) is     ad_util.Zero and     ad.is_undefined_primal(x):
       # the loop was 'just getting', plug in a zero
-      # NOTE sidestepping abstract unit dropvar issue by using x.aval
       args_.append(ad_util.zeros_like_aval(x.aval))
     elif type(ct) is not ad_util.Zero and not ad.is_undefined_primal(x):
       # the loop was 'just setting', grab that cotangent! x is dummy
