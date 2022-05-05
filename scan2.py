@@ -327,6 +327,22 @@ class Ref(Generic[TypeVar('T')]): pass
 def abstractify(x: Any) -> core.AbstractValue:
   return core.raise_to_shaped(core.get_aval(x))
 
+def _hoist_consts_to_refs(jaxpr: core.Jaxpr) -> core.Jaxpr:
+  num_consts = len(jaxpr.constvars)
+
+  def _hoist(i, *consts_args):
+    const_refs, args = split_list(consts_args, [num_consts])
+    consts = [r[()] for r in const_refs]
+    return core.eval_jaxpr(jaxpr, consts, i, *args)
+  const_avals = [ShapedArrayRef(var.aval.shape, var.aval.dtype) for var in
+                 jaxpr.constvars]
+  i_aval, *arg_avals = [var.aval for var in jaxpr.invars]
+  in_avals = [i_aval, *const_avals, *arg_avals]
+  hoisted_jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(
+      lu.wrap_init(_hoist), in_avals)
+  assert not consts, "All consts should have been converted to refs"
+  return hoisted_jaxpr
+
 # for: Int -> (Int -> Ref s -> {State s} ()) -> s -> s
 def for_loop(nsteps: int, body: Callable[[int, Ref[S]], None],
              init_state: S) -> S:
@@ -334,6 +350,7 @@ def for_loop(nsteps: int, body: Callable[[int, Ref[S]], None],
   jaxpr, consts = _trace_to_jaxpr(body, state_tree, map(make_ref, init_state))
   out_flat = for_p.bind(*consts, *init_state, jaxpr=jaxpr, nsteps=int(nsteps),
                         reverse=False)
+  out_flat = out_flat[len(consts):]
   return tree_unflatten(state_tree, out_flat)
 for_p = core.Primitive('for')
 for_p.multiple_results = True
@@ -343,8 +360,10 @@ def _trace_to_jaxpr(f, state_tree, state_avals):
       lu.wrap_init(f), treedef_tuple((tree_structure(0), state_tree)))
   jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(
       f, [core.ShapedArray((), jnp.dtype('int32')), *state_avals])
+  jaxpr = _hoist_consts_to_refs(jaxpr)
+  # jaxpr has no more consts
   if out_tree() != tree_structure(None): raise Exception
-  return pe.convert_constvars_jaxpr(jaxpr), consts
+  return jaxpr, consts
 
 def make_ref(x) -> ShapedArrayRef:
   aval = core.raise_to_shaped(core.get_aval(x))
