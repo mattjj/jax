@@ -424,6 +424,8 @@ def _for_partial_eval(trace, *tracers, jaxpr, nsteps, reverse):
       jaxpr_unknown_resin_, [], [True] * num_res + [True, *in_unknowns])
   _, (used_i,), used_refs = split_list(used_inputs, [num_res, 1])
   assert list(used_refs) == list(in_unknowns)
+  # TODO(mattjj,sharadmv): use partial_eval_jaxpr_nounits (or similar) here to
+  # hoist anything that doesnt depend on loop counter
   jaxpr_known, res_avals = convert_outputs_to_writes(nsteps, jaxpr_known_resout)
   empty_res = [ad_util.zeros_like_aval(a) for a in res_avals]
   tracers_known = [t.pval.get_known() for t, uk in zip(tracers, out_unknowns)
@@ -610,35 +612,49 @@ def f(x):
 def f_ref(x):
   return jnp.cos(x[:-1]) * x[1:]
 
-x = jnp.arange(10.)
-print("============= F ===========")
-prnt(jax.make_jaxpr(f)(x))
-print(f(x))
-print(f_ref(x))
+# x = jnp.arange(10.)
+# print("============= F ===========")
+# prnt(jax.make_jaxpr(f)(x))
+# print(f(x))
+# print(f_ref(x))
 
-print("========== F JVP ===========")
-print(jax.jvp(f, [x], [x]))
-print(jax.jvp(f_ref, [x], [x]))
+# print("========== F JVP ===========")
+# print(jax.jvp(f, [x], [x]))
+# print(jax.jvp(f_ref, [x], [x]))
 
-print("========== F LIN ===========")
-print(jax.linearize(f, x)[1](x))
-print(jax.linearize(f_ref, x)[1](x))
+# print("========== F LIN ===========")
+# print(jax.linearize(f, x)[1](x))
+# print(jax.linearize(f_ref, x)[1](x))
 
-print("========== F GRAD ===========")
-print(jax.grad(lambda x: f(x).sum())(x))
-print(jax.grad(lambda x: f_ref(x).sum())(x))
+# print("========== F GRAD ===========")
+# print(jax.grad(lambda x: f(x).sum())(x))
+# print(jax.grad(lambda x: f_ref(x).sum())(x))
 
-print("========== F 2xGRAD ===========")
-g     = lambda x: jax.grad(lambda x: f(x).sum())(x).sum()
-g_ref = lambda x: jax.grad(lambda x: f_ref(x).sum())(x).sum()
-print(jax.grad(g)(x))
-print(jax.grad(g_ref)(x))
+# print("========== F 2xGRAD ===========")
+# g     = lambda x: jax.grad(lambda x: f(x).sum())(x).sum()
+# g_ref = lambda x: jax.grad(lambda x: f_ref(x).sum())(x).sum()
+# print(jax.grad(g)(x))
+# print(jax.grad(g_ref)(x))
 
-print("========== F 3xGRAD ===========")
-h     = lambda x: jax.grad(lambda x: g(x).sum())(x).sum()
-h_ref = lambda x: jax.grad(lambda x: g_ref(x).sum())(x).sum()
-print(jax.make_jaxpr(jax.grad(h))(x).pretty_print(use_color=True))
-print(jax.grad(h_ref)(x))
+# print("========== F 3xGRAD ===========")
+# h     = lambda x: jax.grad(lambda x: g(x).sum())(x).sum()
+# h_ref = lambda x: jax.grad(lambda x: g_ref(x).sum())(x).sum()
+# print(jax.make_jaxpr(jax.grad(h))(x).pretty_print(use_color=True))
+# print(jax.grad(h_ref)(x))
+
+
+
+A = jnp.arange(6 * 5.).reshape(6, 5)
+xs = jnp.arange(10 * 5.).reshape(10, 5)
+ys = jnp.zeros((10, 6))
+
+def body(i, refs):
+  A_ref, x_ref, y_ref = refs
+  A = A_ref[()]
+  y_ref[i] = jnp.dot(A, x_ref[i])
+for_loop(10, body, (A, xs, ys))
+
+jax.linearize(lambda xs: for_loop(10, body, (A, xs, ys)), xs)
 
 
 

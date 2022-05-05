@@ -1805,7 +1805,7 @@ def _scan_partial_eval(trace, *tracers, reverse, length, num_consts, num_carry,
   # The above trace_to_jaxpr_nounits call computed loop-invariant residuals
   # (known values in invar_pvals_out) and also computed loop-invariant values
   # needed by the new jaxpr_known (in jaxpr_known_consts, which replace the
-  # previous consts). We need to collect the computed inteisive residuals, and
+  # previous consts). We need to collect the computed intensive residuals, and
   # move corresponding intensive residual binders in jaxpr_unknown to the front.
   res_pvals = invar_pvals_out[len(invar_pvals_out) - num_res:]
   intensive_res = [pval.get_known() for pval in res_pvals if pval.is_known()]
