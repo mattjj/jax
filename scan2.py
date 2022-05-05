@@ -670,12 +670,11 @@ xs = jnp.arange(10 * 5.).reshape(10, 5)
 ys = jnp.zeros((10, 6))
 
 def body(i, refs):
-  A_ref, x_ref, y_ref = refs
-  A = A_ref[()]
+  x_ref, y_ref = refs
   y_ref[i] = jnp.dot(A, x_ref[i])
-for_loop(10, body, (A, xs, ys))
+print(for_loop(10, body, (xs, ys)))
 
-jax.linearize(lambda xs: for_loop(10, body, (A, xs, ys)), xs)
+jax.linearize(lambda xs: for_loop(10, body, (xs, ys)), xs)
 
 
 
