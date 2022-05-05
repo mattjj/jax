@@ -699,7 +699,7 @@ def map_transpose(primitive, params, call_jaxpr, args, ct, _, reduce_axes):
 def jvp_jaxpr(jaxpr, nonzeros, instantiate):
   inst = tuple(instantiate) if isinstance(instantiate, list) else instantiate
   return _jvp_jaxpr(jaxpr, tuple(nonzeros), inst)
-
+ 
 @weakref_lru_cache
 def _jvp_jaxpr(jaxpr, nonzeros, instantiate):
   assert len(jaxpr.in_avals) == len(nonzeros)

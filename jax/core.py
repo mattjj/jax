@@ -89,6 +89,7 @@ class Jaxpr:
     self.effects = effects
 
   def __str__(self):
+    return self.pretty_print(use_color=True)
     return str(pp_jaxpr(self, JaxprPpContext(), JaxprPpSettings()))
   __repr__ = __str__
 
