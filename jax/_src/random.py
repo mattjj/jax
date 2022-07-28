@@ -63,6 +63,8 @@ def _check_prng_key(key):
   # TODO(frostig): remove once we always enable_custom_prng
   if type(key) is prng.PRNGKeyArray:
     return key, False
+  elif _arraylike(key) and isinstance(key.dtype, core.AbstractKey):
+    return key, False
   elif _arraylike(key):
     if config.jax_enable_custom_prng:
       warnings.warn(
@@ -83,7 +85,16 @@ def _return_prng_keys(was_wrapped, key):
 
 def _random_bits(key: prng.PRNGKeyArray, bit_width, shape) -> jnp.ndarray:
   key, _ = _check_prng_key(key)
-  return key._random_bits(bit_width, shape)
+  return random_bits_p.bind(key, bit_width=bit_width, shape=shape)
+  # return key._random_bits(bit_width, shape)
+
+random_bits_p = core.Primitive('random_bits')
+
+@random_bits_p.def_abstract_eval
+def _random_bits_abstract_eval(key_aval, *, bit_width, shape):
+  out_shape = (*key_aval.shape, *shape)
+  out_dtype = dtypes.dtype(f'uint{bit_width}')
+  return core.ShapedArray(out_shape, out_dtype)
 
 
 PRNG_IMPLS = {

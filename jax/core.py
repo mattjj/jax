@@ -1188,15 +1188,24 @@ def concrete_or_error(force: Any, val: Any, context=""):
 
 
 def _short_dtype_name(dtype):
-  return (dtype.name.replace('float', 'f').replace('uint', 'u')
-                    .replace('int', 'i').replace('complex', 'c'))
+  if isinstance(dtype, AbstractKey):
+    return dtype
+  else:
+    return (dtype.name.replace('float', 'f').replace('uint', 'u')
+                      .replace('int', 'i').replace('complex', 'c'))
+
+def _dtype_object(dtype):
+  if isinstance(dtype, AbstractKey):
+    return dtype
+  else:
+    return np.dtype(dtype)
 
 class UnshapedArray(AbstractValue):
   __slots__ = ['dtype', 'weak_type']
   array_abstraction_level = 4
 
   def __init__(self, dtype, weak_type=False):
-    self.dtype = np.dtype(dtype)
+    self.dtype = _dtype_object(dtype)
     self.weak_type = weak_type
 
   def update(self, dtype=None, weak_type=None):
@@ -1264,7 +1273,7 @@ class ShapedArray(UnshapedArray):
 
   def __init__(self, shape, dtype, weak_type=False, named_shape=None):
     self.shape = canonicalize_shape(shape)
-    self.dtype = np.dtype(dtype)
+    self.dtype = _dtype_object(dtype)
     self.weak_type = weak_type
     self.named_shape = {} if named_shape is None else dict(named_shape)
 
@@ -1503,6 +1512,22 @@ class BInt:
   def __hash__(self):
     return hash((self.val, self.bound))
 pytype_aval_mappings[BInt] = lambda x: AbstractBInt(x.bound)
+
+
+class AbstractKey(AbstractValue):
+  __slots__ = ['tag']
+  tag: str  # TODO(mattjj,frostig): more enum-like thing
+  def __init__(self, tag: str):
+    self.tag = tag
+  @property
+  def name(self) -> str:
+    return f'{self.tag}'
+  def __repr__(self) -> str:
+    return self.name
+  def __eq__(self, other):
+    return isinstance(other, Key) and self.tag == other.tag
+  def __hash__(self) -> int:
+    return hash((self.__class__, self.tag))
 
 
 # DShapedArray w/ BInt in shapes => PaddedArray runtime representation
@@ -1879,6 +1904,8 @@ class NamedShape:
     return total
 
   def __str__(self):
+    if not self.__named:
+      return str(self.__positional)
     return (f"({', '.join(map(str, self.__positional))}{', ' if self.__named else ''}"
             f"{', '.join(f'{k}={v}' for k, v in self.__named.items())})")
 
