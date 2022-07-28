@@ -29,6 +29,8 @@ from jax.dtypes import float0
 from jax.interpreters import batching
 from jax.interpreters import mlir
 from jax.interpreters import xla
+
+from jax._src import dtypes
 from jax._src.api import jit, vmap
 from jax._src.lax import lax as lax_internal
 from jax._src.lib.mlir.dialects import mhlo
@@ -44,7 +46,7 @@ from jax._src.lib import gpu_prng
 UINT_DTYPES = {
     8: jnp.uint8, 16: jnp.uint16, 32: jnp.uint32, 64: jnp.uint64}  # type: ignore[has-type]
 
-# -- PRNG implementation interface --
+# -- PRNG implementation interface
 
 class PRNGImpl(NamedTuple):
   """Specifies PRNG key shape and operations.
@@ -68,15 +70,22 @@ class PRNGImpl(NamedTuple):
   split: Callable
   random_bits: Callable
   fold_in: Callable
+  tag: str
+
+  def __hash__(self) -> int:
+    return hash(self.tag)
+
+  def __str__(self) -> str:
+    return self.tag
 
   def pprint(self):
-    return (pp.text(f"{self.__class__.__name__}:") +
+    return (pp.text(f"{self.__class__.__name__} [{self.tag}]:") +
             pp.nest(2, pp.group(pp.brk() + pp.join(pp.brk(), [
               pp.text(f"{k} = {v}") for k, v in self._asdict().items()
             ]))))
 
 
-# -- PRNG key arrays --
+# -- PRNG key arrays
 
 def _check_prng_key_data(impl, key_data: jnp.ndarray):
   ndim = len(impl.key_shape)
@@ -94,8 +103,8 @@ def _check_prng_key_data(impl, key_data: jnp.ndarray):
                     f"got dtype={key_data.dtype}")
 
 
-@tree_util.register_pytree_node_class
-class PRNGKeyArray:
+#@tree_util.register_pytree_node_class
+class _PRNGKeyArray:
   """An array whose elements are PRNG keys.
 
   This class lifts the definition of a PRNG, provided in the form of a
@@ -138,6 +147,7 @@ class PRNGKeyArray:
 
   @property
   def dtype(self):
+    assert False
     # TODO(frostig): remove after deprecation window
     if config.jax_enable_custom_prng:
       raise AttributeError("'PRNGKeyArray' has no attribute 'dtype'")
@@ -148,6 +158,7 @@ class PRNGKeyArray:
 
   @property
   def shape(self):
+    return self._shape
     # TODO(frostig): simplify once we always enable_custom_prng
     if config.jax_enable_custom_prng:
       return self._shape
@@ -191,12 +202,15 @@ class PRNGKeyArray:
     return PRNGKeyArray(self.impl, self._keys[idx])
 
   def _fold_in(self, data: int) -> 'PRNGKeyArray':
+    assert False
     return PRNGKeyArray(self.impl, self.impl.fold_in(self._keys, data))
 
   def _random_bits(self, bit_width, shape) -> jnp.ndarray:
+    assert False
     return self.impl.random_bits(self._keys, bit_width, shape)
 
   def _split(self, num: int) -> 'PRNGKeyArray':
+    assert False
     return PRNGKeyArray(self.impl, self.impl.split(self._keys, num))
 
   def reshape(self, newshape, order=None):
@@ -223,6 +237,9 @@ class PRNGKeyArray:
     return PRNGKeyArray(self.impl, lax.expand_dims(self._keys, dimensions))
 
   def __repr__(self):
+    return f'{self.__class__.__name__}[{self.impl.tag}] {{ {self._keys} }}'
+
+  def pprint(self):
     arr_shape = self._shape
     pp_keys = pp.text('shape = ') + pp.text(str(arr_shape))
     pp_impl = pp.text('impl = ') + self.impl.pprint()
@@ -230,13 +247,121 @@ class PRNGKeyArray:
       pp.text('PRNGKeyArray:') +
       pp.nest(2, pp.brk() + pp_keys + pp.brk() + pp_impl)))
 
+PRNGKeyArray = tree_util.register_pytree_node_class(_PRNGKeyArray)
 
 def seed_with_impl(impl: PRNGImpl, seed: int) -> PRNGKeyArray:
-  return PRNGKeyArray(impl, impl.seed(seed))
+  return random_seed(seed, impl=impl)
 
 _register_stackable(PRNGKeyArray)
+_register_stackable(_PRNGKeyArray)
 
-# -- threefry2x32 PRNG implementation --
+def key_array_constant_handler(val, canonicalize_dtypes):
+  return mlir._device_array_constant_handler(
+      val.unsafe_raw_array(), canonicalize_dtypes)
+mlir.register_constant_handler(_PRNGKeyArray, key_array_constant_handler)
+
+def device_put_key_array(x: _PRNGKeyArray, device):
+  return dispatch._device_put_array(x.unsafe_raw_array(), device)
+dispatch.device_put_handlers[_PRNGKeyArray] = device_put_key_array
+
+xla.canonicalize_dtype_handlers[_PRNGKeyArray] = lambda x: x
+
+# -- PRNG primitives
+
+def key_shaped_array(impl, shape):
+  return core.ShapedArray(shape, core.AbstractKey(impl))
+
+core.pytype_aval_mappings[_PRNGKeyArray] = (
+    lambda x: key_shaped_array(x.impl, x._shape))
+
+
+# TODO(frostig): impl functions should be batch-friendly, can vmap
+# themselves if they want to rely on vmap for said batch-friendliness.
+# Or maybe really they should be required to be elementwise funcs, as
+# current ones already are. Then is there a better way to apply them
+# elementwise than to vmap n times?
+def vmap_n(n, f):
+  for _ in range(n):
+    f = jax.vmap(f)
+  return f
+
+
+def random_seed(seeds, impl):
+  return random_seed_p.bind(seeds, impl=impl)
+
+random_seed_p = core.Primitive('random_seed')
+batching.defvectorized(random_seed_p)
+
+@random_seed_p.def_abstract_eval
+def random_seed_abstract_eval(seeds_aval, *, impl):
+  return key_shaped_array(impl, seeds_aval.shape)
+
+@random_seed_p.def_impl
+def random_seed_impl(seeds, *, impl):
+  seed = vmap_n(seeds.ndim, impl.seed)
+  return _PRNGKeyArray(impl, seed(seeds))
+
+mlir.register_lowering(random_seed_p, mlir.lower_fun(
+    random_seed_impl, multiple_results=False))
+
+
+def random_split(keys, count):
+  return random_split_p.bind(keys, count=count)
+
+random_split_p = core.Primitive('random_split')
+batching.defvectorized(random_split_p)
+
+@random_split_p.def_abstract_eval
+def random_split_abstract_eval(keys_aval, *, count):
+  return key_shaped_array(keys_aval.dtype.impl, (*keys_aval.shape, count))
+
+@random_split_p.def_impl
+def random_split_impl(keys, *, count):
+  impl = keys.impl
+  split = vmap_n(keys.ndim, impl.split)
+  return _PRNGKeyArray(impl, split(keys.unsafe_raw_array(), count))
+
+mlir.register_lowering(random_split_p, mlir.lower_fun(
+    random_split_impl, multiple_results=False))
+
+
+def random_fold_in(keys, msgs):
+  return random_fold_in_p.bind(keys, msgs)
+
+random_fold_in_p = core.Primitive('random_fold_in')
+batching.defvectorized(random_fold_in_p)
+
+@random_fold_in_p.def_abstract_eval
+def random_fold_in_abstract_eval(keys_aval, msgs_aval):
+  return keys_aval
+
+@random_fold_in_p.def_impl
+def random_fold_in_impl(keys, msgs, *, count):
+  impl = keys.impl
+  fold_in = vmap_n(keys.ndim, impl.fold_in)
+  return _PRNGKeyArray(impl, fold_in(keys.unsafe_raw_array(), msgs))
+
+
+def random_bits(keys, bit_width, shape):
+  return random_bits_p.bind(keys, bit_width=bit_width, shape=shape)
+
+random_bits_p = core.Primitive('random_bits')
+batching.defvectorized(random_bits_p)
+
+@random_bits_p.def_abstract_eval
+def random_bits_abstract_eval(keys_aval, *, bit_width, shape):
+  out_shape = (*keys_aval.shape, *shape)
+  out_dtype = dtypes.dtype(f'uint{bit_width}')
+  return core.ShapedArray(out_shape, out_dtype)
+
+@random_bits_p.def_impl
+def random_bits_impl(keys, *, bit_width, shape):
+  impl = keys.impl
+  bits = vmap_n(keys.ndim, lambda k: impl.random_bits(k, bit_width, shape))
+  return bits(keys.unsafe_raw_array())
+
+
+# -- threefry2x32 PRNG implementation
 
 
 def _is_threefry_prng_key(key: jnp.ndarray) -> bool:
@@ -424,6 +549,7 @@ mlir.register_lowering(
     platform='rocm')
 
 
+# TODO(frostig): no longer need to jit?
 @partial(jit, inline=True)
 def threefry_2x32(keypair, count):
   """Apply the Threefry 2x32 hash.
@@ -461,6 +587,7 @@ def threefry_2x32(keypair, count):
 def threefry_split(key: jnp.ndarray, num: int) -> jnp.ndarray:
   return _threefry_split(key, int(num))  # type: ignore
 
+# TODO(frostig): no longer need to jit?
 @partial(jit, static_argnums=(1,), inline=True)
 def _threefry_split(key, num) -> jnp.ndarray:
   counts = lax.iota(np.uint32, num * 2)
@@ -470,11 +597,13 @@ def _threefry_split(key, num) -> jnp.ndarray:
 def threefry_fold_in(key: jnp.ndarray, data: int) -> jnp.ndarray:
   return _threefry_fold_in(key, jnp.uint32(data))
 
+# TODO(frostig): no longer need to jit?
 @partial(jit, inline=True)
 def _threefry_fold_in(key, data):
   return threefry_2x32(key, threefry_seed(data))
 
 
+# TODO(frostig): no longer need to jit?
 @partial(jit, static_argnums=(1, 2), inline=True)
 def threefry_random_bits(key: jnp.ndarray, bit_width, shape):
   """Sample uniform random bits of given width and shape using PRNG key."""
@@ -537,10 +666,11 @@ threefry_prng_impl = PRNGImpl(
     seed=threefry_seed,
     split=threefry_split,
     random_bits=threefry_random_bits,
-    fold_in=threefry_fold_in)
+    fold_in=threefry_fold_in,
+    tag='fry')
 
 
-# -- RngBitGenerator PRNG implementation --
+# -- RngBitGenerator PRNG implementation
 
 # This code is experimental!
 # https://www.tensorflow.org/xla/operation_semantics#rngbitgenerator
@@ -572,7 +702,8 @@ rbg_prng_impl = PRNGImpl(
     seed=_rbg_seed,
     split=_rbg_split,
     random_bits=_rbg_random_bits,
-    fold_in=_rbg_fold_in)
+    fold_in=_rbg_fold_in,
+    tag='rbg')
 
 def _unsafe_rbg_split(key: jnp.ndarray, num: int) -> jnp.ndarray:
   # treat 10 iterations of random bits as a 'hash function'
@@ -588,4 +719,5 @@ unsafe_rbg_prng_impl = PRNGImpl(
     seed=_rbg_seed,
     split=_unsafe_rbg_split,
     random_bits=_rbg_random_bits,
-    fold_in=_unsafe_rbg_fold_in)
+    fold_in=_unsafe_rbg_fold_in,
+    tag='urbg')

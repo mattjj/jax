@@ -63,6 +63,10 @@ def _check_prng_key(key):
   # TODO(frostig): remove once we always enable_custom_prng
   if type(key) is prng.PRNGKeyArray:
     return key, False
+  if type(key) is prng._PRNGKeyArray:
+    return key, False
+  elif _arraylike(key) and isinstance(key.dtype, core.AbstractKey):
+    return key, True
   elif _arraylike(key):
     if config.jax_enable_custom_prng:
       warnings.warn(
@@ -75,6 +79,7 @@ def _check_prng_key(key):
 
 def _return_prng_keys(was_wrapped, key):
   # TODO(frostig): remove once we always enable_custom_prng
+  return key
   assert type(key) is prng.PRNGKeyArray, type(key)
   if config.jax_enable_custom_prng:
     return key
@@ -82,8 +87,7 @@ def _return_prng_keys(was_wrapped, key):
     return key.unsafe_raw_array() if was_wrapped else key
 
 def _random_bits(key: prng.PRNGKeyArray, bit_width, shape) -> jnp.ndarray:
-  key, _ = _check_prng_key(key)
-  return key._random_bits(bit_width, shape)
+  return prng.random_bits(key, bit_width=bit_width, shape=shape)
 
 
 PRNG_IMPLS = {
@@ -158,7 +162,7 @@ def unsafe_rbg_key(seed: int) -> KeyArray:
 def _fold_in(key: KeyArray, data: int) -> KeyArray:
   # Alternative to fold_in() to use within random samplers.
   # TODO(frostig): remove and use fold_in() once we always enable_custom_prng
-  return key._fold_in(jnp.uint32(data))
+  return prng.random_bits(key, jnp.uint32(data))
 
 def fold_in(key: KeyArray, data: int) -> KeyArray:
   """Folds in data to a PRNG key to form a new PRNG key.
@@ -177,7 +181,7 @@ def fold_in(key: KeyArray, data: int) -> KeyArray:
 def _split(key: KeyArray, num: int = 2) -> KeyArray:
   # Alternative to split() to use within random samplers.
   # TODO(frostig): remove and use split() once we always enable_custom_prng
-  return key._split(num)
+  return prng.random_split(key, count=num)
 
 def split(key: KeyArray, num: int = 2) -> KeyArray:
   """Splits a PRNG key into `num` new keys by adding a leading axis.
