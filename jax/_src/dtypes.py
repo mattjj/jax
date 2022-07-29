@@ -85,6 +85,7 @@ def _to_complex_dtype(dtype):
 @functools.lru_cache(maxsize=None)
 def _canonicalize_dtype(x64_enabled, dtype):
   """Convert from a dtype to a canonical dtype based on config.x64_enabled."""
+  if str(dtype) == 'fry': return dtype  # TODO(frostig,mattjj): stopgap
   try:
     dtype = np.dtype(dtype)
   except TypeError as e:

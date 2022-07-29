@@ -29,6 +29,8 @@ from jax.dtypes import float0
 from jax.interpreters import batching
 from jax.interpreters import mlir
 from jax.interpreters import xla
+
+from jax._src import dtypes
 from jax._src.api import jit, vmap
 from jax._src.lax import lax as lax_internal
 from jax._src.lib.mlir.dialects import mhlo
@@ -44,7 +46,7 @@ from jax._src.lib import gpu_prng
 UINT_DTYPES = {
     8: jnp.uint8, 16: jnp.uint16, 32: jnp.uint32, 64: jnp.uint64}  # type: ignore[has-type]
 
-# -- PRNG implementation interface --
+# -- PRNG implementation interface
 
 class PRNGImpl(NamedTuple):
   """Specifies PRNG key shape and operations.
@@ -68,15 +70,22 @@ class PRNGImpl(NamedTuple):
   split: Callable
   random_bits: Callable
   fold_in: Callable
+  tag_name: str
+
+  def __hash__(self) -> int:
+    return hash(self.tag_name)
+
+  def __str__(self) -> str:
+    return self.tag_name
 
   def pprint(self):
-    return (pp.text(f"{self.__class__.__name__}:") +
+    return (pp.text(f"{self.__class__.__name__} [{self.tag_name}]:") +
             pp.nest(2, pp.group(pp.brk() + pp.join(pp.brk(), [
               pp.text(f"{k} = {v}") for k, v in self._asdict().items()
             ]))))
 
 
-# -- PRNG key arrays --
+# -- PRNG key arrays
 
 def _check_prng_key_data(impl, key_data: jnp.ndarray):
   ndim = len(impl.key_shape)
@@ -230,11 +239,61 @@ class PRNGKeyArray:
 
 
 def seed_with_impl(impl: PRNGImpl, seed: int) -> PRNGKeyArray:
-  return PRNGKeyArray(impl, impl.seed(seed))
+  return random_seed(seed, impl=impl)
 
 _register_stackable(PRNGKeyArray)
 
-# -- threefry2x32 PRNG implementation --
+
+# -- PRNG primitives
+
+def key_shaped_array(impl, shape):
+  return core.ShapedArray(shape, core.AbstractKey(impl))
+
+
+def random_seed(seeds, impl):
+  return random_seed_p.bind(seeds, impl=impl)
+
+random_seed_p = core.Primitive('random_seed')
+
+@random_seed_p.def_abstract_eval
+def random_seed_abstract_eval(seeds_aval, *, impl):
+  return key_shaped_array(impl, seeds_aval.shape)
+
+
+def random_split(keys, count):
+  return random_split_p.bind(keys, count=count)
+
+random_split_p = core.Primitive('random_split')
+
+@random_split_p.def_abstract_eval
+def random_split_abstract_eval(key_aval, *, count):
+  return key_shaped_array(key_aval.dtype.impl, (*key_aval.shape, count))
+
+
+def random_fold_in(keys, msgs):
+  return random_fold_in_p.bind(keys, msgs)
+
+random_fold_in_p = core.Primitive('random_fold_in')
+
+@random_fold_in_p.def_abstract_eval
+def random_fold_in_abstract_eval(keys_aval, msgs_aval):
+  return keys_aval
+
+
+def random_bits(keys, bit_width, shape):
+  return random_bits_p.bind(keys, bit_width=bit_width, shape=shape)
+
+random_bits_p = core.Primitive('random_bits')
+
+@random_bits_p.def_abstract_eval
+def _random_bits_abstract_eval(keys_aval, *, bit_width, shape):
+  out_shape = (*keys_aval.shape, *shape)
+  out_dtype = dtypes.dtype(f'uint{bit_width}')
+  return core.ShapedArray(out_shape, out_dtype)
+
+
+
+# -- threefry2x32 PRNG implementation
 
 
 def _is_threefry_prng_key(key: jnp.ndarray) -> bool:
@@ -535,10 +594,11 @@ threefry_prng_impl = PRNGImpl(
     seed=threefry_seed,
     split=threefry_split,
     random_bits=threefry_random_bits,
-    fold_in=threefry_fold_in)
+    fold_in=threefry_fold_in,
+    tag_name='fry')
 
 
-# -- RngBitGenerator PRNG implementation --
+# -- RngBitGenerator PRNG implementation
 
 # This code is experimental!
 # https://www.tensorflow.org/xla/operation_semantics#rngbitgenerator
@@ -570,7 +630,8 @@ rbg_prng_impl = PRNGImpl(
     seed=_rbg_seed,
     split=_rbg_split,
     random_bits=_rbg_random_bits,
-    fold_in=_rbg_fold_in)
+    fold_in=_rbg_fold_in,
+    tag_name='rbg')
 
 def _unsafe_rbg_split(key: jnp.ndarray, num: int) -> jnp.ndarray:
   # treat 10 iterations of random bits as a 'hash function'
@@ -586,4 +647,5 @@ unsafe_rbg_prng_impl = PRNGImpl(
     seed=_rbg_seed,
     split=_unsafe_rbg_split,
     random_bits=_rbg_random_bits,
-    fold_in=_unsafe_rbg_fold_in)
+    fold_in=_unsafe_rbg_fold_in,
+    tag_name='urbg')

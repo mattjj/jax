@@ -1515,19 +1515,19 @@ pytype_aval_mappings[BInt] = lambda x: AbstractBInt(x.bound)
 
 
 class AbstractKey(AbstractValue):
-  __slots__ = ['tag']
-  tag: str  # TODO(mattjj,frostig): more enum-like thing
-  def __init__(self, tag: str):
-    self.tag = tag
+  __slots__ = ['impl']
+  impl: Any  # prng.PRNGImpl. TODO(mattjj,frostig): more enum-like thing
+  def __init__(self, impl):
+    self.impl = impl
   @property
   def name(self) -> str:
-    return f'{self.tag}'
+    return f'{self.impl.tag_name}'
   def __repr__(self) -> str:
     return self.name
   def __eq__(self, other):
-    return isinstance(other, Key) and self.tag == other.tag
+    return isinstance(other, Key) and self.impl is other.impl
   def __hash__(self) -> int:
-    return hash((self.__class__, self.tag))
+    return hash((self.__class__, self.impl))
 
 
 # DShapedArray w/ BInt in shapes => PaddedArray runtime representation
