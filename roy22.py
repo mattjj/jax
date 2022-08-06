@@ -1,5 +1,8 @@
 import jax
 import jax.numpy as jnp
+from jax import (
+    make_jaxpr,
+)
 
 from jax import core
 from jax._src import prng
@@ -10,18 +13,7 @@ def info(type, value, tb):
   ipdb.pm()
 sys.excepthook = info
 
-#aval = core.ShapedArray((), core.AbstractKey('fry'))
-aval = core.ShapedArray((), core.AbstractKey(prng.threefry_prng_impl))
-print(aval)
-
-from jax.interpreters import partial_eval as pe
-from jax._src.api_util import flatten_fun_nokwargs
-import jax.linear_util as lu
-
-def make_jaxpr(f, *in_avals):
-  jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(
-      lu.wrap_init(lambda *xs: [f(*xs)]), in_avals)
-  return core.ClosedJaxpr(jaxpr, consts)
+seed = jnp.array(27, dtype=jnp.dtype('uint32'))
 
 def f(key):
   k1, k2 = jax.random.split(key, 2)
@@ -29,11 +21,13 @@ def f(key):
   y = jax.random.uniform(k2, (1234, 5000))
   return x + y
 
-jaxpr = make_jaxpr(f, aval)
+key = jax.random.PRNGKey(jnp.array(0, dtype=int))
+print(key)
+jaxpr = make_jaxpr(f)(key)
 print(jaxpr)
 
 with jax.disable_jit():
-  x = f(jax.random.PRNGKey(jnp.array(27)))
+  x = f(jax.random.PRNGKey(seed))
   print(x[:3, :4])
   print(x.mean())
 
@@ -43,35 +37,35 @@ def f(seed):
   key = jax.random.PRNGKey(seed)
   return jax.random.uniform(key, (10000, 20000))
 
-jaxpr = make_jaxpr(f, core.ShapedArray((), jnp.dtype('uint32')))
+jaxpr = make_jaxpr(f)(key)
 print(jaxpr)
 
 with jax.disable_jit():
-  x = f(jnp.array(27))
+  x = f(seed)
   print(x[:3, :4])
   print(x.mean())
 
 print()
 
-# fv = jax.vmap(f)
+seeds = jnp.array([27, 12, 9], dtype=jnp.dtype('uint32'))
+fv = jax.vmap(f)
+jaxpr = make_jaxpr(fv)(seeds)
+print(jaxpr)
 
-# jaxpr = make_jaxpr(fv, core.ShapedArray((3,), jnp.dtype('uint32')))
-# print(jaxpr)
+with jax.disable_jit():
+  x = fv(seeds)
+  print(x[:, :3, :4])
+  print(x.mean(axis=[1, 2]))
 
-# with jax.disable_jit():
-#   x = fv(jnp.array([27, 12, 9]))
-#   print(x[:, :3, :4])
-#   print(x.mean(axis=[1, 2]))
+print()
 
-# print()
-
-x = f(jnp.array(27))
+x = f(seed)
 print(x[:3, :4])
 print(x.mean())
 
 print()
 
-x = jax.jit(f)(jnp.array(27))
+x = jax.jit(f)(seed)
 print(x[:3, :4])
 print(x.mean())
 

@@ -14,7 +14,7 @@
 
 
 from functools import partial
-from typing import Callable, Iterator, NamedTuple, Sequence
+from typing import Callable, Hashable, Iterator, NamedTuple, Sequence
 import warnings
 
 import numpy as np
@@ -30,6 +30,7 @@ from jax.interpreters import batching
 from jax.interpreters import mlir
 from jax.interpreters import xla
 
+from jax._src import dispatch
 from jax._src import dtypes
 from jax._src.api import jit, vmap
 from jax._src.lax import lax as lax_internal
@@ -38,9 +39,12 @@ from jax._src.numpy.lax_numpy import (
     _canonicalize_tuple_index, _eliminate_deprecated_list_indexing,
     _expand_bool_indices, _register_stackable)
 import jax._src.pretty_printer as pp
-from jax._src.util import canonicalize_axis, prod
+from jax._src.util import canonicalize_axis, prod, safe_map, safe_zip
 
 from jax._src.lib import gpu_prng
+
+map, unsafe_map = safe_map, map
+zip, unsafe_zip = safe_zip, zip
 
 
 UINT_DTYPES = {
@@ -103,8 +107,7 @@ def _check_prng_key_data(impl, key_data: jnp.ndarray):
                     f"got dtype={key_data.dtype}")
 
 
-#@tree_util.register_pytree_node_class
-class _PRNGKeyArray:
+class PRNGKeyArray:
   """An array whose elements are PRNG keys.
 
   This class lifts the definition of a PRNG, provided in the form of a
@@ -126,6 +129,7 @@ class _PRNGKeyArray:
     # instead of a jnp.ndarray due to tree_unflatten
     if type(key_data) not in [object, bool]:
       _check_prng_key_data(impl, key_data)
+    assert not isinstance(key_data, core.Tracer)
     self.impl = impl
     self._keys = key_data
 
@@ -147,7 +151,6 @@ class _PRNGKeyArray:
 
   @property
   def dtype(self):
-    assert False
     # TODO(frostig): remove after deprecation window
     if config.jax_enable_custom_prng:
       raise AttributeError("'PRNGKeyArray' has no attribute 'dtype'")
@@ -247,39 +250,119 @@ class _PRNGKeyArray:
       pp.text('PRNGKeyArray:') +
       pp.nest(2, pp.brk() + pp_keys + pp.brk() + pp_impl)))
 
-PRNGKeyArray = tree_util.register_pytree_node_class(_PRNGKeyArray)
 
 def seed_with_impl(impl: PRNGImpl, seed: int) -> PRNGKeyArray:
   return random_seed(seed, impl=impl)
 
 _register_stackable(PRNGKeyArray)
-_register_stackable(_PRNGKeyArray)
+
+
+class KeyTy:
+  impl: Hashable  # prng.PRNGImpl. TODO(mattjj,frostig): protocol really
+  def __init__(self, impl):
+    self.impl = impl
+  @property
+  def name(self) -> str:
+    return f'key<{self.impl.tag}>'
+  def __repr__(self) -> str:
+    return self.name
+  def __eq__(self, other):
+    return type(other) is KeyTy and self.impl is other.impl
+  def __hash__(self) -> int:
+    return hash((self.__class__, self.impl))
+
+  # handlers
+
+  @staticmethod
+  def aval_to_ir_types(aval):
+    phys_aval = core.ShapedArray((*aval.shape, *aval.dtype.impl.key_shape),
+                                 jnp.dtype('uint32'))
+    return mlir.aval_to_ir_types(phys_aval)
+
+  @staticmethod
+  def result_handler(sticky_device, aval):
+    def handler(_, buf):
+      buf.aval = core.ShapedArray(buf.shape, buf.dtype)
+      return PRNGKeyArray(aval.dtype.impl, buf)
+    return handler
+
+  # eltype-polymorphic primitive lowering rules
+
+  @staticmethod
+  def empty_mlir(ctx):
+    aval_out, = ctx.aval_out
+    return mlir.ir_constants(np.empty(aval_out.dtype.impl.key_shape,
+                                      dtype=np.dtype('uint32')))
+
+  @staticmethod
+  def dynamic_slice_mlir(ctx, x, start_indices, slice_sizes):
+    aval_out, = ctx.aval_out
+    dtype = dtypes.canonicalize_dtype(np.dtype('int64'))
+    key_shape = aval_out.dtype.impl.key_shape
+    trailing_zeros = [mlir.ir_constant(np.zeros(0, dtype))] * len(key_shape)
+    start_indices = (*start_indices, *trailing_zeros)
+    slice_sizes_ = mlir.dense_int_elements((*slice_sizes, *key_shape))
+    return mhlo.DynamicSliceOp(x, start_indices, slice_sizes_).results
+
+  @staticmethod
+  def dynamic_update_slice_mlir(ctx, x, update, *start_indices):
+    aval_out, = ctx.aval_out
+    dtype = dtypes.canonicalize_dtype(np.dtype('int64'))
+    key_shape = aval_out.dtype.impl.key_shape
+    zeros = [mlir.ir_constant(np.array(0, dtype=dtype))] * len(key_shape)
+    start_indices = (*start_indices, *zeros)
+    return mhlo.DynamicUpdateSliceOp(mlir.aval_to_ir_type(aval_out), x, update,
+                                     start_indices).results
+
+  @staticmethod
+  def broadcast_in_dim_mlir(ctx, x, *dyn_shape, shape, broadcast_dimensions):
+    if dyn_shape: raise NotImplementedError
+    aval_out, = ctx.avals_out
+    key_shape = aval_out.dtype.impl.key_shape
+    trailing_dims = [aval_out.ndim + i for i in range(len(key_shape))]
+    broadcast_dimensions = [*broadcast_dimensions, *trailing_dims]
+    return mhlo.BroadcastInDimOp(
+        mlir.aval_to_ir_type(aval_out), x,
+        mlir.dense_int_elements(broadcast_dimensions)).results
+
+  @staticmethod
+  def transpose_mlir(ctx, x, *, permutation):
+    aval_out, = ctx.avals_out
+    key_shape = aval_out.dtype.impl.key_shape
+    trailing_dims = [aval_out.ndim + i for i in range(len(key_shape))]
+    perm = [*permutation, *trailing_dims]
+    return mhlo.TransposeOp(x, mlir.dense_int_elements(perm)).results
+
+core.custom_eltypes.add(KeyTy)
+
+
+def key_shaped_array(impl, shape):
+  return core.ShapedArray(shape, KeyTy(impl))
+
+def key_aval_to_raw_aval(key_array_aval):
+  shape = (*key_array_aval.shape, *key_array_aval.dtype.impl.key_shape)
+  return core.ShapedArray(shape, np.dtype('uint32'))
+
+core.pytype_aval_mappings[PRNGKeyArray] = (
+    lambda x: key_shaped_array(x.impl, x._shape))
+
+xla.pytype_aval_mappings[PRNGKeyArray] = (
+    lambda x: key_shaped_array(x.impl, x._shape))
+
+xla.canonicalize_dtype_handlers[PRNGKeyArray] = lambda x: x
+
+def device_put_key_array(x: PRNGKeyArray, device):
+  return dispatch._device_put_array(x.unsafe_raw_array(), device)
+dispatch.device_put_handlers[PRNGKeyArray] = device_put_key_array
 
 def key_array_constant_handler(val, canonicalize_dtypes):
   return mlir._device_array_constant_handler(
       val.unsafe_raw_array(), canonicalize_dtypes)
-mlir.register_constant_handler(_PRNGKeyArray, key_array_constant_handler)
-
-def device_put_key_array(x: _PRNGKeyArray, device):
-  return dispatch._device_put_array(x.unsafe_raw_array(), device)
-dispatch.device_put_handlers[_PRNGKeyArray] = device_put_key_array
-
-xla.canonicalize_dtype_handlers[_PRNGKeyArray] = lambda x: x
-
-# -- PRNG primitives
-
-def key_shaped_array(impl, shape):
-  return core.ShapedArray(shape, core.AbstractKey(impl))
-
-core.pytype_aval_mappings[_PRNGKeyArray] = (
-    lambda x: key_shaped_array(x.impl, x._shape))
+mlir.register_constant_handler(PRNGKeyArray, key_array_constant_handler)
 
 
-# TODO(frostig): impl functions should be batch-friendly, can vmap
-# themselves if they want to rely on vmap for said batch-friendliness.
-# Or maybe really they should be required to be elementwise funcs, as
-# current ones already are. Then is there a better way to apply them
-# elementwise than to vmap n times?
+# -- primitives
+
 def vmap_n(n, f):
   for _ in range(n):
     f = jax.vmap(f)
@@ -299,10 +382,18 @@ def random_seed_abstract_eval(seeds_aval, *, impl):
 @random_seed_p.def_impl
 def random_seed_impl(seeds, *, impl):
   seed = vmap_n(seeds.ndim, impl.seed)
-  return _PRNGKeyArray(impl, seed(seeds))
+  return PRNGKeyArray(impl, seed(seeds))
 
-mlir.register_lowering(random_seed_p, mlir.lower_fun(
-    random_seed_impl, multiple_results=False))
+def random_seed_lowering(ctx, seeds, *, impl):
+  aval, = ctx.avals_in
+  seed = vmap_n(aval.ndim, impl.seed)
+  seed_lowering = mlir.lower_fun(seed, multiple_results=False)
+  ctx_new = ctx.replace(avals_out=map(key_aval_to_raw_aval, ctx.avals_out))
+  out = seed_lowering(ctx_new, seeds)
+  ctx.set_tokens_out(ctx_new.tokens_out)
+  return out
+
+mlir.register_lowering(random_seed_p, random_seed_lowering)
 
 
 def random_split(keys, count):
@@ -319,10 +410,20 @@ def random_split_abstract_eval(keys_aval, *, count):
 def random_split_impl(keys, *, count):
   impl = keys.impl
   split = vmap_n(keys.ndim, impl.split)
-  return _PRNGKeyArray(impl, split(keys.unsafe_raw_array(), count))
+  return PRNGKeyArray(impl, split(keys.unsafe_raw_array(), count))
 
-mlir.register_lowering(random_split_p, mlir.lower_fun(
-    random_split_impl, multiple_results=False))
+def random_split_lowering(ctx, keys, *, count):
+  aval, = ctx.avals_in
+  impl = aval.dtype.impl
+  split = vmap_n(aval.ndim, impl.split)
+  split_lowering = mlir.lower_fun(split, multiple_results=False)
+  ctx_new = ctx.replace(avals_in=[key_aval_to_raw_aval(aval)],
+                        avals_out=map(key_aval_to_raw_aval, ctx.avals_out))
+  out = split_lowering(ctx_new, keys)
+  ctx.set_tokens_out(ctx_new.tokens_out)
+  return out
+
+mlir.register_lowering(random_split_p, random_split_lowering)
 
 
 def random_fold_in(keys, msgs):
@@ -336,10 +437,23 @@ def random_fold_in_abstract_eval(keys_aval, msgs_aval):
   return keys_aval
 
 @random_fold_in_p.def_impl
-def random_fold_in_impl(keys, msgs, *, count):
+def random_fold_in_impl(keys, msgs):
   impl = keys.impl
   fold_in = vmap_n(keys.ndim, impl.fold_in)
-  return _PRNGKeyArray(impl, fold_in(keys.unsafe_raw_array(), msgs))
+  return PRNGKeyArray(impl, fold_in(keys.unsafe_raw_array(), msgs))
+
+def random_fold_in_lowering(ctx, keys, msgs):
+  keys_aval, msgs_aval = ctx.avals_in
+  impl = keys_aval.dtype.impl
+  fold_in = vmap_n(keys_aval.ndim, impl.fold_in)
+  fold_in_lowering = mlir.lower_fun(fold_in, multiple_results=False)
+  ctx_new = ctx.replace(avals_in=[key_aval_to_raw_aval(keys_aval), msgs_aval],
+                        avals_out=map(key_aval_to_raw_aval, ctx.avals_out))
+  out = fold_in_lowering(ctx_new, keys, msgs)
+  ctx.set_tokens_out(ctx_new.tokens_out)
+  return out
+
+mlir.register_lowering(random_fold_in_p, random_fold_in_lowering)
 
 
 def random_bits(keys, bit_width, shape):
@@ -359,6 +473,18 @@ def random_bits_impl(keys, *, bit_width, shape):
   impl = keys.impl
   bits = vmap_n(keys.ndim, lambda k: impl.random_bits(k, bit_width, shape))
   return bits(keys.unsafe_raw_array())
+
+def random_bits_lowering(ctx, keys, *, bit_width, shape):
+  aval, = ctx.avals_in
+  impl = aval.dtype.impl
+  bits = vmap_n(aval.ndim, lambda k: impl.random_bits(k, bit_width, shape))
+  bits_lowering = mlir.lower_fun(bits, multiple_results=False)
+  ctx_new = ctx.replace(avals_in=[key_aval_to_raw_aval(aval)])
+  out = bits_lowering(ctx_new, keys)
+  ctx.set_tokens_out(ctx_new.tokens_out)
+  return out
+
+mlir.register_lowering(random_bits_p, random_bits_lowering)
 
 
 # -- threefry2x32 PRNG implementation
