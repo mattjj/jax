@@ -14,14 +14,18 @@
 """Module for state primitives."""
 from functools import partial
 
-from typing import Any, Generic, List, Tuple, TypeVar
+from typing import Any, Generic, List, Tuple, TypeVar, Union
 
 from jax import core
 from jax._src import ad_util
 from jax._src import pretty_printer as pp
-from jax._src.util import safe_map, safe_zip
+from jax._src.util import safe_map, safe_zip, partition_list, tuple_insert
 from jax.interpreters import ad
+<<<<<<< HEAD
 from jax.interpreters import partial_eval as pe
+=======
+from jax.interpreters import batching
+>>>>>>> 35efc0ecd (start adding for vmap, primitive closure is hard)
 import jax.numpy as jnp
 
 from jax._src.state.types import ShapedArrayRef, StateEffect
@@ -53,10 +57,12 @@ def _get_impl(ref: Ref, *idx: int):
   raise ValueError("Cannot run stateful primitive.")
 get_p.def_impl(_get_impl)
 
-def ref_get(ref: Ref, idx: Tuple[int, ...]) -> Array:
+def ref_get(ref: Ref, idx: Tuple[Union[int, slice], ...]) -> Array:
   """Reads a value from a `Ref`, a.k.a. value <- ref[idx]."""
-  idx = map(jnp.int32, idx)
-  return get_p.bind(ref, *idx)
+  indexed_dims_ = [i != slice(None) for i in idx]
+  _, idx = partition_list(indexed_dims_, idx)
+  indexed_dims = indexed_dims_ + [False] * (ref.ndim - len(indexed_dims_))
+  return get_p.bind(ref, *map(jnp.int32, idx), indexed_dims=tuple(indexed_dims))
 
 # `swap` mutates a `Ref`, setting its value and returns its previous value.
 # b = swap_p.bind(x, a)
@@ -115,11 +121,13 @@ def ref_addupdate(ref: Ref, idx: Tuple[int, ...], x: Array) -> None:
 
 ## get/set/addupdate abstract evaluation rules
 
-def _get_abstract_eval(ref_aval: ShapedArrayRef, *idx: int):
+def _get_abstract_eval(ref_aval: ShapedArrayRef, *idx, indexed_dims):
   if not isinstance(ref_aval, ShapedArrayRef):
     raise ValueError(f"`get` must be called on `Ref` types: {ref_aval}.")
-  return (core.ShapedArray(ref_aval.shape[len(idx):], ref_aval.dtype),
-          {StateEffect})
+  shape_suffix = [d for i, d in zip(indexed_dims, ref_aval.shape) if not i]
+  shape_prefix, = {i.shape for i in idx} or [()]  # tie fighter
+  shape = (*shape_prefix, *shape_suffix)
+  return (core.ShapedArray(shape, ref_aval.dtype), {StateEffect})
 get_p.def_effectful_abstract_eval(_get_abstract_eval)
 
 
@@ -169,8 +177,12 @@ def _get_pp_rule(eqn, context, settings):
   # Pretty prints `a = get x i` as `x[i] <- a`
   y, = eqn.outvars
   x, *idx = eqn.invars
-  idx = ','.join(core.pp_var(i, context) for i in idx)
+  idx_iter = iter(idx)
+  idx = ','.join(core.pp_var(next(idx_iter), context) if indexed else ':'
+                 for indexed in eqn.params['indexed_dims'])
+  assert next(idx_iter, None) is None
   lhs = core.pp_vars([y], context, print_shapes=settings.print_shapes)
+  # TODO more general get
   return [lhs, pp.text(' <- '), pp_ref(pp.concat([
     pp.text(core.pp_var(x, context)), pp.text('['), pp.text(idx), pp.text(']')
     ]))]
@@ -278,3 +290,47 @@ pe.partial_eval_jaxpr_custom_rules[swap_p] = partial(_state_partial_eval_custom,
                                                      swap_p)
 pe.partial_eval_jaxpr_custom_rules[addupdate_p] = partial(
     _state_partial_eval_custom, addupdate_p)
+
+##  get/swap/addupdate batching rules
+
+def _get_vmap(batched_args, batched_dims, *, indexed_dims):
+  ref, *idxs = batched_args
+  ref_dim, *idx_dims = batched_dims
+  if all(d is batching.not_mapped for d in idx_dims):
+    indexed_dims_ = tuple_insert(indexed_dims, ref_dim, False)
+    num_idxs_to_left = sum(indexed_dims[:ref_dim])
+    idxs_rank, = {i.ndim for i in idxs}
+    bdim_out = ref_dim - num_idxs_to_left + idxs_rank
+    return get_p.bind(ref, *idxs, indexed_dims=indexed_dims_), bdim_out
+  else:
+    raise NotImplementedError  # TODO generalize to be gather-y
+batching.primitive_batchers[get_p] = _get_vmap
+
+
+# get [indexed_dims=indexed_dims] x *idxs
+#   len(idxs) + [where indexed_dims is false] = x.ndim
+# for example
+#   x[:, idxs1, :, idxs2, :, :]
+# idxs can be int arrays, all have same shape as each other
+#
+# say x is shape (10, 3, 11, 4, 12, 13)
+# say idxs are each of shape (5, 6)
+# what is result shape?
+# like numpy: (5, 6, 10, 11, 12, 13)
+# with numpy, _sometimes_ the bdims stay in place. but we could just always have
+# result bdims at front.
+#
+# for now, don't allow slices like 3:7 (can lower those away)
+
+# TODO
+#  [x] get traceable
+#  [x] get abstract eval
+#  [x] get pprint
+#  [-] get vmap
+#   [x] batch ref
+#   [ ] batch idxs
+#  [ ] get lowering
+#  [ ] other primitives!
+#   [ ] swap
+#   [ ] addupdate
+#  [ ] transpose

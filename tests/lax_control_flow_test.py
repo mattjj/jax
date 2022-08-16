@@ -1811,7 +1811,7 @@ class LaxControlFlowTest(jtu.JaxTestCase):
        "scan": scan_impl}
       for jit_scan in [False, True]
       for jit_f in [False, True]
-      for scan_impl, scan_name in SCAN_IMPLS
+      for scan_impl, scan_name in SCAN_IMPLS_WITH_FOR
       for in_axes in itertools.product([None, 0, 1], [None, 0, 1, 2])
       if in_axes != (None, None))
   def testScanVmap(self, jit_scan, jit_f, in_axes, scan):
