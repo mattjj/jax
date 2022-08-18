@@ -17,15 +17,13 @@ from functools import partial
 from typing import Any, Generic, List, Tuple, TypeVar, Union
 
 from jax import core
+from jax import lax
 from jax._src import ad_util
 from jax._src import pretty_printer as pp
 from jax._src.util import safe_map, safe_zip, partition_list, tuple_insert
 from jax.interpreters import ad
-<<<<<<< HEAD
-from jax.interpreters import partial_eval as pe
-=======
 from jax.interpreters import batching
->>>>>>> 35efc0ecd (start adding for vmap, primitive closure is hard)
+from jax.interpreters import partial_eval as pe
 import jax.numpy as jnp
 
 from jax._src.state.types import ShapedArrayRef, StateEffect
@@ -64,14 +62,14 @@ def _unpack_idx(idx: Indexer, ndim: int
   indexed_dims_ = [type(i) != slice for i in idx]
   _, non_slice_idx = partition_list(indexed_dims_, idx)
   indexed_dims = indexed_dims_ + [False] * (ndim - len(indexed_dims_))
-  return (tuple(map(lambda x: jnp.array(x, jnp.int32), non_slice_idx)),
+  return (tuple(map(lambda x: jnp.asarray(x, jnp.int32), non_slice_idx)),
           tuple(indexed_dims))
 
 def _get_slice_output_shape(in_shape: Tuple[int, ...],
                             idx_shapes: Tuple[Tuple[int, ...], ...],
                             indexed_dims: Tuple[bool, ...]) -> Tuple[int, ...]:
   shape_suffix = [d for i, d in zip(indexed_dims, in_shape) if not i]
-  shape_prefix, = idx_shapes or [()]  # tie fighter
+  shape_prefix, = set(idx_shapes) or [()]  # tie fighter
   # Move shape prefix dimensions to the front
   shape = (*shape_prefix, *shape_suffix)
   return shape
@@ -148,7 +146,7 @@ def _get_abstract_eval(ref_aval: ShapedArrayRef, *idx, indexed_dims):
     raise ValueError(f"Invalid `idx` and `indexed_dims`: {idx}, {indexed_dims}")
   idx_shapes = tuple(i.shape for i in idx)
   shape = _get_slice_output_shape(ref_aval.shape, idx_shapes, indexed_dims)
-  return (core.core.ShapedArrayShapedArray(shape, ref_aval.dtype), {StateEffect})
+  return (core.ShapedArray(shape, ref_aval.dtype), {StateEffect})
 get_p.def_effectful_abstract_eval(_get_abstract_eval)
 
 
@@ -158,6 +156,8 @@ def _swap_abstract_eval(ref_aval: ShapedArrayRef, val_aval: core.AbstractValue,
     raise ValueError(f"`swap` must be called on `Ref` types: {ref_aval}.")
   if len(indexed_dims) != len(ref_aval.shape):
     raise ValueError("`indexed_dims` must be the same length as `Ref` shape.")
+  if sum(indexed_dims) != len(idx):
+    raise ValueError(f"Invalid `idx` and `indexed_dims`: {idx}, {indexed_dims}")
   val_aval = core.raise_to_shaped(val_aval)
   assert isinstance(val_aval, core.ShapedArray)
   idx_shapes = tuple(i.shape for i in idx)
@@ -184,6 +184,8 @@ def _addupdate_abstract_eval(ref_aval: ShapedArrayRef,
     raise ValueError(f"`addupdate` must be called on `Ref` types: {ref_aval}.")
   if len(indexed_dims) != len(ref_aval.shape):
     raise ValueError("`indexed_dims` must be the same length as `Ref` shape.")
+  if sum(indexed_dims) != len(idx):
+    raise ValueError(f"Invalid `idx` and `indexed_dims`: {idx}, {indexed_dims}")
   val_aval = core.raise_to_shaped(val_aval)
   assert isinstance(val_aval, core.ShapedArray)
   idx_shapes = tuple(i.shape for i in idx)
@@ -243,8 +245,8 @@ def _swap_pp_rule(eqn, context, settings):
     x_i = pp.concat([pp.text(core.pp_var(x, context)),
                      pp.text('['), idx, pp.text(']')])
     y = core.pp_vars([y], context, print_shapes=settings.print_shapes)
-    return [y, pp.text(', '), x_i, pp.text(' <- '),
-            x_i, pp.text(', '), pp.text(core.pp_var(v, context))]
+    return [y, pp.text(', '), pp_ref(x_i), pp.text(' <- '),
+            pp_ref(x_i), pp.text(', '), pp.text(core.pp_var(v, context))]
 core.pp_eqn_rules[swap_p] = _swap_pp_rule
 
 def _addupdate_pp_rule(eqn, context, settings):
@@ -332,18 +334,88 @@ pe.partial_eval_jaxpr_custom_rules[addupdate_p] = partial(
 ##  get/swap/addupdate batching rules
 
 def _get_vmap(batched_args, batched_dims, *, indexed_dims):
+  axis_size, = {x.shape[d] for x, d in zip(batched_args, batched_dims)
+                if d is not batching.not_mapped}
   ref, *idxs = batched_args
   ref_dim, *idx_dims = batched_dims
   if all(d is batching.not_mapped for d in idx_dims):
     indexed_dims_ = tuple_insert(indexed_dims, ref_dim, False)
     num_idxs_to_left = sum(indexed_dims[:ref_dim])
-    idxs_rank, = {i.ndim for i in idxs}
+    idxs_rank, = {i.ndim for i in idxs} or [0]
     bdim_out = ref_dim - num_idxs_to_left + idxs_rank
     return get_p.bind(ref, *idxs, indexed_dims=indexed_dims_), bdim_out
-  else:
-    raise NotImplementedError  # TODO generalize to be gather-y
+  elif ref_dim is batching.not_mapped:
+    idxs = [batching.bdim_at_front(i, d, axis_size) for i, d
+            in zip(idxs, idx_dims)]
+    return get_p.bind(ref, *idxs, indexed_dims=indexed_dims), 0
+  else:  # Both ref and idx are batched
+    indexed_dims_ = tuple_insert(indexed_dims, ref_dim, True)
+    idxs = tuple(batching.bdim_at_front(i, d, axis_size) for i, d
+                 in zip(idxs, idx_dims))
+    idxs_shape, = {i.shape for i in idxs} or [()]
+    idxs_rank = len(idxs_shape)
+    idx_place = ref_dim - (len(indexed_dims_) - sum(indexed_dims_))
+
+    return get_p.bind(ref, *idxs, indexed_dims=indexed_dims_), 0
 batching.primitive_batchers[get_p] = _get_vmap
 
+def _swap_vmap(batched_args, batched_dims, *, indexed_dims):
+  axis_size, = {x.shape[d] for x, d in zip(batched_args, batched_dims)
+                if d is not batching.not_mapped}
+  ref, val, *idxs = batched_args
+  ref_dim, val_dim, *idx_dims = batched_dims
+  if all(d is batching.not_mapped for d in idx_dims):
+    if val_dim is batching.not_mapped:
+      val = batching.broadcast(val, axis_size, ref_dim)
+    assert ref_dim is not batching.not_mapped
+    indexed_dims_ = tuple_insert(indexed_dims, ref_dim, False)
+    num_idxs_to_left = sum(indexed_dims[:ref_dim])
+    idxs_rank, = {i.ndim for i in idxs} or [0]
+    bdim_out = ref_dim - num_idxs_to_left + idxs_rank
+    return swap_p.bind(ref, val, *idxs, indexed_dims=indexed_dims_), bdim_out
+  else:
+    assert ref_dim is not batching.not_mapped
+    assert val_dim is not batching.not_mapped
+    indexed_dims_ = tuple_insert(indexed_dims, ref_dim, True)
+    idxs = tuple(batching.bdim_at_front(i, d, axis_size) for i, d
+                 in zip(idxs, idx_dims))
+    idxs_shape, = {i.shape for i in idxs} or [()]
+    idxs_rank = len(idxs_shape)
+    idx_place = ref_dim - (len(indexed_dims_) - sum(indexed_dims_))
+    idxs = tuple_insert(
+        idxs, idx_place, lax.broadcasted_iota(jnp.dtype('int32'), idxs_shape, 0))
+    val = batching.moveaxis(val, val_dim, 0)
+    return swap_p.bind(ref, val, *idxs, indexed_dims=indexed_dims_), 0
+batching.primitive_batchers[swap_p] = _swap_vmap
+
+def _addupdate_vmap(batched_args, batched_dims, *, indexed_dims):
+  axis_size, = {x.shape[d] for x, d in zip(batched_args, batched_dims)
+                if d is not batching.not_mapped}
+  ref, val, *idxs = batched_args
+  ref_dim, val_dim, *idx_dims = batched_dims
+  if all(d is batching.not_mapped for d in idx_dims):
+    if val_dim is batching.not_mapped:
+      val = batching.broadcast(val, axis_size, ref_dim)
+    assert ref_dim is not batching.not_mapped
+    indexed_dims_ = tuple_insert(indexed_dims, ref_dim, False)
+    num_idxs_to_left = sum(indexed_dims[:ref_dim])
+    idxs_rank, = {i.ndim for i in idxs} or [0]
+    bdim_out = ref_dim - num_idxs_to_left + idxs_rank
+    return addupdate_p.bind(ref, val, *idxs, indexed_dims=indexed_dims_), []
+  else:
+    assert ref_dim is not batching.not_mapped
+    assert val_dim is not batching.not_mapped
+    indexed_dims_ = tuple_insert(indexed_dims, ref_dim, True)
+    idxs = tuple(batching.bdim_at_front(i, d, axis_size) for i, d
+                 in zip(idxs, idx_dims))
+    idxs_shape, = {i.shape for i in idxs} or [()]
+    idxs_rank = len(idxs_shape)
+    idx_place = ref_dim - (len(indexed_dims_) - sum(indexed_dims_))
+    idxs = tuple_insert(
+        idxs, idx_place, lax.broadcasted_iota(jnp.dtype('int32'), idxs_shape, 0))
+    val = batching.moveaxis(val, val_dim, 0)
+    return addupdate_p.bind(ref, val, *idxs, indexed_dims=indexed_dims_), []
+batching.primitive_batchers[addupdate_p] = _addupdate_vmap
 
 # get [indexed_dims=indexed_dims] x *idxs
 #   len(idxs) + [where indexed_dims is false] = x.ndim
