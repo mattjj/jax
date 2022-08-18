@@ -52,17 +52,34 @@ zip, unsafe_zip = safe_zip, zip
 #   a:f32[3] <- x[]
 get_p = core.Primitive("get")
 
-def _get_impl(ref: Ref, *idx: int):
+def _get_impl(ref: Ref, *idx: int, **_):
   del ref, idx
   raise ValueError("Cannot run stateful primitive.")
 get_p.def_impl(_get_impl)
 
+Indexer = Tuple[Union[int, slice, jnp.ndarray], ...]
+
+def _unpack_idx(idx: Indexer, ndim: int
+               ) -> Tuple[Tuple[int, ...], Tuple[bool, ...]]:
+  indexed_dims_ = [type(i) != slice for i in idx]
+  _, non_slice_idx = partition_list(indexed_dims_, idx)
+  indexed_dims = indexed_dims_ + [False] * (ndim - len(indexed_dims_))
+  return (tuple(map(lambda x: jnp.array(x, jnp.int32), non_slice_idx)),
+          tuple(indexed_dims))
+
+def _get_slice_output_shape(in_shape: Tuple[int, ...],
+                            idx_shapes: Tuple[Tuple[int, ...], ...],
+                            indexed_dims: Tuple[bool, ...]) -> Tuple[int, ...]:
+  shape_suffix = [d for i, d in zip(indexed_dims, in_shape) if not i]
+  shape_prefix, = idx_shapes or [()]  # tie fighter
+  # Move shape prefix dimensions to the front
+  shape = (*shape_prefix, *shape_suffix)
+  return shape
+
 def ref_get(ref: Ref, idx: Tuple[Union[int, slice], ...]) -> Array:
   """Reads a value from a `Ref`, a.k.a. value <- ref[idx]."""
-  indexed_dims_ = [i != slice(None) for i in idx]
-  _, idx = partition_list(indexed_dims_, idx)
-  indexed_dims = indexed_dims_ + [False] * (ref.ndim - len(indexed_dims_))
-  return get_p.bind(ref, *map(jnp.int32, idx), indexed_dims=tuple(indexed_dims))
+  idx, indexed_dims = _unpack_idx(idx, ref.ndim)
+  return get_p.bind(ref, *idx, indexed_dims=indexed_dims)
 
 # `swap` mutates a `Ref`, setting its value and returns its previous value.
 # b = swap_p.bind(x, a)
@@ -82,15 +99,15 @@ def ref_get(ref: Ref, idx: Tuple[Union[int, slice], ...]) -> Array:
 #   x:Ref{f32[3]}[i, j] <- a
 swap_p = core.Primitive("swap")
 
-def _swap_impl(ref: Ref, value: Array, *idx: int):
+def _swap_impl(ref: Ref, value: Array, *idx: int, **_):
   del ref, value, idx
   raise ValueError("Cannot run stateful primitive.")
 swap_p.def_impl(_swap_impl)
 
 def ref_swap(ref: Ref, idx: Tuple[int, ...], value: Array) -> Array:
   """Sets a `Ref`'s value and returns the original value."""
-  idx = map(jnp.int32, idx)
-  return swap_p.bind(ref, value, *idx)
+  idx, indexed_dims = _unpack_idx(idx, ref.ndim)
+  return swap_p.bind(ref, value, *idx, indexed_dims=indexed_dims)
 
 def ref_set(ref: Ref, idx: Tuple[int, ...], value: Array) -> None:
   """Sets a `Ref`'s value, a.k.a. ref[idx] <- value."""
@@ -117,27 +134,35 @@ addupdate_p.def_impl(_addupdate_impl)
 
 def ref_addupdate(ref: Ref, idx: Tuple[int, ...], x: Array) -> None:
   """Mutates a ref with an additive update i.e. `ref[idx] += x`."""
-  return addupdate_p.bind(ref, x, *idx)
+  idx, indexed_dims = _unpack_idx(idx, ref.ndim)
+  return addupdate_p.bind(ref, x, *idx, indexed_dims=indexed_dims)
 
 ## get/set/addupdate abstract evaluation rules
 
 def _get_abstract_eval(ref_aval: ShapedArrayRef, *idx, indexed_dims):
   if not isinstance(ref_aval, ShapedArrayRef):
     raise ValueError(f"`get` must be called on `Ref` types: {ref_aval}.")
-  shape_suffix = [d for i, d in zip(indexed_dims, ref_aval.shape) if not i]
-  shape_prefix, = {i.shape for i in idx} or [()]  # tie fighter
-  shape = (*shape_prefix, *shape_suffix)
-  return (core.ShapedArray(shape, ref_aval.dtype), {StateEffect})
+  if len(indexed_dims) != len(ref_aval.shape):
+    raise ValueError("`indexed_dims` must be the same length as `Ref` shape.")
+  if sum(indexed_dims) != len(idx):
+    raise ValueError(f"Invalid `idx` and `indexed_dims`: {idx}, {indexed_dims}")
+  idx_shapes = tuple(i.shape for i in idx)
+  shape = _get_slice_output_shape(ref_aval.shape, idx_shapes, indexed_dims)
+  return (core.core.ShapedArrayShapedArray(shape, ref_aval.dtype), {StateEffect})
 get_p.def_effectful_abstract_eval(_get_abstract_eval)
 
 
 def _swap_abstract_eval(ref_aval: ShapedArrayRef, val_aval: core.AbstractValue,
-                        *idx: int):
+                        *idx: core.ShapedArray, indexed_dims: Tuple[bool]):
   if not isinstance(ref_aval, ShapedArrayRef):
     raise ValueError(f"`swap` must be called on `Ref` types: {ref_aval}.")
+  if len(indexed_dims) != len(ref_aval.shape):
+    raise ValueError("`indexed_dims` must be the same length as `Ref` shape.")
   val_aval = core.raise_to_shaped(val_aval)
   assert isinstance(val_aval, core.ShapedArray)
-  expected_output_shape = ref_aval.shape[len(idx):]
+  idx_shapes = tuple(i.shape for i in idx)
+  expected_output_shape = _get_slice_output_shape(
+      ref_aval.shape, idx_shapes, indexed_dims)
   if expected_output_shape != val_aval.shape:
     raise ValueError("Invalid shape for `swap`. "
                      f"Ref shape: {ref_aval.shape}. "
@@ -147,24 +172,32 @@ def _swap_abstract_eval(ref_aval: ShapedArrayRef, val_aval: core.AbstractValue,
     raise ValueError("Invalid dtype for `swap`. "
                      f"Ref dtype: {ref_aval.dtype}. "
                      f"Value shape: {val_aval.dtype}. ")
-  return (core.ShapedArray(ref_aval.shape[len(idx):], ref_aval.dtype),
+  return (core.ShapedArray(expected_output_shape, ref_aval.dtype),
           {StateEffect})
 swap_p.def_effectful_abstract_eval(_swap_abstract_eval)
 
 
 def _addupdate_abstract_eval(ref_aval: ShapedArrayRef,
                              val_aval: core.AbstractValue,
-                             *idx: int):
+                             *idx: core.ShapedArray, indexed_dims: Tuple[bool]):
   if not isinstance(ref_aval, ShapedArrayRef):
     raise ValueError(f"`addupdate` must be called on `Ref` types: {ref_aval}.")
+  if len(indexed_dims) != len(ref_aval.shape):
+    raise ValueError("`indexed_dims` must be the same length as `Ref` shape.")
   val_aval = core.raise_to_shaped(val_aval)
   assert isinstance(val_aval, core.ShapedArray)
-  expected_output_shape = ref_aval.shape[len(idx):]
-  if expected_output_shape != val_aval.shape:
+  idx_shapes = tuple(i.shape for i in idx)
+  slice_shape = _get_slice_output_shape(
+      ref_aval.shape, idx_shapes, indexed_dims)
+  if slice_shape != val_aval.shape:
     raise ValueError("Invalid shape for `swap`. "
                      f"Ref shape: {ref_aval.shape}. "
                      f"Value shape: {val_aval.shape}. "
                      f"Indices: {idx}. ")
+  if ref_aval.dtype != val_aval.dtype:
+    raise ValueError("Invalid dtype for `swap`. "
+                     f"Ref dtype: {ref_aval.dtype}. "
+                     f"Value shape: {val_aval.dtype}. ")
   return [], {StateEffect}
 addupdate_p.def_effectful_abstract_eval(_addupdate_abstract_eval)
 
@@ -173,25 +206,29 @@ addupdate_p.def_effectful_abstract_eval(_addupdate_abstract_eval)
 pp_ref = partial(pp.color, intensity=pp.Intensity.NORMAL,
                  foreground=pp.Color.GREEN)
 
+def _pp_idx(context, non_slice_idx, indexed_dims):
+  idx_iter = iter(non_slice_idx)
+  idx = ','.join(core.pp_var(next(idx_iter), context) if indexed else ':'
+                 for indexed in indexed_dims)
+  assert next(idx_iter, None) is None
+  return pp.text(idx)
+
 def _get_pp_rule(eqn, context, settings):
   # Pretty prints `a = get x i` as `x[i] <- a`
   y, = eqn.outvars
   x, *idx = eqn.invars
-  idx_iter = iter(idx)
-  idx = ','.join(core.pp_var(next(idx_iter), context) if indexed else ':'
-                 for indexed in eqn.params['indexed_dims'])
-  assert next(idx_iter, None) is None
+  idx = _pp_idx(context, idx, eqn.params["indexed_dims"])
   lhs = core.pp_vars([y], context, print_shapes=settings.print_shapes)
   # TODO more general get
   return [lhs, pp.text(' <- '), pp_ref(pp.concat([
-    pp.text(core.pp_var(x, context)), pp.text('['), pp.text(idx), pp.text(']')
+    pp.text(core.pp_var(x, context)), pp.text('['), idx, pp.text(']')
     ]))]
 core.pp_eqn_rules[get_p] = _get_pp_rule
 
 def _swap_pp_rule(eqn, context, settings):
   y, = eqn.outvars
   x, v, *idx = eqn.invars
-  idx = ','.join(core.pp_var(i, context) for i in idx)
+  idx = _pp_idx(context, idx, eqn.params["indexed_dims"])
   if type(y) is core.DropVar:
     # In the case of a set (ignored return value),
     # pretty print `_ = swap x v i` as `x[i] <- v`
@@ -199,12 +236,12 @@ def _swap_pp_rule(eqn, context, settings):
     return [
       pp_ref(pp.concat([
         pp.text(core.pp_var(x, context)),
-        pp.text('['), pp.text(idx), pp.text(']')
+        pp.text('['), idx, pp.text(']')
       ])), pp.text(' <- '), pp.text(core.pp_var(v, context))]
   else:
     # pretty-print `y:T = swap x v i` as `y:T, x[i] <- x[i], v`
     x_i = pp.concat([pp.text(core.pp_var(x, context)),
-                     pp.text('['), pp.text(idx), pp.text(']')])
+                     pp.text('['), idx, pp.text(']')])
     y = core.pp_vars([y], context, print_shapes=settings.print_shapes)
     return [y, pp.text(', '), x_i, pp.text(' <- '),
             x_i, pp.text(', '), pp.text(core.pp_var(v, context))]
@@ -214,55 +251,56 @@ def _addupdate_pp_rule(eqn, context, settings):
   # pretty-print ` = addupdate x i v` as `x[i] += v`
   () = eqn.outvars
   x, v, *idx = eqn.invars
-  idx = ','.join(core.pp_var(i, context) for i in idx)
+  idx = _pp_idx(context, idx, eqn.params["indexed_dims"])
   return [
     pp_ref(pp.concat([
         pp.text(core.pp_var(x, context)),
-        pp.text('['), pp.text(idx), pp.text(']')
+        pp.text('['), idx, pp.text(']')
       ])), pp.text(' += '), pp.text(core.pp_var(v, context))]
 core.pp_eqn_rules[addupdate_p] = _addupdate_pp_rule
 
 ## get/swap/addupdate JVP rules
 
-def _get_jvp(primals: List[Any], tangents: List[Any]):
+def _get_jvp(primals: List[Any], tangents: List[Any], **params: Any):
   ref_primal, *idx = primals
   assert isinstance(ref_primal.aval, ShapedArrayRef)
   ref_tangent, *_ = tangents
   assert isinstance(ref_tangent.aval, ShapedArrayRef)
-  return ref_get(ref_primal, idx), ref_get(ref_tangent, idx)  # type: ignore[arg-type]
+  return (get_p.bind(ref_primal, *idx, **params),
+          get_p.bind(ref_tangent, *idx, **params))  # type: ignore[arg-type]
 ad.primitive_jvps[get_p] = _get_jvp
 
-def _swap_jvp(primals: List[Any], tangents: List[Any]):
+def _swap_jvp(primals: List[Any], tangents: List[Any], **params: Any):
   ref_primal, x_primal, *idx = primals
   assert isinstance(ref_primal.aval, ShapedArrayRef)
   ref_tangent, x_tangent, *_ = tangents
   assert isinstance(ref_tangent.aval, ShapedArrayRef)
   x_tangent = ad_util.instantiate(x_tangent)
-  return (ref_swap(ref_primal, idx, x_primal),  # type: ignore[arg-type]
-          ref_swap(ref_tangent, idx, x_tangent))  # type: ignore[arg-type]
+  return (swap_p.bind(ref_primal, x_primal, *idx, **params),  # type: ignore[arg-type]
+          swap_p.bind(ref_tangent, x_tangent, *idx, **params))  # type: ignore[arg-type]
 ad.primitive_jvps[swap_p] = _swap_jvp
 
-def addupdate_jvp_rule(primals: List[Any], tangents: List[Any]):
+def addupdate_jvp_rule(primals: List[Any], tangents: List[Any], **params: Any):
   ref_primal, x_primal, *idx = primals
   ref_tangent, x_tangent, *_ = tangents
   x_tangent = ad_util.instantiate(x_tangent)
-  addupdate_p.bind(ref_primal, x_primal, *idx)
-  addupdate_p.bind(ref_tangent, x_tangent, *idx)
+  addupdate_p.bind(ref_primal, x_primal, *idx, **params)
+  addupdate_p.bind(ref_tangent, x_tangent, *idx, **params)
   return [], []
 ad.primitive_jvps[addupdate_p] = addupdate_jvp_rule
 
 ##  get/swap/addupdate transpose rules
 
-def _get_transpose(g, ref, *idx):
+def _get_transpose(g, ref, *idx, **params):
   # get transpose is addupdate
   if type(g) is not ad_util.Zero:
-    ref_addupdate(ref, idx, g)
+    addupdate_p.bind(ref, g, *idx, **params)
   return [None] + [None] * len(idx)
 ad.primitive_transposes[get_p] = _get_transpose
 
-def _swap_transpose(g, ref, x, *idx):
+def _swap_transpose(g, ref, x, *idx, **params):
   # swap transpose is swap
-  x_bar = ref_swap(ref, idx, ad_util.instantiate(g))
+  x_bar = swap_p.bind(ref, ad_util.instantiate(g), *idx, **params)
   return [None, x_bar] + [None] * len(idx)
 ad.primitive_transposes[swap_p] = _swap_transpose
 
@@ -330,7 +368,7 @@ batching.primitive_batchers[get_p] = _get_vmap
 #   [x] batch ref
 #   [ ] batch idxs
 #  [ ] get lowering
-#  [ ] other primitives!
-#   [ ] swap
-#   [ ] addupdate
+#  [x] other primitives!
+#   [x] swap
+#   [x] addupdate
 #  [ ] transpose

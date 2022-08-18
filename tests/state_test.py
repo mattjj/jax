@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 from absl.testing import absltest
+from absl.testing import parameterized
 import jax
 from jax import core
 from jax import lax
@@ -20,6 +21,7 @@ from jax.config import config
 from jax.interpreters import partial_eval as pe
 from jax._src import test_util as jtu
 import jax.numpy as jnp
+import numpy as np
 
 from jax._src import state
 
@@ -39,68 +41,179 @@ class StatePrimitivesTest(jtu.JaxTestCase):
     with self.assertRaises(ValueError):
       state.addupdate_p.bind(jnp.ones(5), jnp.zeros(5))
 
-  def test_get_abstract_eval(self):
-    ref_aval = state.ShapedArrayRef((1, 2, 3), jnp.float32)
-    out_aval, effect = state.get_p.abstract_eval(ref_aval, 0)
-    self.assertSetEqual(effect, {state.StateEffect})
-    self.assertTupleEqual(out_aval.shape, (2, 3))
-    self.assertEqual(out_aval.dtype, jnp.float32)
-
   def test_get_abstract_aval_must_take_in_refs(self):
+    ref_aval = core.ShapedArray((), jnp.float32)
+    def f(x_ref):
+      return [state.ref_get(x_ref, ())]
     with self.assertRaises(ValueError):
-      state.get_p.abstract_eval(core.ShapedArray((1, 2, 3), jnp.float32))
+      pe.trace_to_jaxpr_dynamic(lu.wrap_init(f), [ref_aval])
 
-  def test_swap_abstract_eval(self):
-    ref_aval = state.ShapedArrayRef((1, 2, 3), jnp.float32)
-    val_aval = core.ShapedArray((2, 3), jnp.float32)
-    out_aval, effect = state.swap_p.abstract_eval(ref_aval, val_aval, 0)
-    self.assertSetEqual(effect, {state.StateEffect})
-    self.assertTupleEqual(out_aval.shape, (2, 3))
-    self.assertEqual(out_aval.dtype, jnp.float32)
+  @parameterized.named_parameters(
+      dict(testcase_name="trivial_get", ref_shape=(1, 2),
+           ref_dtype=jnp.float32,
+           idx=(), out_shape=(1, 2), out_dtype=jnp.float32),
+      dict(testcase_name="get_with_index", ref_shape=(1, 2),
+           ref_dtype=jnp.float32,
+           idx=(0,), out_shape=(2,), out_dtype=jnp.float32),
+      dict(testcase_name="get_with_nonleading_index", ref_shape=(1, 2),
+           ref_dtype=jnp.float32,
+           idx=(slice(None), 0), out_shape=(1,), out_dtype=jnp.float32),
+      dict(testcase_name="get_with_array_index", ref_shape=(1, 2, 3, 4),
+           ref_dtype=jnp.float32,
+           idx=(np.array([0, 1]),), out_shape=(2, 2, 3, 4),
+           out_dtype=jnp.float32),
+      dict(testcase_name="get_with_multiple_array_index",
+           ref_shape=(1, 3, 2, 4), ref_dtype=jnp.float32,
+           idx=(np.array([0, 1]), np.array([0, 1])),
+           out_shape=(2, 2, 4), out_dtype=jnp.float32),
+      dict(testcase_name="get_with_nonleading_multiple_array_index",
+           ref_shape=(1, 3, 2, 4), ref_dtype=jnp.float32,
+           idx=(slice(None), np.array([0, 1]), slice(None), np.array([0, 1])),
+           out_shape=(2, 1, 2), out_dtype=jnp.float32),
+  )
+  def test_get_abstract_eval(self, ref_shape, ref_dtype, idx, out_shape=None,
+                             out_dtype=None, should_error=False):
+    ref_aval = state.ShapedArrayRef(ref_shape, ref_dtype)
+    def f(x_ref):
+      out = state.ref_get(x_ref, idx)
+      return [out]
+    if should_error:
+      with self.assertRaises(Exception):
+        pe.trace_to_jaxpr_dynamic(lu.wrap_init(f), [ref_aval])
+    else:
+      jaxpr, out_avals, _ = pe.trace_to_jaxpr_dynamic(
+          lu.wrap_init(f), [ref_aval])
+      self.assertSetEqual(jaxpr.effects, {state.StateEffect})
+      self.assertLen(out_avals, 1)
+      out_aval, = out_avals
+      self.assertIsInstance(out_aval, core.ShapedArray)
+      self.assertEqual(out_aval.shape, out_shape)
+      self.assertEqual(out_aval.dtype, out_dtype)
 
   def test_swap_abstract_eval_must_take_in_refs(self):
+    ref_aval = core.ShapedArray((), jnp.float32)
+    val_aval = core.ShapedArray((), jnp.float32)
+    def f(x_ref, val):
+      return [state.ref_swap(x_ref, (), val)]
     with self.assertRaises(ValueError):
-      state.swap_p.abstract_eval(core.ShapedArray((1, 2, 3), jnp.float32),
-                                    core.ShapedArray((1, 2, 3), jnp.float32))
+      pe.trace_to_jaxpr_dynamic(lu.wrap_init(f), [ref_aval, val_aval])
 
-  def test_swap_checks_for_correct_shapes(self):
-    with self.assertRaises(ValueError):
-      state.swap_p.abstract_eval(
-          state.ShapedArrayRef((1, 2, 3), jnp.float32),
-          core.ShapedArray((2, 3), jnp.float32))
-    with self.assertRaises(ValueError):
-      state.swap_p.abstract_eval(
-          state.ShapedArrayRef((1, 2, 3), jnp.float32),
-          core.ShapedArray((1, 2, 3, 4), jnp.float32))
-    state.swap_p.abstract_eval(
-        state.ShapedArrayRef((1, 2, 3), jnp.float32),
-        core.ShapedArray((2, 3), jnp.float32), 1)
+  @parameterized.named_parameters(
+      dict(testcase_name="invalid_val_shape", ref_shape=(1, 2),
+           ref_dtype=jnp.float32, val_shape=(2,), val_dtype=jnp.float32,
+           idx=(), should_error=True),
+      dict(testcase_name="invalid_val_shape_slice", ref_shape=(1, 2),
+           ref_dtype=jnp.float32, val_shape=(2,), val_dtype=jnp.float32,
+           idx=(slice(None),), should_error=True),
+      dict(testcase_name="trivial_swap", ref_shape=(1, 2),
+           ref_dtype=jnp.float32, val_shape=(1, 2), val_dtype=jnp.float32,
+           idx=(), out_shape=(1, 2), out_dtype=jnp.float32),
+      dict(testcase_name="bad_dtype", ref_shape=(1, 2),
+           ref_dtype=jnp.int32, val_shape=(1, 2), val_dtype=jnp.float32,
+           idx=(), should_error=True),
+      dict(testcase_name="swap_with_index", ref_shape=(1, 2),
+           ref_dtype=jnp.float32, val_shape=(2,), val_dtype=jnp.float32,
+           idx=(0,), out_shape=(2,), out_dtype=jnp.float32),
+      dict(testcase_name="swap_with_nonleading_index", ref_shape=(1, 2),
+           ref_dtype=jnp.float32, val_shape=(1,), val_dtype=jnp.float32,
+           idx=(slice(None), 0), out_shape=(1,), out_dtype=jnp.float32),
+      dict(testcase_name="swap_with_nonleading_index_bad_val", ref_shape=(1, 2),
+           ref_dtype=jnp.float32, val_shape=(2,), val_dtype=jnp.float32,
+           idx=(slice(None), 0), should_error=True),
+      dict(testcase_name="swap_with_array_index", ref_shape=(1, 2, 3, 4),
+           ref_dtype=jnp.float32, val_shape=(2, 2, 3, 4), val_dtype=jnp.float32,
+           idx=(np.array([0, 1]),), out_shape=(2, 2, 3, 4),
+           out_dtype=jnp.float32),
+      dict(testcase_name="swap_with_multiple_array_index",
+           ref_shape=(1, 3, 2, 4), ref_dtype=jnp.float32,
+           val_shape=(2, 2, 4), val_dtype=jnp.float32,
+           idx=(np.array([0, 1]), np.array([0, 1])),
+           out_shape=(2, 2, 4), out_dtype=jnp.float32),
+      dict(testcase_name="swap_with_nonleading_multiple_array_index",
+           ref_shape=(1, 3, 2, 4), ref_dtype=jnp.float32,
+           val_shape=(2, 1, 2), val_dtype=jnp.float32,
+           idx=(slice(None), np.array([0, 1]), slice(None), np.array([0, 1])),
+           out_shape=(2, 1, 2), out_dtype=jnp.float32),
+  )
+  def test_swap_abstract_eval(self, ref_shape, ref_dtype,
+      val_shape, val_dtype, idx, out_shape=None, out_dtype=None,
+      should_error=False):
+    ref_aval = state.ShapedArrayRef(ref_shape, ref_dtype)
+    val_aval = core.ShapedArray(val_shape, val_dtype)
+    def f(x_ref, val):
+      out = state.ref_swap(x_ref, idx, val)
+      return [out]
+    if should_error:
+      with self.assertRaises(Exception):
+        pe.trace_to_jaxpr_dynamic(lu.wrap_init(f), [ref_aval, val_aval])
+    else:
+      jaxpr, out_avals, _ = pe.trace_to_jaxpr_dynamic(
+          lu.wrap_init(f), [ref_aval, val_aval])
+      self.assertSetEqual(jaxpr.effects, {state.StateEffect})
+      self.assertLen(out_avals, 1)
+      out_aval, = out_avals
+      self.assertIsInstance(out_aval, core.ShapedArray)
+      self.assertEqual(out_aval.shape, out_shape)
+      self.assertEqual(out_aval.dtype, out_dtype)
 
-  def test_addupdate_abstract_eval(self):
-    ref_aval = state.ShapedArrayRef((1, 2, 3), jnp.float32)
-    val_aval = core.ShapedArray((2, 3), jnp.float32)
-    out_avals, effect = state.addupdate_p.abstract_eval(ref_aval, val_aval,
-                                                           0)
-    self.assertSetEqual(effect, {state.StateEffect})
-    self.assertListEqual(out_avals, [])
+  @parameterized.named_parameters(
+      dict(testcase_name="invalid_val_shape", ref_shape=(1, 2),
+           ref_dtype=jnp.float32, val_shape=(2,), val_dtype=jnp.float32,
+           idx=(), should_error=True),
+      dict(testcase_name="invalid_val_shape_slice", ref_shape=(1, 2),
+           ref_dtype=jnp.float32, val_shape=(2,), val_dtype=jnp.float32,
+           idx=(slice(None),), should_error=True),
+      dict(testcase_name="trivial_addupdate", ref_shape=(1, 2),
+           ref_dtype=jnp.float32, val_shape=(1, 2), val_dtype=jnp.float32,
+           idx=(), out_shape=(1, 2), out_dtype=jnp.float32),
+      dict(testcase_name="bad_dtype", ref_shape=(1, 2),
+           ref_dtype=jnp.int32, val_shape=(1, 2), val_dtype=jnp.float32,
+           idx=(), should_error=True),
+      dict(testcase_name="addupdate_with_index", ref_shape=(1, 2),
+           ref_dtype=jnp.float32, val_shape=(2,), val_dtype=jnp.float32,
+           idx=(0,), out_shape=(2,), out_dtype=jnp.float32),
+      dict(testcase_name="addupdate_with_nonleading_index", ref_shape=(1, 2),
+           ref_dtype=jnp.float32, val_shape=(1,), val_dtype=jnp.float32,
+           idx=(slice(None), 0)),
+      dict(testcase_name="addupdate_with_nonleading_index_bad_val", ref_shape=(1, 2),
+           ref_dtype=jnp.float32, val_shape=(2,), val_dtype=jnp.float32,
+           idx=(slice(None), 0), should_error=True),
+      dict(testcase_name="addupdate_with_array_index", ref_shape=(1, 2, 3, 4),
+           ref_dtype=jnp.float32, val_shape=(2, 2, 3, 4), val_dtype=jnp.float32,
+           idx=(np.array([0, 1]),)),
+      dict(testcase_name="addupdate_with_multiple_array_index",
+           ref_shape=(1, 3, 2, 4), ref_dtype=jnp.float32,
+           val_shape=(2, 2, 4), val_dtype=jnp.float32,
+           idx=(np.array([0, 1]), np.array([0, 1]))),
+      dict(testcase_name="addupdate_with_nonleading_multiple_array_index",
+           ref_shape=(1, 3, 2, 4), ref_dtype=jnp.float32,
+           val_shape=(2, 1, 2), val_dtype=jnp.float32,
+           idx=(slice(None), np.array([0, 1]), slice(None), np.array([0, 1]))),
+  )
+  def test_addupdate_abstract_eval(self, ref_shape, ref_dtype,
+      val_shape, val_dtype, idx, out_shape=None, out_dtype=None,
+      should_error=False):
+    ref_aval = state.ShapedArrayRef(ref_shape, ref_dtype)
+    val_aval = core.ShapedArray(val_shape, val_dtype)
+    def f(x_ref, val):
+      state.ref_addupdate(x_ref, idx, val)
+      return []
+    if should_error:
+      with self.assertRaises(Exception):
+        pe.trace_to_jaxpr_dynamic(lu.wrap_init(f), [ref_aval, val_aval])
+    else:
+      jaxpr, out_avals, _ = pe.trace_to_jaxpr_dynamic(
+          lu.wrap_init(f), [ref_aval, val_aval])
+      self.assertSetEqual(jaxpr.effects, {state.StateEffect})
+      self.assertLen(out_avals, 0)
 
   def test_addupdate_abstract_eval_must_take_in_refs(self):
+    ref_aval = core.ShapedArray((), jnp.float32)
+    val_aval = core.ShapedArray((), jnp.float32)
+    def f(x_ref, val):
+      return [state.ref_addupdate(x_ref, (), val)]
     with self.assertRaises(ValueError):
-      state.addupdate_p.abstract_eval(core.ShapedArray((1, 2, 3), jnp.float32),
-                                    core.ShapedArray((1, 2, 3), jnp.float32))
-
-  def test_addupdate_checks_for_correct_shapes(self):
-    with self.assertRaises(ValueError):
-      state.addupdate_p.abstract_eval(
-          state.ShapedArrayRef((1, 2, 3), jnp.float32),
-          core.ShapedArray((2, 3), jnp.float32))
-    with self.assertRaises(ValueError):
-      state.addupdate_p.abstract_eval(
-          state.ShapedArrayRef((1, 2, 3), jnp.float32),
-          core.ShapedArray((1, 2, 3, 4), jnp.float32))
-    state.addupdate_p.abstract_eval(
-        state.ShapedArrayRef((1, 2, 3), jnp.float32),
-        core.ShapedArray((2, 3), jnp.float32), 1)
+      pe.trace_to_jaxpr_dynamic(lu.wrap_init(f), [ref_aval, val_aval])
 
   def test_can_represent_get_and_swap_in_jaxprs(self):
 
@@ -135,6 +248,13 @@ class StatePrimitivesTest(jtu.JaxTestCase):
         lu.wrap_init(body), [state.ShapedArrayRef((), jnp.int32)])
     self.assertIn("b:i32[] <- a[]", jaxpr.pretty_print(use_color=False))
 
+    def body(x_ref):
+      x = x_ref[:, 0]
+      return [x]
+    jaxpr, _ , _ = pe.trace_to_jaxpr_dynamic(
+        lu.wrap_init(body), [state.ShapedArrayRef((1, 2), jnp.int32)])
+    self.assertIn("b:i32[1] <- a[:,0]", jaxpr.pretty_print(use_color=False))
+
   def test_set_custom_pretty_printing_rule(self):
     def body(x_ref):
       x_ref[()] = jnp.int32(2)
@@ -142,6 +262,14 @@ class StatePrimitivesTest(jtu.JaxTestCase):
     jaxpr, _ , _ = pe.trace_to_jaxpr_dynamic(
         lu.wrap_init(body), [state.ShapedArrayRef((), jnp.int32)])
     self.assertIn("a[] <- 2", jaxpr.pretty_print(use_color=False))
+
+    def body(x_ref, val):
+      x_ref[:, 0] = val
+      return []
+    jaxpr, _ , _ = pe.trace_to_jaxpr_dynamic(
+        lu.wrap_init(body), [state.ShapedArrayRef((1, 2), jnp.int32),
+                             core.ShapedArray((1,), jnp.int32)])
+    self.assertIn("a[:,0] <- b", jaxpr.pretty_print(use_color=False))
 
   def test_swap_custom_pretty_printing_rule(self):
     def body(x_ref):
@@ -151,13 +279,32 @@ class StatePrimitivesTest(jtu.JaxTestCase):
         lu.wrap_init(body), [state.ShapedArrayRef((), jnp.int32)])
     self.assertIn("b:i32[], a[] <- a[], 2", jaxpr.pretty_print(use_color=False))
 
+    def body(x_ref, val):
+      x = state.ref_swap(x_ref, (slice(None), 0), val)
+      return [x]
+    jaxpr, _ , _ = pe.trace_to_jaxpr_dynamic(
+        lu.wrap_init(body), [state.ShapedArrayRef((1, 2), jnp.int32),
+                             core.ShapedArray((1,), jnp.int32)])
+    self.assertIn("c:i32[1], a[:,0] <- a[:,0], b",
+                  jaxpr.pretty_print(use_color=False))
+
   def test_addupdate_custom_pretty_printing_rule(self):
     def body(x_ref):
       state.ref_addupdate(x_ref, (), jnp.int32(2))
       return []
     jaxpr, _ , _ = pe.trace_to_jaxpr_dynamic(
         lu.wrap_init(body), [state.ShapedArrayRef((), jnp.int32)])
+
     self.assertIn("a[] += 2", jaxpr.pretty_print(use_color=False))
+
+    def body(x_ref, val):
+      state.ref_addupdate(x_ref, (slice(None), 0), val)
+      return []
+    jaxpr, _ , _ = pe.trace_to_jaxpr_dynamic(
+        lu.wrap_init(body), [state.ShapedArrayRef((1, 2), jnp.int32),
+                             core.ShapedArray((1,), jnp.int32)])
+    self.assertIn("a[:,0] += b", jaxpr.pretty_print(use_color=False))
+
 
   def test_get_jvp(self):
 
