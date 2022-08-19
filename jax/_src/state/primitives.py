@@ -333,30 +333,45 @@ pe.partial_eval_jaxpr_custom_rules[addupdate_p] = partial(
 
 ##  get/swap/addupdate batching rules
 
+def _compute_output_batch_dimension(indexed_dims: Tuple[bool, ...], ref_dim:
+    int, idxs_shape: Tuple[int, ...]):
+  num_idxs_to_left = sum(indexed_dims[:ref_dim])
+  return ref_dim - num_idxs_to_left + len(idxs_shape)
+
 def _get_vmap(batched_args, batched_dims, *, indexed_dims):
   axis_size, = {x.shape[d] for x, d in zip(batched_args, batched_dims)
                 if d is not batching.not_mapped}
   ref, *idxs = batched_args
   ref_dim, *idx_dims = batched_dims
-  if all(d is batching.not_mapped for d in idx_dims):
-    indexed_dims_ = tuple_insert(indexed_dims, ref_dim, False)
-    num_idxs_to_left = sum(indexed_dims[:ref_dim])
-    idxs_rank, = {i.ndim for i in idxs} or [0]
-    bdim_out = ref_dim - num_idxs_to_left + idxs_rank
-    return get_p.bind(ref, *idxs, indexed_dims=indexed_dims_), bdim_out
-  elif ref_dim is batching.not_mapped:
-    idxs = [batching.bdim_at_front(i, d, axis_size) for i, d
-            in zip(idxs, idx_dims)]
-    return get_p.bind(ref, *idxs, indexed_dims=indexed_dims), 0
-  else:  # Both ref and idx are batched
-    indexed_dims_ = tuple_insert(indexed_dims, ref_dim, True)
+
+  ref_is_batched = ref_dim is not batching.not_mapped
+  idx_is_batched = any(i_dim is not batching.not_mapped for i_dim in idx_dims)
+  bdim_out = 0
+
+  if idx_is_batched:
+    # If at least one of the idx is batched, we broadcast them all and move the
+    # batch dim to the front.
     idxs = tuple(batching.bdim_at_front(i, d, axis_size) for i, d
                  in zip(idxs, idx_dims))
-    idxs_shape, = {i.shape for i in idxs} or [()]
-    idxs_rank = len(idxs_shape)
-    idx_place = ref_dim - (len(indexed_dims_) - sum(indexed_dims_))
-
-    return get_p.bind(ref, *idxs, indexed_dims=indexed_dims_), 0
+  idxs_shape, = {i.shape for i in idxs} or [()]
+  if ref_is_batched:
+    # If ref is batched, we are doing a `get` with an additional axis. If `idxs`
+    # are also batched, then we are indexing into the batch axis with an `iota`.
+    indexed_dims = tuple_insert(indexed_dims, ref_dim, idx_is_batched)
+    if idx_is_batched:
+      # If we have batched idx, we need to insert the new iota index
+      # The place where we add in the new `iota` index is `ref_dim` so we need
+      # to compute what `ref_dim` *would be* if we inserted it into `idxs`
+      # instead, because `idxs` doesn't include the non indexed dims.
+      idx_place = [i for i, i_dim in enumerate(indexed_dims)
+                   if i_dim].index(ref_dim)
+      idxs = tuple_insert(idxs, idx_place,
+                          lax.broadcasted_iota(jnp.dtype('int32'),
+                                               idxs_shape, 0))
+    else:
+      bdim_out = _compute_output_batch_dimension(indexed_dims, ref_dim,
+                                                 idxs_shape)
+  return get_p.bind(ref, *idxs, indexed_dims=indexed_dims), bdim_out
 batching.primitive_batchers[get_p] = _get_vmap
 
 def _swap_vmap(batched_args, batched_dims, *, indexed_dims):
@@ -364,28 +379,32 @@ def _swap_vmap(batched_args, batched_dims, *, indexed_dims):
                 if d is not batching.not_mapped}
   ref, val, *idxs = batched_args
   ref_dim, val_dim, *idx_dims = batched_dims
-  if all(d is batching.not_mapped for d in idx_dims):
-    if val_dim is batching.not_mapped:
-      val = batching.broadcast(val, axis_size, ref_dim)
-    assert ref_dim is not batching.not_mapped
-    indexed_dims_ = tuple_insert(indexed_dims, ref_dim, False)
-    num_idxs_to_left = sum(indexed_dims[:ref_dim])
-    idxs_rank, = {i.ndim for i in idxs} or [0]
-    bdim_out = ref_dim - num_idxs_to_left + idxs_rank
-    return swap_p.bind(ref, val, *idxs, indexed_dims=indexed_dims_), bdim_out
-  else:
-    assert ref_dim is not batching.not_mapped
-    assert val_dim is not batching.not_mapped
-    indexed_dims_ = tuple_insert(indexed_dims, ref_dim, True)
+  ref_is_batched = ref_dim is not batching.not_mapped
+  val_is_batched = val_dim is not batching.not_mapped
+  idx_is_batched = any(i_dim is not batching.not_mapped for i_dim in idx_dims)
+  if idx_is_batched:
+    # If at least one of the idx is batched, we broadcast them all and move the
+    # batch dim to the front.
     idxs = tuple(batching.bdim_at_front(i, d, axis_size) for i, d
                  in zip(idxs, idx_dims))
-    idxs_shape, = {i.shape for i in idxs} or [()]
-    idxs_rank = len(idxs_shape)
-    idx_place = ref_dim - (len(indexed_dims_) - sum(indexed_dims_))
-    idxs = tuple_insert(
-        idxs, idx_place, lax.broadcasted_iota(jnp.dtype('int32'), idxs_shape, 0))
+  idxs_shape, = {i.shape for i in idxs} or [()]
+  if ref_is_batched and not idx_is_batched:
+    if not val_is_batched:
+      val = batching.broadcast(val, axis_size, ref_dim)
+    indexed_dims = tuple_insert(indexed_dims, ref_dim, False)
+    bdim_out = _compute_output_batch_dimension(indexed_dims, ref_dim, idxs_shape)
+  elif idx_is_batched:
+    assert ref_is_batched
+    assert val_is_batched
+    indexed_dims = tuple_insert(indexed_dims, ref_dim, True)
+    idx_place = [i for i, i_dim in enumerate(indexed_dims)
+                 if i_dim].index(ref_dim)
+    idxs = tuple_insert(idxs, idx_place,
+                        lax.broadcasted_iota(jnp.dtype('int32'),
+                                             idxs_shape, 0))
     val = batching.moveaxis(val, val_dim, 0)
-    return swap_p.bind(ref, val, *idxs, indexed_dims=indexed_dims_), 0
+    bdim_out = 0
+  return swap_p.bind(ref, val, *idxs, indexed_dims=indexed_dims), bdim_out
 batching.primitive_batchers[swap_p] = _swap_vmap
 
 def _addupdate_vmap(batched_args, batched_dims, *, indexed_dims):
@@ -393,28 +412,30 @@ def _addupdate_vmap(batched_args, batched_dims, *, indexed_dims):
                 if d is not batching.not_mapped}
   ref, val, *idxs = batched_args
   ref_dim, val_dim, *idx_dims = batched_dims
-  if all(d is batching.not_mapped for d in idx_dims):
-    if val_dim is batching.not_mapped:
-      val = batching.broadcast(val, axis_size, ref_dim)
-    assert ref_dim is not batching.not_mapped
-    indexed_dims_ = tuple_insert(indexed_dims, ref_dim, False)
-    num_idxs_to_left = sum(indexed_dims[:ref_dim])
-    idxs_rank, = {i.ndim for i in idxs} or [0]
-    bdim_out = ref_dim - num_idxs_to_left + idxs_rank
-    return addupdate_p.bind(ref, val, *idxs, indexed_dims=indexed_dims_), []
-  else:
-    assert ref_dim is not batching.not_mapped
-    assert val_dim is not batching.not_mapped
-    indexed_dims_ = tuple_insert(indexed_dims, ref_dim, True)
+  ref_is_batched = ref_dim is not batching.not_mapped
+  val_is_batched = val_dim is not batching.not_mapped
+  idx_is_batched = any(i_dim is not batching.not_mapped for i_dim in idx_dims)
+  if idx_is_batched:
+    # If at least one of the idx is batched, we broadcast them all and move the
+    # batch dim to the front.
     idxs = tuple(batching.bdim_at_front(i, d, axis_size) for i, d
                  in zip(idxs, idx_dims))
-    idxs_shape, = {i.shape for i in idxs} or [()]
-    idxs_rank = len(idxs_shape)
-    idx_place = ref_dim - (len(indexed_dims_) - sum(indexed_dims_))
-    idxs = tuple_insert(
-        idxs, idx_place, lax.broadcasted_iota(jnp.dtype('int32'), idxs_shape, 0))
+  idxs_shape, = {i.shape for i in idxs} or [()]
+  if ref_is_batched and not idx_is_batched:
+    if not val_is_batched:
+      val = batching.broadcast(val, axis_size, ref_dim)
+    indexed_dims = tuple_insert(indexed_dims, ref_dim, False)
+  elif idx_is_batched:
+    assert ref_is_batched
+    assert val_is_batched
+    indexed_dims = tuple_insert(indexed_dims, ref_dim, True)
+    idx_place = [i for i, i_dim in enumerate(indexed_dims)
+                 if i_dim].index(ref_dim)
+    idxs = tuple_insert(idxs, idx_place,
+                        lax.broadcasted_iota(jnp.dtype('int32'),
+                                             idxs_shape, 0))
     val = batching.moveaxis(val, val_dim, 0)
-    return addupdate_p.bind(ref, val, *idxs, indexed_dims=indexed_dims_), []
+  return addupdate_p.bind(ref, val, *idxs, indexed_dims=indexed_dims), []
 batching.primitive_batchers[addupdate_p] = _addupdate_vmap
 
 # get [indexed_dims=indexed_dims] x *idxs
