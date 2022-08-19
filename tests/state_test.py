@@ -11,8 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import itertools as it
 from absl.testing import absltest
 from absl.testing import parameterized
+import numpy as np
 import jax
 from jax import core
 from jax import lax
@@ -20,8 +22,8 @@ from jax import linear_util as lu
 from jax.config import config
 from jax.interpreters import partial_eval as pe
 from jax._src import test_util as jtu
+from jax._src.util import tuple_insert
 import jax.numpy as jnp
-import numpy as np
 
 from jax._src import state
 
@@ -358,6 +360,50 @@ class StatePrimitivesTest(jtu.JaxTestCase):
     self.assertEqual(jaxpr.eqns[1].primitive, state.addupdate_p)
     self.assertEqual(jaxpr.eqns[2].primitive, state.get_p)
     self.assertEqual(jaxpr.eqns[3].primitive, state.get_p)
+
+  @parameterized.parameters(
+      dict(ref_shape=ref_shape, ref_bdim=ref_bdim, idx_shape=idx_shape,
+           indexed_dims=indexed_dims, idx_bdims=idx_bdims, out_bdim=out_bdim)
+      for ref_shape in [(2, 3), (4, 2, 3), ()]
+      for ref_bdim in range(1 + len(ref_shape))
+      for idx_shape in [(), (5,), (5, 6)]
+      for indexed_dims in it.product([True, False], repeat=len(ref_shape))
+      for idx_bdims in it.product([None, *range(1 + len(idx_shape))],
+                                  repeat=sum(indexed_dims))
+      for out_bdim in range(1 + len(ref_shape) - sum(indexed_dims)
+                            + len(idx_shape) * any(indexed_dims))
+  )
+  def test_get_vmap(self, ref_shape, ref_bdim, idx_shape, indexed_dims,
+                    idx_bdims, out_bdim):
+    axis_size = 7
+    out_shape = tuple([d for d, b in zip(ref_shape, indexed_dims) if not b])
+    if any(indexed_dims):
+      out_shape = (*idx_shape, *out_shape)
+
+    def maybe_insert(shape, idx):
+      if idx is None:
+        return shape
+      return tuple_insert(shape, idx, axis_size)
+
+    batched_ref_shape = maybe_insert(ref_shape, ref_bdim)
+    ref_aval = state.ShapedArrayRef(batched_ref_shape, jnp.dtype('float32'))
+
+    idx_avals = [core.ShapedArray(maybe_insert(idx_shape, idx_bdim),
+                                  jnp.dtype('int32')) for idx_bdim in idx_bdims]
+
+    def f(x_ref, *idxs):
+      idxs_ = iter(idxs)
+      indexer = tuple([next(idxs_) if b else slice(None) for b in indexed_dims])
+      out = x_ref[indexer]
+      return [out]
+    f = jax.vmap(f, in_axes=(ref_bdim, *idx_bdims), out_axes=[out_bdim])
+
+    _, (out_aval,), _ = pe.trace_to_jaxpr_dynamic(lu.wrap_init(f),
+                                                  [ref_aval, *idx_avals])
+    self.assertIsInstance(out_aval, core.ShapedArray)
+    expected_shape = maybe_insert(out_shape, out_bdim)
+    self.assertEqual(out_aval.shape, expected_shape)
+
 
 class StateDischargeTest(jtu.JaxTestCase):
 
