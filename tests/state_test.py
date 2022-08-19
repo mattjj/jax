@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from functools import partial
 import itertools as it
 from absl.testing import absltest
 from absl.testing import parameterized
@@ -363,18 +364,30 @@ class StatePrimitivesTest(jtu.JaxTestCase):
 
   @parameterized.parameters(
       dict(ref_shape=ref_shape, ref_bdim=ref_bdim, idx_shape=idx_shape,
-           indexed_dims=indexed_dims, idx_bdims=idx_bdims, out_bdim=out_bdim)
+           indexed_dims=indexed_dims, idx_bdims=idx_bdims, out_bdim=out_bdim,
+           op=op)
       for ref_shape in [(2, 3), (4, 2, 3), ()]
       for ref_bdim in range(1 + len(ref_shape))
-      for idx_shape in [(), (5,), (5, 6)]
+      for idx_shape in [(), (1,), (5,), (5, 6)]
       for indexed_dims in it.product([True, False], repeat=len(ref_shape))
       for idx_bdims in it.product([None, *range(1 + len(idx_shape))],
                                   repeat=sum(indexed_dims))
       for out_bdim in range(1 + len(ref_shape) - sum(indexed_dims)
                             + len(idx_shape) * any(indexed_dims))
+      for op in [
+          lambda x_ref, indexer: [x_ref[indexer]],
+          # TODO fix these other guys bro
+          # lambda x_ref, indexer: [
+          #     state.ref_swap(x_ref, indexer,
+          #                    jnp.ones(x_ref.shape, x_ref.dtype)[indexer])],
+          # lambda x_ref, indexer: (
+          #     state.ref_addupdate(x_ref, indexer,
+          #                         jnp.ones(x_ref.shape, x_ref.dtype)[indexer])
+          #     or [jnp.ones(x_ref.shape, x_ref.dtype)[indexer]])
+      ]
   )
   def test_get_vmap(self, ref_shape, ref_bdim, idx_shape, indexed_dims,
-                    idx_bdims, out_bdim):
+                    idx_bdims, out_bdim, op):
     axis_size = 7
     out_shape = tuple([d for d, b in zip(ref_shape, indexed_dims) if not b])
     if any(indexed_dims):
@@ -386,23 +399,45 @@ class StatePrimitivesTest(jtu.JaxTestCase):
       return tuple_insert(shape, idx, axis_size)
 
     batched_ref_shape = maybe_insert(ref_shape, ref_bdim)
-    ref_aval = state.ShapedArrayRef(batched_ref_shape, jnp.dtype('float32'))
+    ref_aval = state.ShapedArrayRef(ref_shape, jnp.dtype('float32'))
+    bat_ref_aval = state.ShapedArrayRef(batched_ref_shape, jnp.dtype('float32'))
 
-    idx_avals = [core.ShapedArray(maybe_insert(idx_shape, idx_bdim),
-                                  jnp.dtype('int32')) for idx_bdim in idx_bdims]
+    idx_avals = [core.ShapedArray(idx_shape, jnp.dtype('int32'))
+                 for _ in idx_bdims]
+    bat_idx_avals = [
+        core.ShapedArray(maybe_insert(idx_shape, idx_bdim), jnp.dtype('int32'))
+        for idx_bdim in idx_bdims]
 
     def f(x_ref, *idxs):
       idxs_ = iter(idxs)
       indexer = tuple([next(idxs_) if b else slice(None) for b in indexed_dims])
-      out = x_ref[indexer]
-      return [out]
-    f = jax.vmap(f, in_axes=(ref_bdim, *idx_bdims), out_axes=[out_bdim])
+      return op(x_ref, indexer)
+      # out = x_ref[indexer]
+      # return [out]
 
-    _, (out_aval,), _ = pe.trace_to_jaxpr_dynamic(lu.wrap_init(f),
-                                                  [ref_aval, *idx_avals])
-    self.assertIsInstance(out_aval, core.ShapedArray)
-    expected_shape = maybe_insert(out_shape, out_bdim)
-    self.assertEqual(out_aval.shape, expected_shape)
+    rng = self.rng()
+    a = rng.randn(*bat_ref_aval.shape)
+    his = [d for d, b in zip(ref_aval.shape, indexed_dims) if b]
+    idxs = [rng.randint(low=0, high=hi, size=i.shape)
+            for i, hi in zip(bat_idx_avals, his)]
+
+    # discharge-of-vmap
+    f_batched = jax.vmap(f, in_axes=(ref_bdim, *idx_bdims), out_axes=[out_bdim])
+    stateful_jaxpr, _, stateful_consts = pe.trace_to_jaxpr_dynamic(
+        lu.wrap_init(f_batched), [bat_ref_aval, *bat_idx_avals])
+    jaxpr, consts = state.discharge_state(stateful_jaxpr, stateful_consts)
+    discharge_of_vmap_ans = core.eval_jaxpr(jaxpr, consts, a, *idxs)
+    # vmap-of-discharge
+    stateful_jaxpr, _, stateful_consts = pe.trace_to_jaxpr_dynamic(
+        lu.wrap_init(f), [ref_aval, *idx_avals])
+    jaxpr_, consts_ = state.discharge_state(stateful_jaxpr, stateful_consts)
+    f_batched = jax.vmap(partial(core.eval_jaxpr, jaxpr_, consts_),
+                         in_axes=(ref_bdim, *idx_bdims),
+                         out_axes=[out_bdim, ref_bdim])
+    vmap_of_discharge_ans = f_batched(a, *idxs)
+
+    self.assertAllClose(discharge_of_vmap_ans, vmap_of_discharge_ans,
+                        check_dtypes=False)
 
 
 class StateDischargeTest(jtu.JaxTestCase):
@@ -431,7 +466,7 @@ class StateDischargeTest(jtu.JaxTestCase):
     stateful_jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(lu.wrap_init(f),
                                                           in_avals)
     # Discharging should just turn this into a jaxpr that just adds 1.
-    discharged_jaxpr, _ = state.discharge_state(stateful_jaxpr, consts)
+    discharged_jaxpr, () = state.discharge_state(stateful_jaxpr, consts)
     self.assertLen(discharged_jaxpr.invars, 1)
     self.assertLen(discharged_jaxpr.outvars, 2)
     self.assertIn(lax.dynamic_slice_p,
@@ -440,6 +475,20 @@ class StateDischargeTest(jtu.JaxTestCase):
     inval = jnp.arange(24., dtype=jnp.float32).reshape((4, 3, 2))
     outval, refval = core.eval_jaxpr(discharged_jaxpr, (), inval)
     self.assertTrue((outval == inval[0, 1] + 1).all())
+    self.assertTrue((refval == inval).all())
+
+  def test_discharge_get_with_gather(self):
+    def f(a_ref):
+      a = a_ref[jnp.array([0, 1])]
+      return [a + 1]
+    in_avals = [state.ShapedArrayRef((4, 3), jnp.dtype('float32'))]
+    stateful_jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(
+        lu.wrap_init(f), in_avals)
+    discharged_jaxpr, discharged_consts = state.discharge_state(
+        stateful_jaxpr, consts)
+    inval = jnp.arange(4 * 3, dtype=jnp.float32).reshape((4, 3))
+    outval, refval = core.eval_jaxpr(discharged_jaxpr, discharged_consts, inval)
+    self.assertTrue((outval == inval[jnp.array([0, 1])] + 1).all())
     self.assertTrue((refval == inval).all())
 
   def test_discharge_set(self):
@@ -468,7 +517,7 @@ class StateDischargeTest(jtu.JaxTestCase):
     stateful_jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(lu.wrap_init(f),
                                                           in_avals)
     # Discharging should just turn this into a jaxpr that just adds 1.
-    discharged_jaxpr, _ = state.discharge_state(stateful_jaxpr, consts)
+    discharged_jaxpr, () = state.discharge_state(stateful_jaxpr, consts)
     self.assertLen(discharged_jaxpr.invars, 1)
     self.assertLen(discharged_jaxpr.outvars, 1)
     self.assertIn(lax.dynamic_update_slice_p,
@@ -479,6 +528,19 @@ class StateDischargeTest(jtu.JaxTestCase):
     inval = jnp.arange(24., dtype=jnp.float32).reshape((4, 3, 2))
     refval, = core.eval_jaxpr(discharged_jaxpr, (), inval)
     self.assertTrue((refval == inval.at[0, 1].set(1.)).all())
+
+  def test_discharge_set_with_gather(self):
+    def f(a_ref):
+      a_ref[jnp.array([0, 1])] = jnp.ones((2, 3), 'float32')
+      return []
+    in_avals = [state.ShapedArrayRef((4, 3), jnp.dtype('float32'))]
+    stateful_jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(lu.wrap_init(f),
+                                                          in_avals)
+    discharged_jaxpr, discharged_consts = state.discharge_state(
+        stateful_jaxpr, consts)
+    inval = jnp.arange(4 * 3, dtype=jnp.float32).reshape((4, 3))
+    refval, = core.eval_jaxpr(discharged_jaxpr, discharged_consts, inval)
+    self.assertTrue((refval == inval.at[jnp.array([0, 1])].set(1.)).all())
 
   def test_discharge_addupdate(self):
     def f(a_ref, b):
@@ -518,6 +580,20 @@ class StateDischargeTest(jtu.JaxTestCase):
     inval = jnp.arange(24., dtype=jnp.float32).reshape((4, 3, 2))
     refval, = core.eval_jaxpr(discharged_jaxpr, (), inval)
     self.assertTrue((refval == inval.at[0, 1].add(1.)).all())
+
+  def test_discharge_addupdate_with_gather(self):
+    def f(a_ref):
+      state.ref_addupdate(a_ref, (jnp.array([0, 1]),),
+                          jnp.ones((2, 3), 'float32'))
+      return []
+    in_avals = [state.ShapedArrayRef((4, 3), jnp.dtype('float32'))]
+    stateful_jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(lu.wrap_init(f),
+                                                          in_avals)
+    discharged_jaxpr, discharged_consts = state.discharge_state(
+        stateful_jaxpr, consts)
+    inval = jnp.arange(4 * 3, dtype=jnp.float32).reshape((4, 3))
+    refval, = core.eval_jaxpr(discharged_jaxpr, discharged_consts, inval)
+    self.assertTrue((refval == inval.at[jnp.array([0, 1])].add(1.)).all())
 
   def test_discharge_jaxpr_with_multiple_outputs(self):
     def f(a_ref):

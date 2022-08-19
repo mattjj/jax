@@ -192,12 +192,12 @@ def _addupdate_abstract_eval(ref_aval: ShapedArrayRef,
   slice_shape = _get_slice_output_shape(
       ref_aval.shape, idx_shapes, indexed_dims)
   if slice_shape != val_aval.shape:
-    raise ValueError("Invalid shape for `swap`. "
+    raise ValueError("Invalid shape for `addupdate`. "
                      f"Ref shape: {ref_aval.shape}. "
                      f"Value shape: {val_aval.shape}. "
                      f"Indices: {idx}. ")
   if ref_aval.dtype != val_aval.dtype:
-    raise ValueError("Invalid dtype for `swap`. "
+    raise ValueError("Invalid dtype for `addupdate`. "
                      f"Ref dtype: {ref_aval.dtype}. "
                      f"Value shape: {val_aval.dtype}. ")
   return [], {StateEffect}
