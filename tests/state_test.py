@@ -411,9 +411,12 @@ class StatePrimitivesTest(jtu.JaxTestCase):
     def f(x_ref, *idxs):
       idxs_ = iter(idxs)
       indexer = tuple([next(idxs_) if b else slice(None) for b in indexed_dims])
-      return op(x_ref, indexer)
-      # out = x_ref[indexer]
-      # return [out]
+      # return op(x_ref, indexer)
+      foo_ = jnp.ones(x_ref.shape, x_ref.dtype)
+      foo = foo_[None][(0, *indexer)]
+      # breakpoint()
+      x_ref[indexer] = foo
+      return [foo]
 
     rng = self.rng()
     a = rng.randn(*bat_ref_aval.shape)

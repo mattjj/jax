@@ -58,11 +58,9 @@ def _get_discharge(x, idx, indexed_dims):
 
 def _prepend_gather(x, idx, indexed_dims):
   indexer = _indexer(idx, indexed_dims)
-  if len(idx) > 1 and False:
-    return x[indexer]
-  else:
-    # NumPy advanced int indexing won't prepend w/ only one dim, so add dummy.
-    return x[None][(np.array([0], 'int32'), *indexer)]
+  # NumPy advanced int indexing won't prepend w/ only one dim, so add dummy.
+  # return x[None][(np.array([0], 'int32'), *indexer)]
+  return x[None][(np.array(0, 'int32'), *indexer)]
 
 def _indexer(idx, indexed_dims):
   idx_ = iter(idx)
