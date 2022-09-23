@@ -2098,7 +2098,9 @@ def infer_lambda_input_type(
   idxs, implicit_types = _collect_implicit(args, specs)
   implicit_sig = [(ty, False) for ty in implicit_types]
   explicit_sig = [(_arg_type(idxs, x, s), True) for x, s in zip(args, specs)]
-  return (*implicit_sig, *explicit_sig)
+  input_type = (*implicit_sig, *explicit_sig)
+  lu._check_input_type(input_type)
+  return input_type
 
 def _canonicalize_specs(
     ndims: Sequence[int], specs: Optional[Sequence[AbstractedAxesSpec]]
