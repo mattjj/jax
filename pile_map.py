@@ -182,6 +182,10 @@ def pile_map(jaxpr: jax.core.ClosedJaxpr, pile: Pile) -> Pile:
       if not eqn.primitive.multiple_results:
         out_vals = [out_vals]
       out_axes = [None] * len(out_vals)
+    elif (rule := dependent_primitive_rules.get(eqn.primitive)):
+      out_vals, out_axes = rule(in_vals, in_axes, **eqn.params)
+      if not eqn.primitive.multiple_results:
+        out_vals, out_axes = [out_vals], [out_axes]
     elif all(c is None or c.segment_lengths is None for c in in_axes):
       in_axes_ = [c and c.axis for c in in_axes]
       rule = batching.primitive_batchers[eqn.primitive]
@@ -207,6 +211,7 @@ def pile_map(jaxpr: jax.core.ClosedJaxpr, pile: Pile) -> Pile:
     breakpoint()  # form a Pile
 
 pile_map_rules = {}
+dependent_primitive_rules = {}
 
 from jax._src.lax import lax
 from jax.ops import segment_sum
@@ -263,10 +268,28 @@ pile_map_rules[lax.cos_p] = partial(eltwise_rule, lax.cos_p)
 pile_map_rules[lax.integer_pow_p] = partial(eltwise_rule, lax.integer_pow_p)
 
 
+def bcast_in_dim_rule(vals, dims, *, shape, broadcast_dimensions):
+  operand, *dyn_shape = vals
+  operand_dim, *dyn_shape_dims = dims
+  if not dyn_shape or all(d is None for d in dyn_shape_dims):
+    raise NotImplementedError  # call batching rule
+  if len(dyn_shape) > 1:
+    raise NotImplementedError
+  if broadcast_dimensions:
+    raise NotImplementedError  # only broadcast scalars for now
+  size, = dyn_shape
+  size_dim, = dyn_shape_dims
+  assert size_dim.segment_lengths is None  # had to be scalar sizes in jaxpr
+  dst_dim, = (i for i, d in enumerate(shape) if d is None)
+  data = jnp.repeat(operand, size, axis=operand_dim.axis)
+  data = jnp.moveaxis(data, operand_dim.axis, dst_dim) # concat axis pos matters
+  return data, ConcatAxis(dst_dim, size)
+dependent_primitive_rules[lax.broadcast_in_dim_p] = bcast_in_dim_rule
+
+
 
 def f(x):
-  # y = x + x.shape[0]
-  y = x.shape[0] + x
+  y = x + x.shape[0]
   return (jnp.cos(y) ** 2).sum()
 
 jaxpr = jax.make_jaxpr(f, abstracted_axes=('n',))(jnp.arange(3.))
@@ -280,3 +303,15 @@ print(y)
 # TODO broadcast_in_dim dynamic shape batching rule upgrade
 
 # TODO toposort f32[m] + m
+
+# TODO if we have let-bound dynamic shapes, could end up with one application of
+# pile_map requiring abstracting multiple piles?
+# def f(x):
+#   n = x.shape[0]
+#   m = 2 * n
+#   return jnp.zeros((n, m))
+# n = [3, 1, 4]
+# m = [6, 2, 8]
+# i:(Fin 3) => f32[n.i, m.i]
+# TODO should allow multiple 'segment lengths' arrays!
+#  * would need to generalize ConcatAxis

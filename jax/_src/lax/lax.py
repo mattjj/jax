@@ -2776,10 +2776,10 @@ def _broadcast_in_dim_transpose_rule(ct, operand, *dyn_shape,
   return ([expand_dims(_reduce_sum(ct, axes), unit_dims)] +
           [None] * len(dyn_shape))
 
-def _broadcast_in_dim_batch_rule(batched_args, batch_dims, *dyn_shape, shape,
+def _broadcast_in_dim_batch_rule(batched_args, batch_dims, shape,
                                  broadcast_dimensions):
+  operand, *dyn_shape = batched_args
   if dyn_shape: raise NotImplementedError  # TODO(mattjj)
-  operand, = batched_args
   bdim, = batch_dims
   new_operand = batching.moveaxis(operand, bdim, 0)
   new_shape = (operand.shape[bdim],) + shape
