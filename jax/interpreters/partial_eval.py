@@ -1899,17 +1899,19 @@ class DynamicJaxprTrace(core.Trace):
 custom_staging_rules: Dict[Primitive, Callable] = {}
 
 def _memoize(thunk):
-  cell = []
-  saved_state = [core.thread_local_state.trace_state.copy()]
+  result = None
+  saved_state = core.thread_local_state.trace_state.copy()
   def memoized():
-    if not cell:
+    nonlocal result, saved_state
+    if result is None:
       prev_state = core.thread_local_state.trace_state
-      core.thread_local_state.trace_state = saved_state.pop()
+      core.thread_local_state.trace_state = saved_state
       try:
-        cell.append(thunk())
+        result = thunk()
+        saved_state = None
       finally:
         core.thread_local_state.trace_state = prev_state
-    return cell[0]
+    return result
   return memoized
 
 
