@@ -2113,8 +2113,22 @@ def _dynamic_slice_indices(operand, start_indices: Any):
       continue
     d = core.dimension_as_value(d)
     if isinstance(i, (int, np.integer)):
+      # TODO(mattjj,sharadmv): handle np.ndarray w/ ndim == 0
       result.append(i + lax.convert_element_type(d, _dtype(i)) if i < 0 else i)
       continue
     d = lax.convert_element_type(d, _dtype(i))
+    # x[-1]  where x:f32[3{<=5}]
+    # resolves to
+    # x[-1 + x.shape[0]]
+    # that's fine if x.shape[0] is an int32[], but what if it's a BInt[] ?
+
+    #  x.shape[0] + x.shape[0]  <-- cool (in principle)
+    #
+    #  -1 + x.shape[0]
+
+    #  { lambda n:BInt{<=5}[] . let
+    #      m:i32[] = convert_element_type [ new_dtype=i32 ] n
+    #    in (m,) }
+
     result.append(lax.select(i < 0, i + d, i))
   return result

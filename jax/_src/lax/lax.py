@@ -558,12 +558,15 @@ def _convert_element_type(operand: ArrayLike, new_dtype: Optional[DTypeLike] = N
   old_dtype = dtypes.dtype(operand, canonicalize=False)
   old_weak_type = dtypes.is_weakly_typed(operand)
 
+  if core.is_opaque_dtype(new_dtype):
+    return convert_element_type_p.bind(operand, new_dtype=new_dtype,
+                                       weak_type=bool(weak_type))
+
   if new_dtype is None:
     new_dtype = old_dtype
   else:
     new_dtype = np.dtype(new_dtype)
   new_dtype = dtypes.dtype(new_dtype, canonicalize=True)
-  new_weak_type = bool(weak_type)
 
   if (dtypes.issubdtype(old_dtype, np.complexfloating) and
       not dtypes.issubdtype(new_dtype, np.complexfloating)):
@@ -583,7 +586,7 @@ def _convert_element_type(operand: ArrayLike, new_dtype: Optional[DTypeLike] = N
     return type_cast(Array, operand)
   else:
     return convert_element_type_p.bind(operand, new_dtype=new_dtype,
-                                       weak_type=new_weak_type)
+                                       weak_type=bool(weak_type))
 
 def bitcast_convert_type(operand: ArrayLike, new_dtype: DTypeLike) -> Array:
   """Elementwise bitcast.
@@ -4480,23 +4483,6 @@ def _iota_padding_rule(in_avals, out_avals, *dyn_shape, dtype, shape, dimension)
 pe.padding_rules[iota_p] = _iota_padding_rule
 
 
-def make_bint(i, bd: int):
-  return bint_p.bind(i, bd=bd)
-
-bint_p = core.Primitive('bint')
-
-@bint_p.def_impl
-def _bint_impl(i, *, bd):
-  return core.BInt(i, bd)
-
-@bint_p.def_abstract_eval
-def bint_abstract_eval(_, *, bd: int):
-  return core.AbstractBInt(bound=bd)
-
-pe.padding_rules[bint_p] = lambda _, __, i, bd: [i]
-mlir.register_lowering(bint_p, lambda ctx, x, bd: [x])
-
-
 ### util
 
 _ndim = np.ndim
@@ -4769,3 +4755,73 @@ def _empty_lower(ctx, *, dtype):
     return dtype._rules.empty_mlir(ctx)
   return mlir.ir_constants(np.zeros((), np.dtype(dtype)))
 mlir.register_lowering(empty_p, _empty_lower)
+
+
+# bints lol
+
+class BIntRules:
+  @staticmethod
+  def aval_to_ir_types(aval):
+    dtype = dtypes._scalar_type_to_dtype(int)
+    return (ir.RankedTensorType.get((), mlir.dtype_to_ir_type(dtype)),)
+
+  @staticmethod
+  def result_handler(sticky_device, aval):
+    def handler(_, buf):
+      return core.DArray(aval, buf)
+    return handler
+
+core.bint._rules = BIntRules
+
+
+# class AbstractBInt(AbstractValue):
+#   __slots__ = ['bound']
+#   bound: int
+#   def __init__(self, bound):
+#     self.bound = bound
+#   def str_short(self, short_dtypes=False) -> str:
+#     return f'bint{{≤{self.bound}}}[]'
+#   __repr__ = str_short
+#   def __eq__(self, other):
+#     return type(other) is AbstractBInt and self.bound == other.bound
+#   def __hash__(self) -> int:
+#     return hash((type(self), self.bound))
+#   def at_least_vspace(self):
+#     return self  # should return float0 array
+#   def join(self, other):
+#     return self
+
+# class BInt:
+#   val: Any  # Union[int, Array]
+#   bound: int
+#   def __init__(self, val, bound):
+#     assert 0 <= val <= bound
+#     self.val = val
+#     self.bound = bound
+#   def __repr__(self) -> str:
+#     return f'{self.val}{{≤{self.bound}}}'
+#   def __int__(self) -> int:
+#     return self.val
+#   def __eq__(self, other) -> bool:
+#     return (isinstance(other, BInt) and
+#             (self.val, self.bound) == (other.val, other.bound))
+#   def __hash__(self):
+#     return hash((self.val, self.bound))
+# pytype_aval_mappings[BInt] = lambda x: AbstractBInt(x.bound)
+
+# class BIntDimensionHandler(DimensionHandler):
+#   def symbolic_equal(self, d1, d2) -> bool:
+#     return isinstance(d2, BInt) and d1.val == d2.val and d1.bound == d2.bound
+#   def sum(self, *ds) -> BInt:
+#     if not all(isinstance(d, BInt) for d in ds):
+#       raise InconclusiveDimensionOperation
+#     if len({d.bound for d in ds}) != 1:
+#       raise InconclusiveDimensionOperation
+#     return BInt(sum(d.val for d in ds), ds[0].bound)
+#   def fail(self, *_): raise InconclusiveDimensionOperation
+#   great_equal = diff = divide_shape_sizes = stride = dilate = as_value = fail
+# _SPECIAL_DIMENSION_HANDLERS[BInt] = BIntDimensionHandler()
+
+# def _bint_ir_types(aval: core.AbstractBInt) -> Sequence[ir.Type]:
+#   dtype = dtypes._scalar_type_to_dtype(int)
+#   return (ir.RankedTensorType.get((), dtype_to_ir_type(dtype)),)

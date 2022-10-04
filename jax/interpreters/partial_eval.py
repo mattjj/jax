@@ -41,9 +41,8 @@ from jax._src.util import (unzip2, safe_zip, safe_map, toposort, split_list,
 from jax.core import (Trace, Tracer, Jaxpr, Literal, get_aval, AbstractValue,
                       ClosedJaxpr, new_jaxpr_eqn, ConcreteArray, Var, DropVar,
                       raise_to_shaped, Atom, JaxprEqn, Primitive, ShapedArray,
-                      DShapedArray, AbstractBInt, mapped_aval, unmapped_aval,
-                      DBIdx, InDBIdx, OutDBIdx, InputType, OutputType,
-                      get_referent)
+                      DShapedArray, mapped_aval, unmapped_aval, DBIdx, InDBIdx,
+                      OutDBIdx, InputType, OutputType, get_referent)
 from jax._src import source_info_util
 from jax.config import config
 

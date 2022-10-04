@@ -655,7 +655,6 @@ num_buffers_handlers[core.AbstractToken] = lambda _: 1
 num_buffers_handlers[core.ShapedArray] = lambda _: 1
 num_buffers_handlers[core.DShapedArray] = lambda _: 1
 num_buffers_handlers[core.ConcreteArray] = lambda _: 1
-num_buffers_handlers[core.AbstractBInt] = lambda _: 1
 
 
 def _input_handler(backend: Backend,
@@ -801,7 +800,7 @@ def _dynamic_array_result_handler(sticky_device, aval, env, buf):
     padded_shape = [d.bound if type(d) is core.BInt else d for d in shape]
     buf_aval = core.ShapedArray(tuple(padded_shape), aval.dtype, aval.weak_type)
     data = maybe_create_array_from_da(buf, buf_aval, sticky_device)
-    return core.PaddedArray(aval.update(shape=tuple(shape)), data)
+    return core.DArray(aval.update(shape=tuple(shape)), data)
   else:
     aval = core.ShapedArray(tuple(shape), aval.dtype)
     return maybe_create_array_from_da(buf, aval, sticky_device)
@@ -815,8 +814,6 @@ result_handlers[core.AbstractToken] = lambda _, __: lambda _, __: core.token
 result_handlers[core.ShapedArray] = array_result_handler
 result_handlers[core.DShapedArray] = dynamic_array_result_handler
 result_handlers[core.ConcreteArray] = array_result_handler
-result_handlers[core.AbstractBInt] = \
-    lambda _, a: lambda _, b: core.BInt(int(b), a.bound)
 
 
 def needs_check_special():
@@ -1186,7 +1183,6 @@ device_put_handlers: Dict[Any, Callable[[Any, Optional[Device]],
 device_put_handlers.update((t, _device_put_array) for t in array_types)
 device_put_handlers.update((t, _device_put_scalar) for t in _scalar_types)
 device_put_handlers[core.Token] = _device_put_token
-device_put_handlers[core.BInt] = lambda x, d: _device_put_scalar(x.val, d)
 
 
 def _device_put_device_array(x: Union[device_array.DeviceArrayProtocol, device_array._DeviceArray], device: Optional[Device]):
@@ -1194,7 +1190,7 @@ def _device_put_device_array(x: Union[device_array.DeviceArrayProtocol, device_a
   return (x.device_buffer,)
 for t in device_array.device_array_types:
   device_put_handlers[t] = _device_put_device_array
-device_put_handlers[core.PaddedArray] = lambda x, d: device_put(x._data, d)
+device_put_handlers[core.DArray] = lambda x, d: device_put(x._data, d)
 
 def _copy_device_array_to_device(
     x: Union[device_array.DeviceArrayProtocol, device_array._DeviceArray],
