@@ -3647,17 +3647,21 @@ def _rewriting_take(arr, idx, indices_are_sorted=False, unique_indices=False,
   if (arr.ndim > 0 and isinstance(arr.shape[0], int) and
       isinstance(idx, slice) and
       (type(idx.start) is int or idx.start is None) and
-      (type(idx.stop)  is int or idx.stop is  None) and
       (type(idx.step)  is int or idx.step is  None)):
     n = arr.shape[0]
     start = idx.start if idx.start is not None else 0
     stop  = idx.stop  if idx.stop  is not None else n
     step  = idx.step  if idx.step  is not None else 1
-    if (0 <= start < n and 0 <= stop <= n and 0 < step and
-        (start, stop, step) != (0, n, 1)):
-      if _any(isinstance(d, core.Tracer) for d in arr.shape[1:]):
+    tracer = _any(isinstance(s, core.Tracer) for s in (start, stop, step))
+    if (0 <= start < n and
+        (isinstance(stop, core.Tracer) or 0 <= stop <= n and 0 < step) and
+        (tracer or (start, stop, step) != (0, n, 1))):
+      if _any(isinstance(d, core.Tracer) for d in arr.shape[1:]) or tracer:
         if step == 1:  # TODO(mattjj, sharadmv): handle step != 1
-          return lax.dynamic_slice_in_dim(arr, start, _max(0, stop - start), 0)
+          max_ = _max if not tracer else maximum
+          size = (max_(0, stop - start) if isinstance(start, core.Tracer)
+                  or start != 0 else stop)
+          return lax.dynamic_slice_in_dim(arr, start, size, 0)
       else:
         return lax.slice_in_dim(arr, start, stop, step)
 

@@ -4009,6 +4009,17 @@ def _sort_batch_rule(batched_args, batch_dims, *, dimension, is_stable, num_keys
   return (sort_p.bind(*new_args, dimension=new_dimension, is_stable=is_stable, num_keys=num_keys),
           bdims)
 
+def _sort_padding_rule(in_avals, out_avals, *args, dimension, is_stable, num_keys):
+  key_avals, _ = split_list(in_avals, [num_keys])
+  keys, rest = split_list(args, [num_keys])
+  new_keys = []
+  for a, k in zip(key_avals, keys):
+    padded_axes = [(i, d.val) for i, d in enumerate(a.shape)
+                   if isinstance(d, pe.BoundedAxisSize)]
+    new_k = _replace_masked_values(k, _get_min_identity(a.dtype), padded_axes)
+    new_keys.append(new_k)
+  return sort_p.bind(*new_keys, *rest, dimension=dimension,
+                     is_stable=is_stable, num_keys=num_keys)
 
 sort_p = Primitive('sort')
 sort_p.multiple_results = True
@@ -4016,6 +4027,7 @@ sort_p.def_impl(partial(xla.apply_primitive, sort_p))
 sort_p.def_abstract_eval(_sort_abstract_eval)
 ad.primitive_jvps[sort_p] = _sort_jvp
 batching.primitive_batchers[sort_p] = _sort_batch_rule
+pe.padding_rules[sort_p] = _sort_padding_rule
 
 
 def _sort_lower(ctx, *operands, dimension, is_stable, num_keys):

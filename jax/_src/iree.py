@@ -113,6 +113,8 @@ class IreeBuffer(xla_client.DeviceArrayBase):
   def copy_to_host_async(self):
     return self
 
+  dtype = property(lambda self: self._value.dtype)
+
 class IreeExecutable:
 
   def __init__(self, client, devices, module_object, function_name):
