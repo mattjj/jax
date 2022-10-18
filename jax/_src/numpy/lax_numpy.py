@@ -3675,10 +3675,20 @@ def _rewriting_take(arr, idx, indices_are_sorted=False, unique_indices=False,
           not dtypes.issubdtype(aval.dtype, dtypes.bool_) and
           isinstance(arr.shape[0], int)):
         return lax.dynamic_index_in_dim(arr, idx, keepdims=False)
+      if (isinstance(aval, (core.ShapedArray, core.DShapedArray)) and
+          dtypes.issubdtype(aval.dtype, dtypes.bool_)):
+        return _bool_indexing(arr, idx)
 
   treedef, static_idx, dynamic_idx = _split_index_for_jit(idx, arr.shape)
   return _gather(arr, treedef, static_idx, dynamic_idx, indices_are_sorted,
                  unique_indices, mode, fill_value)
+
+def _bool_indexing(arr, idx):
+  if arr.shape != idx.shape: raise NotImplementedError
+  arr, idx = arr.ravel(), idx.ravel()
+  _, arr = lax.sort_key_val(~idx, arr)
+  size = lax.convert_element_type(sum(idx), core.bint(len(idx)))
+  return lax.dynamic_slice_in_dim(arr, 0, size, 0)
 
 # TODO(phawkins): re-enable jit after fixing excessive recompilation for
 # slice indexes (e.g., slice(0, 5, None), slice(10, 15, None), etc.).

@@ -1540,6 +1540,11 @@ class DArray:
     if isinstance(other, DArray) and self._aval == other._aval:
       return self._data == other._data
     return False
+  def __int__(self) -> int:
+    if self.shape:
+      raise TypeError("only size-1 arrays can be converted to Python scalars")
+    return int(self._data)
+
 
 pytype_aval_mappings[DArray] = \
     lambda x: DConcreteArray(x._aval.shape, x._aval.dtype, x._aval.weak_type,
@@ -1680,7 +1685,11 @@ class DimensionHandler:
 
 _dimension_handler_int = DimensionHandler()
 _SPECIAL_DIMENSION_HANDLERS: Dict[type, DimensionHandler] = {}
-DArrayDimHandler = type('DArrayDimHandler', (DimensionHandler,), {})()
+
+class DArrayDimHandler(DimensionHandler):
+  def greater_equal(self, d1, d2):
+    return int(d1) >= int(d2)
+DArrayDimHandler = DArrayDimHandler()  # type: ignore
 
 def _get_special_dim_handler(dim: DimSize) -> Optional[DimensionHandler]:
   if isinstance(dim, Tracer) and not config.jax_dynamic_shapes:
