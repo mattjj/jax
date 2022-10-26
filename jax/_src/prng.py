@@ -17,6 +17,7 @@ import abc
 from functools import partial
 import operator as op
 from typing import Any, Callable, Hashable, Iterator, NamedTuple, Sequence
+import weakref
 
 import numpy as np
 
@@ -517,8 +518,16 @@ xla.pytype_aval_mappings[PRNGKeyArray] = (
 
 xla.canonicalize_dtype_handlers[PRNGKeyArray] = lambda x: x
 
+already_consumed = set()  # TODO threadlocal or locked or something
+
 def device_put_key_array(x: PRNGKeyArray, device):
-  return dispatch.device_put(x.unsafe_raw_array(), device)
+  x_raw = x.unsafe_raw_array()
+  if id(x_raw) in already_consumed:
+    raise Exception("lenarity")
+  else:
+    already_consumed.add(id(x_raw))
+    weakref.ref(x_raw, lambda x_raw: already_consumed.pop(id(x_raw)))
+  return dispatch.device_put(x_raw, device)
 dispatch.device_put_handlers[PRNGKeyArray] = device_put_key_array
 
 def key_array_shard_arg_handler(x: PRNGKeyArray, devices, indices, mode):
