@@ -4,6 +4,7 @@ sys.excepthook = ultratb.FormattedTB(mode='Verbose',
      color_scheme='Linux', call_pdb=1)
 
 
+from functools import partial
 from typing import Tuple, Optional
 
 import numpy as np
@@ -121,16 +122,36 @@ def _shard_map_staging(trace, fun, in_tracers, *, mesh, in_pspecs, out_pspecs_th
 pe.DynamicJaxprTrace.process_shard_map = _shard_map_staging
 
 
-def _shard_map_lowering(ctx, *in_vals, jaxpr, mesh, in_pspecs, out_pspecs):
-  in_axes_maps = [{name: i for i, name in enumerate(p) if name is not None}
-                  for p in in_pspecs]
-  in_vals_ = [pxla._full_to_shard_lowering(ctx, x, axes=a, mesh=mesh,
-                                           manual_axes=frozenset())[0]
-              for x, a in zip(in_vals, in_axes_maps)]
-  sub_ctx = ctx.module_context
-  outs, _ = mlir.jaxpr_subcomp(sub_ctx, jaxpr, mlir.TokenSet(), (), *in_vals_)
-  breakpoint()
+def _shard_map_lowering(ctx, *in_nodes, jaxpr, mesh, in_pspecs, out_pspecs):
+  in_avals_ = [v.aval for v in jaxpr.invars]
+  in_nodes_ = map(partial(_shard, mesh), in_pspecs, ctx.avals_in, in_avals_,
+                  in_nodes)
+  out_nodes_, _ = mlir.jaxpr_subcomp(ctx.module_context, jaxpr, mlir.TokenSet(),
+                                     (), *in_nodes_)
+  out_avals_ = [x.aval for x in jaxpr.outvars]
+  out_nodes = map(partial(_unshard, mesh), out_pspecs, out_avals_,
+                  ctx.avals_out, out_nodes_)
+  return out_nodes
 mlir.register_lowering(shard_map_p, _shard_map_lowering)
+
+def _shard(mesh, pspec, aval_in, aval_out, x):
+  manual_proto = pxla._manual_proto(aval_in, frozenset(mesh.axis_names), mesh)
+  result_type, = mlir.aval_to_ir_types(aval_out)
+  axes = {name: i for i, name in enumerate(pspec) if name is not None}
+  sharding_proto = pxla.mesh_sharding_specs(
+      mesh.shape, mesh.axis_names)(aval_in, axes).sharding_proto()
+  sx = mlir.wrap_with_sharding_op(x, sharding_proto, unspecified_dims=set())
+  return mlir.wrap_with_full_to_shard_op(result_type, sx, manual_proto, set()),
+
+def _unshard(mesh, pspec, aval_in, aval_out, xs):
+  x, = xs
+  manual_proto = pxla._manual_proto(aval_in, frozenset(mesh.axis_names), mesh)
+  result_type, = mlir.aval_to_ir_types(aval_out)
+  sx = mlir.wrap_with_sharding_op(x, manual_proto, unspecified_dims=set())
+  axes = {name: i for i, name in enumerate(pspec) if name is not None}
+  sharding_proto = pxla.mesh_sharding_specs(
+      mesh.shape, mesh.axis_names)(aval_out, axes).sharding_proto()
+  return mlir.wrap_with_shard_to_full_op(result_type, sx, sharding_proto, set()),
 
 
 class ShardMapTrace(core.Trace):
