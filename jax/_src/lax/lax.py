@@ -4843,10 +4843,30 @@ class BIntRules:
     return (ir.RankedTensorType.get(aval.shape, mlir.dtype_to_ir_type(dtype)),)
 
   @staticmethod
+  def physical_avals(aval):
+    return [aval]
+
+  @staticmethod
+  def physical_op_sharding(aval, sharding):
+    return sharding._to_xla_op_sharding(aval.ndim)
+
+  @staticmethod
   def result_handler(sticky_device, aval):
     def handler(_, buf):
       buf.aval = core.ShapedArray(buf.shape, buf.dtype)
       return core.DArray(aval, buf)
     return handler
+
+  @staticmethod
+  def global_sharded_result_handler(aval, out_sharding, committed,
+                                    is_out_sharding_from_xla):
+    def handler(bufs):
+      buf, = bufs
+      return core.DArray(aval, buf)
+    return handler
+
+
+  # TODO(mattjj,yashkatariya): add local_sharded_result_handler to handle bints
+  # with pmap
 
 core.bint._rules = BIntRules

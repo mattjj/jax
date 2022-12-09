@@ -253,7 +253,8 @@ def _check_input_type(in_type: core.InputType) -> None:
     if isinstance(d, core.DBIdx) and type(d.val) is int and d.val >= 0:
       return True
     return (isinstance(d, (int, core.DBIdx, core.DArray)) and
-            (not isinstance(d, core.DArray) or type(d) is core.bint and not d.shape))
+            (not isinstance(d, core.DArray) or type(d.dtype) is core.bint and
+             not d.shape))
   assert all(valid_size(d) for a, _ in in_type if type(a) is core.DShapedArray
              for d in a.shape)
 

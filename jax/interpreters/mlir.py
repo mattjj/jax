@@ -85,6 +85,8 @@ def shape_tensor(sizes: Sequence[Union[int, ir.RankedTensorType]]
   def lower_dim(d):
     if type(d) is int:
       return ir_constant(np.array([d], np.int32))
+    elif type(d) is core.DArray and type(d.dtype) is core.bint:
+      breakpoint()
     else:
       return mhlo.ReshapeOp(int1d, mhlo.ConvertOp(aval_to_ir_type(core.ShapedArray((), np.int32)), d))
   d, *ds = map(lower_dim, sizes)
