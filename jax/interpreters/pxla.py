@@ -2783,15 +2783,27 @@ def lower_sharding_computation(
   lower_sharding_computation calculates the number of out_avals so it can apply
   the singleton _UNSPECIFIED to all out_avals.
   """
-  # 1. Trace to jaxpr and preprocess/verify it
   name_stack = new_name_stack(wrap_name(fun_name, api_name))
+
+  # 1. Trace to jaxpr and preprocess/verify it
+  if fun.in_type is None:
+    in_type = tuple(zip(global_in_avals, it.repeat(True)))
+    fun = lu.annotate(fun, in_type)
+  else:
+    assert global_in_avals == (None,) * len(global_in_avals)
+    global_in_avals = [aval for aval, _ in fun.in_type]
 
   with dispatch.log_elapsed_time(f"Finished tracing + transforming {name_stack} "
                                  "in {elapsed_time} sec",
                                  event=dispatch.JAXPR_TRACE_EVENT):
-    jaxpr, global_out_avals, consts = pe.trace_to_jaxpr_final(
-        fun, global_in_avals, debug_info=pe.debug_info_final(fun, api_name))
-  kept_outputs = [True] * len(global_out_avals)
+    # jaxpr, global_out_avals, consts = pe.trace_to_jaxpr_final(
+    #     fun, global_in_avals, debug_info=pe.debug_info_final(fun, api_name))
+    jaxpr, out_type, consts = pe.trace_to_jaxpr_final2(
+        fun, debug_info=pe.debug_info_final(fun, api_name))
+  global_out_avals, kept_outputs = unzip2(out_type)
+
+  if config.jax_dynamic_shapes and dispatch.jaxpr_has_bints(jaxpr):
+    jaxpr, consts = pe.pad_jaxpr(jaxpr, consts)
 
   if _is_unspecified(out_shardings):
     out_shardings = (_UNSPECIFIED,) * len(global_out_avals)
@@ -3198,6 +3210,7 @@ class MeshComputation(stages.XlaLowering):
   def compile(self,
               _allow_propagation_to_outputs : bool = False,
               _allow_compile_replicated : bool = True) -> MeshExecutable:
+    print(self.mhlo())
     if self._executable is None:
       executable = self._compile_unloaded(
           _allow_propagation_to_outputs, _allow_compile_replicated)

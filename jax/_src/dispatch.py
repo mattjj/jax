@@ -95,22 +95,25 @@ _on_exit = False
 
 ### op-by-op execution
 
-ArgSpec = Tuple[core.AbstractValue, Optional[Device]]
+ArgSpec = Tuple[core.AbstractValue, Union[Optional[Device], Optional[Sharding]]]
 
 def arg_spec(x: Any) -> ArgSpec:
   from jax.experimental import pjit
 
   aval = xla.abstractify(x)
+  return aval, _arg_spec2(x)
+
+def _arg_spec2(x: Any) -> Union[Optional[Device], Optional[Sharding]]:
   try:
     if config.jax_array:
       if isinstance(x.sharding, PmapSharding):
-        return aval, None
-      return aval, (pjit.to_op_sharding_sharding(x.sharding, x.ndim)  # type: ignore
-                    if x._committed else None)
+        return None
+      return (pjit.to_op_sharding_sharding(x.sharding, x.ndim)  # type: ignore
+              if x._committed else None)
     else:
-      return aval, x._device
+      return x._device
   except:
-    return aval, None
+    return None
 
 
 def apply_primitive(prim, *args, **params):
@@ -233,11 +236,8 @@ def _xla_call_impl_lazy(fun: lu.WrappedFun, *args, device, backend, name,
   del inline  # Only used at tracing time
   if fun.in_type is None:
     arg_specs: Iterable[Any] = unsafe_map(arg_spec, args)
-  else:
-    # fun.in_type is used for dynamic shapes.
-    if config.jax_array:
-      raise NotImplementedError('Dynamic shapes do not work with Array.')
-    arg_specs = [(None, getattr(x, '_device', None)) for x in args]
+  else:  # fun.in_type is used for dynamic shapes
+    arg_specs = [(None, _arg_spec2(x)) for x in args]
   return xla_callable(fun, device, backend, name, donated_invars, keep_unused,
                       *arg_specs)
 

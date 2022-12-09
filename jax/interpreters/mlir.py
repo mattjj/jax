@@ -85,8 +85,6 @@ def shape_tensor(sizes: Sequence[Union[int, ir.RankedTensorType]]
   def lower_dim(d):
     if type(d) is int:
       return ir_constant(np.array([d], np.int32))
-    elif type(d) is core.DArray and type(d.dtype) is core.bint:
-      breakpoint()
     else:
       return mhlo.ReshapeOp(int1d, mhlo.ConvertOp(aval_to_ir_type(core.ShapedArray((), np.int32)), d))
   d, *ds = map(lower_dim, sizes)
@@ -144,7 +142,8 @@ def _array_ir_types(aval: Union[core.ShapedArray, core.DShapedArray]
     return _dynamic_array_ir_types(aval)  # type: ignore
   return (ir.RankedTensorType.get(aval.shape, dtype_to_ir_type(aval.dtype)),)
 
-def _dynamic_array_ir_types(aval: core.ShapedArray) -> Sequence[ir.Type]:
+def _dynamic_array_ir_types(aval: Union[core.ShapedArray, core.DShapedArray]
+                            ) -> Sequence[ir.Type]:
   dyn_size = ir.ShapedType.get_dynamic_size() if mlir_api_version >= 35 else -1
   shape = [d if type(d) is int else dyn_size for d in aval.shape]
   return (ir.RankedTensorType.get(shape, dtype_to_ir_type(aval.dtype)),)

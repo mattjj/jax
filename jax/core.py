@@ -1799,7 +1799,7 @@ def is_constant_dim(d: DimSize) -> bool:
     int(d)
     return True
   except:
-    return False
+    return isinstance(d, DArray) and type(d.dtype) is bint and not d.shape
 
 def is_constant_shape(s: Shape) -> bool:
   # Whether the shape is a static constant.
