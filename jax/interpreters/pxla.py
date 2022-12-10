@@ -437,6 +437,10 @@ def _shard_device_array(x, devices, indices, mode):
 for t in device_array.device_array_types:
   shard_arg_handlers[t] = _shard_device_array
 
+def _shard_darray(x, devices, indices, mode):
+  return _shard_arg(x._data, devices, indices, mode)
+shard_arg_handlers[core.DArray] = _shard_darray
+
 
 # NOTE(skye): we could refactor to generate _multi_slice parameters directly
 # from the input ShardingSpec, rather than the indices. However, this would
@@ -3210,7 +3214,6 @@ class MeshComputation(stages.XlaLowering):
   def compile(self,
               _allow_propagation_to_outputs : bool = False,
               _allow_compile_replicated : bool = True) -> MeshExecutable:
-    print(self.mhlo())
     if self._executable is None:
       executable = self._compile_unloaded(
           _allow_propagation_to_outputs, _allow_compile_replicated)

@@ -4860,11 +4860,10 @@ class BIntRules:
   @staticmethod
   def global_sharded_result_handler(aval, out_sharding, committed,
                                     is_out_sharding_from_xla):
-    def handler(bufs):
-      buf, = bufs
-      return core.DArray(aval, buf)
-    return handler
-
+    buf_aval = core.ShapedArray(aval.shape, np.dtype('int32'), aval.weak_type)
+    buf_handler = array._array_global_result_handler(
+        buf_aval, out_sharding, committed, is_out_sharding_from_xla)
+    return lambda bufs: core.DArray(aval, buf_handler(bufs))
 
   # TODO(mattjj,yashkatariya): add local_sharded_result_handler to handle bints
   # with pmap

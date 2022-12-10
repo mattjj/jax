@@ -1594,6 +1594,7 @@ class DArray:
     assert data.shape == pad_shape
     self._aval = aval
     self._data = data
+    assert 'DeviceArray' not in str(type(data))
   shape = property(lambda self: self._aval.shape)
   dtype = property(lambda self: self._aval.dtype)
   def __repr__(self) -> str:

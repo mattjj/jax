@@ -690,21 +690,14 @@ def _darray_global_result_handler(global_aval, out_sharding, committed,
     return _array_global_result_handler(global_aval, out_sharding, committed,
                                         is_out_sharding_from_xla)
   else:
-    # TODO(mattjj): this assumes buf has padded shape (when bints are present),
-    # i.e. when we lower a jaxpr with bint axis sizes to mlir the mlir lowering
-    # pass generates the bounded program. Maybe instead if we want to pad we
-    # should explicitly do a jaxpr -> jaxpr padding...
     pad_shape = [d.dtype.bound if dispatch._is_bint_axis_size(d) else d
                  for d in shape]
     dtype = (global_aval.dtype if not core.is_opaque_dtype(global_aval.dtype)
-             else global_aval.dtype.physical_avals[0].dtype)
+             else global_aval.dtype._rules.physical_avals(global_aval)[0].dtype)
     buf_aval = core.ShapedArray(tuple(pad_shape), dtype, global_aval.weak_type)
     padded_handler = _array_global_result_handler(
         buf_aval, out_sharding, committed, is_out_sharding_from_xla)
-    def handler(bufs):
-      arr = padded_handler(bufs)
-      return core.DArray(global_aval, arr)
-    return handler
+    return lambda bufs: core.DArray(global_aval, padded_handler(bufs))
 pxla.global_result_handlers[(core.DShapedArray, pxla.OutputType.Array)] = _darray_global_result_handler
 
 
