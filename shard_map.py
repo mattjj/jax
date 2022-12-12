@@ -1,31 +1,25 @@
-import sys
-from IPython.core import ultratb
-sys.excepthook = ultratb.FormattedTB(mode='Verbose',
-     color_scheme='Linux', call_pdb=1)
-
-
 from functools import partial
-from typing import Tuple, Optional
 
-import numpy as np
+from typing import Callable, Optional, Tuple
 
 from jax import core
-from jax.tree_util import tree_flatten, tree_unflatten
-from jax.api_util import flatten_fun_nokwargs, shaped_abstractify
 from jax import linear_util as lu
-from jax.util import safe_map, safe_zip, unzip2
-from jax.interpreters import partial_eval as pe
-from jax.interpreters import mlir
-from jax.interpreters import pxla
-from jax.experimental import PartitionSpec
+from jax import util
 from jax._src import source_info_util
-map, unsafe_map = safe_map, map
-zip, unsafe_zip = safe_zip, zip
+from jax.api_util import flatten_fun_nokwargs
+from jax.experimental import maps
+from jax.experimental import pjit
+from jax.interpreters import mlir
+from jax.interpreters import partial_eval as pe
+from jax.interpreters import pxla
+from jax.tree_util import tree_flatten
+from jax.tree_util import tree_map
+from jax.tree_util import tree_unflatten
+import numpy as np
+import math
 
-import jax
-import jax.numpy as jnp
-
-jax.config.update('jax_array', True)
+map, unsafe_map = util.safe_map, map
+zip, unsafe_zip = util.safe_zip, zip
 
 
 # Notes:
@@ -59,6 +53,7 @@ jax.config.update('jax_array', True)
 #     (eg for transposition), but trace-time form can infer output (needed for
 #     eager).
 
+
 class ShardMapPrimitive(core.Primitive):
   multiple_results = True
 
@@ -67,13 +62,13 @@ class ShardMapPrimitive(core.Primitive):
     fun, env_trace_todo = process_env_traces(
         fun, top_trace and top_trace.level, mesh)
     tracers = map(top_trace.full_raise, args)
-    outs = top_trace.process_shard_map(
+    outs = top_trace.process_shard_map(  # pytype: disable=attribute-error
         fun, tracers, mesh=mesh, in_pspecs=in_pspecs,
         out_pspecs_thunk=out_pspecs_thunk)
     return map(core.full_lower, core.apply_todos(env_trace_todo(), outs))
 
   def get_bind_params(self, params):
-    breakpoint()
+    raise NotImplementedError
 
 
 shard_map_p = ShardMapPrimitive('shard_map')
@@ -95,16 +90,32 @@ def _shard_map_impl(trace, fun, args, *, mesh, in_pspecs, out_pspecs_thunk):
   return out_vals
 core.EvalTrace.process_shard_map = _shard_map_impl
 
+def pspec_to_in_shape(mesh: maps.Mesh, pspec, dim):
+  if pspec is None:
+    return dim
+  elif isinstance(pspec, str):
+    return dim // mesh.shape[pspec]
+  else:
+    return dim // math.prod([mesh.shape[p] for p in pspec])
+
+def pspec_to_out_shape(mesh, pspec, dim):
+  if pspec is None:
+    return dim
+  elif isinstance(pspec, str):
+    return dim * mesh.shape[pspec]
+  else:
+    return dim * math.prod([mesh.shape[p] for p in pspec])
+
 def _shard_map_staging(trace, fun, in_tracers, *, mesh, in_pspecs, out_pspecs_thunk):
-  in_avals = [x.aval.update(shape=tuple(d if n is None else d // mesh.shape[n]
+  in_avals = [x.aval.update(shape=tuple(pspec_to_in_shape(mesh, n, d)
                                         for d, n in zip(x.shape, p)))
               for x, p in zip(in_tracers, in_pspecs)]
-  with core.new_sublevel():
+  with core.new_sublevel(), core.extend_axis_env_nd(mesh.shape.items()):
     jaxpr, out_avals_, consts = pe.trace_to_subjaxpr_dynamic(
         fun, trace.main, in_avals)
   out_pspecs = [canonicalize_pspec(x.aval.shape, p)
                 for x, p in zip(jaxpr.outvars, out_pspecs_thunk())]
-  out_avals = [x.aval.update(shape=tuple(d if n is None else d * mesh.shape[n]
+  out_avals = [x.aval.update(shape=tuple(pspec_to_out_shape(mesh, n, d)
                                          for d, n in zip(x.aval.shape, p)))
                for x, p in zip(jaxpr.outvars, out_pspecs)]
   source_info = source_info_util.current()
@@ -113,6 +124,7 @@ def _shard_map_staging(trace, fun, in_tracers, *, mesh, in_pspecs, out_pspecs_th
   invars = map(trace.getvar, in_tracers)
   constvars = map(trace.getvar, map(trace.instantiate_const, consts))
   outvars = map(trace.makevar, out_tracers)
+  in_pspecs = [(None,)] * len(jaxpr.constvars) + in_pspecs
   params = dict(mesh=mesh, in_pspecs=in_pspecs, out_pspecs=out_pspecs,
                 jaxpr=pe.convert_constvars_jaxpr(jaxpr))
   eqn = pe.new_jaxpr_eqn([*constvars, *invars], outvars, shard_map_p,
@@ -121,14 +133,19 @@ def _shard_map_staging(trace, fun, in_tracers, *, mesh, in_pspecs, out_pspecs_th
   return out_tracers
 pe.DynamicJaxprTrace.process_shard_map = _shard_map_staging
 
-
 def _shard_map_lowering(ctx, *in_nodes, jaxpr, mesh, in_pspecs, out_pspecs):
   in_avals_ = [v.aval for v in jaxpr.invars]
   in_nodes_ = map(partial(_shard, mesh), in_pspecs, ctx.avals_in, in_avals_,
                   in_nodes)
-  out_nodes_, _ = mlir.jaxpr_subcomp(ctx.module_context, jaxpr, mlir.TokenSet(),
-                                     (), *in_nodes_)
-  out_avals_ = [x.aval for x in jaxpr.outvars]
+  new_axis_context = mlir.SPMDAxisContext(mesh, frozenset(mesh.axis_names))
+  sub_ctx = ctx.module_context.replace(
+      # TODO(sharadmv): name stack
+      axis_context=new_axis_context)
+  with core.extend_axis_env_nd(tuple(mesh.shape.items())):
+    out_nodes_, _ = mlir.jaxpr_subcomp(sub_ctx, jaxpr, mlir.TokenSet(),
+                                       (), *in_nodes_,
+                                       dim_var_values=ctx.dim_var_values)
+  out_avals_ = [v.aval for v in jaxpr.outvars]
   out_nodes = map(partial(_unshard, mesh), out_pspecs, out_avals_,
                   ctx.avals_out, out_nodes_)
   return out_nodes
@@ -137,22 +154,21 @@ mlir.register_lowering(shard_map_p, _shard_map_lowering)
 def _shard(mesh, pspec, aval_in, aval_out, x):
   manual_proto = pxla._manual_proto(aval_in, frozenset(mesh.axis_names), mesh)
   result_type, = mlir.aval_to_ir_types(aval_out)
-  axes = {name: i for i, name in enumerate(pspec) if name is not None}
-  sharding_proto = pxla.mesh_sharding_specs(
-      mesh.shape, mesh.axis_names)(aval_in, axes).sharding_proto()
+  array_mapping = pxla._get_array_mapping(pjit.PartitionSpec(*pspec))
+  sharding_proto = pxla.mesh_sharding_specs(mesh.shape, mesh.axis_names)(
+      aval_in, array_mapping).sharding_proto()
   sx = mlir.wrap_with_sharding_op(x, sharding_proto, unspecified_dims=set())
-  return mlir.wrap_with_full_to_shard_op(result_type, sx, manual_proto, set()),
+  return [mlir.wrap_with_full_to_shard_op(result_type, sx, manual_proto, set())]
 
 def _unshard(mesh, pspec, aval_in, aval_out, xs):
   x, = xs
   manual_proto = pxla._manual_proto(aval_in, frozenset(mesh.axis_names), mesh)
   result_type, = mlir.aval_to_ir_types(aval_out)
   sx = mlir.wrap_with_sharding_op(x, manual_proto, unspecified_dims=set())
-  axes = {name: i for i, name in enumerate(pspec) if name is not None}
-  sharding_proto = pxla.mesh_sharding_specs(
-      mesh.shape, mesh.axis_names)(aval_out, axes).sharding_proto()
-  return mlir.wrap_with_shard_to_full_op(result_type, sx, sharding_proto, set()),
-
+  array_mapping = pxla._get_array_mapping(pjit.PartitionSpec(*pspec))
+  sharding_proto = pxla.mesh_sharding_specs(mesh.shape, mesh.axis_names)(
+      aval_out, array_mapping).sharding_proto()
+  return mlir.wrap_with_shard_to_full_op(result_type, sx, sharding_proto, set())
 
 class ShardMapTrace(core.Trace):
   def __init__(self, *args, mesh):
@@ -166,9 +182,8 @@ class ShardMapTrace(core.Trace):
     return ShardMapTracer(self, tracer.val, tracer.pspec)
 
   def process_primitive(self, primitive, tracers, params):
-    in_arrs, in_pspecs = unzip2((t.val, t.pspec) for t in tracers)
-    breakpoint()
     # TODO execute_sharded_on_local_devices(...)
+    raise NotImplementedError("Eager shard map not supported.")
 
 class ShardMapTracer(core.Tracer):
   def __init__(self, trace, val, pspec):
@@ -187,32 +202,51 @@ class ShardMapTracer(core.Tracer):
   def full_lower(self):
     return self
 
-def shard_map(f, mesh, args, in_pspecs, out_pspecs):
-  f = lu.wrap_init(f)
-  args_flat, in_tree = tree_flatten(args)
-  in_pspecs_flat, in_tree_ = tree_flatten(in_pspecs)
-  in_pspecs_flat = [canonicalize_pspec(x.shape, p)
-                    for x, p in zip(args_flat, in_pspecs_flat)]
-  assert in_tree == in_tree_
-  f, out_tree = flatten_fun_nokwargs(f, in_tree)
-  def out_pspecs_thunk():
-    out_pspecs_flat, out_tree_ = tree_flatten(out_pspecs)
-    assert out_tree() == out_tree_
-    return out_pspecs_flat
-  out_flat = shard_map_p.bind(
-      f, *args_flat, mesh=mesh, in_pspecs=in_pspecs_flat,
-      out_pspecs_thunk=out_pspecs_thunk)
-  return tree_unflatten(out_tree(), out_flat)
-
-def canonicalize_pspec(shape: Tuple[int, ...], p: PartitionSpec
+def canonicalize_pspec(shape: Tuple[int, ...], p: pjit.PartitionSpec
                        ) -> Tuple[Optional[core.AxisName], ...]:
   assert len(p) == len(shape)
   return tuple(p)
 
+def shard_map(f: Callable, mesh: maps.Mesh, in_pspecs, out_pspecs):
+  def wrapped(*args):
+    fun = lu.wrap_init(f)
+    with mesh:
+      args = tree_map(pjit.with_sharding_constraint, args, in_pspecs)
+    args_flat, in_tree = tree_flatten(args)
+    in_pspecs_flat, in_tree_ = tree_flatten(in_pspecs)
+    in_pspecs_flat = [canonicalize_pspec(x.shape, p)
+                      for x, p in zip(args_flat, in_pspecs_flat)]
+    assert in_tree == in_tree_
+    flat_fun, out_tree = flatten_fun_nokwargs(fun, in_tree)
+    def out_pspecs_thunk():
+      out_pspecs_flat, out_tree_ = tree_flatten(out_pspecs)
+      assert out_tree() == out_tree_
+      return out_pspecs_flat
+    out_flat = shard_map_p.bind(
+        flat_fun, *args_flat, mesh=mesh, in_pspecs=in_pspecs_flat,
+        out_pspecs_thunk=out_pspecs_thunk)
+    return tree_unflatten(out_tree(), out_flat)
+  return wrapped
+
+
 ##
 
+import os, re
+import jax
 from jax.experimental import maps
-P = PartitionSpec
+from jax.experimental import pjit
+import jax.numpy as jnp
+
+n = 8
+xla_flags = os.getenv("XLA_FLAGS", "")
+xla_flags = re.sub(
+    r"--xla_force_host_platform_device_count=\S+", "", xla_flags
+).split()
+os.environ["XLA_FLAGS"] = " ".join(
+    ["--xla_force_host_platform_device_count={}".format(n)] + xla_flags
+)
+
+P = pjit.PartitionSpec
 
 
 def f(x):
@@ -226,10 +260,10 @@ x = jax.device_put(jnp.arange(8 * 8.).reshape(8, 8), sharding)
 
 @jax.make_jaxpr
 def g(x):
-  return shard_map(f, mesh, (x,), in_pspecs=(pspec,), out_pspecs=pspec)
+  return shard_map(f, mesh, in_pspecs=(pspec,), out_pspecs=pspec)(x)
 print(g(x))
 
 @jax.jit
 def g(x):
-  return shard_map(f, mesh, (x,), in_pspecs=(pspec,), out_pspecs=pspec)
+  return shard_map(f, mesh, in_pspecs=(pspec,), out_pspecs=pspec)(x)
 print(g(x))
