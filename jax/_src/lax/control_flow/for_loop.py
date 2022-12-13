@@ -789,3 +789,59 @@ def run_state(f, init_state):
   def wrapped_body(_, *args):
     return f(*args)
   return for_loop(1, wrapped_body, init_state)
+
+
+### Bloop
+
+# bounded_loop :: IntLit -> (() -> Bool) -> (() -> {State h} ()) -> () -> {State h} ()
+# bounded_loop max_iters cond_fun body_fun carry =
+#   i = 0
+#   while cond_fun() and i < max_iters:
+#     body_fun()
+#     i += 1
+
+def bloop(max_iter, cond, body):
+  cond, _ = flatten_fun_nokwargs(lu.wrap_init(cond), treedef_tuple(()))
+  body, _ = flatten_fun_nokwargs(lu.wrap_init(body), treedef_tuple(()))
+  cond_jaxpr, _, cond_consts = pe.trace_to_jaxpr_dynamic(cond, ())
+  body_jaxpr, _, body_consts = pe.trace_to_jaxpr_dynamic(body, ())
+  bloop_p.bind(*cond_consts, *body_consts, ncond=len(cond_consts),
+               max_iter=max_iter,
+               cond_jaxpr=pe.convert_constvars_jaxpr(cond_jaxpr),
+               body_jaxpr=pe.convert_constvars_jaxpr(body_jaxpr))
+bloop_p = core.Primitive('bloop')
+bloop_p.multiple_results = True
+
+@bloop_p.def_effectful_abstract_eval
+def _bloop_abstract_eval(*consts, ncond, max_iter, cond_jaxpr, body_jaxpr):
+  cond_avals, body_avals = split_list(consts, [ncond])
+  jaxpr_aval_effects = state.get_ref_state_effects(
+      [v.aval for v in cond_jaxpr.invars], cond_jaxpr.effects)
+  cond_effects = [set(eff.replace(ref_aval=aval) for eff in effs) for aval, effs
+                  in zip(cond_avals, jaxpr_aval_effects)
+                  if isinstance(aval, ShapedArrayRef)]
+
+  jaxpr_aval_effects = state.get_ref_state_effects(
+      [v.aval for v in body_jaxpr.invars], body_jaxpr.effects)
+  body_effects = [set(eff.replace(ref_aval=aval) for eff in effs) for aval, effs
+                  in zip(body_avals, jaxpr_aval_effects)
+                  if isinstance(aval, ShapedArrayRef)]
+  return [], core.join_effects(*cond_effects, *body_effects)
+
+@state.register_discharge_rule(bloop_p)
+def _bloop_discharge(in_avals, out_avals, *args, ncond, max_iter,
+                     cond_jaxpr, body_jaxpr):
+  cond_jaxpr, cond_consts = state.discharge_state(cond_jaxpr, ())
+  body_jaxpr, body_consts = state.discharge_state(body_jaxpr, ())
+
+  def cond_fun(carry):
+    keep_going, _ = carry
+    return keep_going
+
+  def body_fun(carry):
+    _, state = carry
+    keep_going, *state  = core.eval_jaxpr(cond_jaxpr, cond_consts, *state)
+    state = core.eval_jaxpr(body_jaxpr, body_consts, *state)
+    return keep_going, state
+
+  pred = core.eval_jaxpr(cond_jaxpr, cond_consts, ...)

@@ -100,7 +100,7 @@ def dynamic_slice(operand: Array, start_indices: Union[Array, Sequence[ArrayLike
     Array([[ 4,  5,  6,  7],
            [ 8,  9, 10, 11]], dtype=int32)
   """
-  start_indices = _dynamic_slice_indices(operand, start_indices)
+  # start_indices = _dynamic_slice_indices(operand, start_indices)
   if jax.config.jax_dynamic_shapes:
     dynamic_sizes, static_sizes = lax._extract_tracers_dyn_shape(slice_sizes)
   else:
@@ -149,7 +149,7 @@ def dynamic_update_slice(operand: Array, update: ArrayLike,
            [0., 0., 1., 1.],
            [0., 0., 0., 0.]], dtype=float32)
   """
-  start_indices = _dynamic_slice_indices(operand, start_indices)
+  # start_indices = _dynamic_slice_indices(operand, start_indices)
   return dynamic_update_slice_p.bind(operand, update, *start_indices)
 
 
