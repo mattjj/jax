@@ -844,6 +844,8 @@ def _bloop_discharge(in_avals, out_avals, *args, ncond, max_iter,
     states = core.eval_jaxpr(body_jaxpr, body_consts, *states)
     return keep_going, states
 
+  # TODO de-dup refs
+
   cond_args, body_args = split_list(args, [ncond])
   pred, *states = core.eval_jaxpr(cond_jaxpr, cond_consts, *cond_args)
   _, states = lax.while_loop(cond_fun, body_fun, (pred, states))
