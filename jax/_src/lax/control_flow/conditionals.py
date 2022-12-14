@@ -835,6 +835,7 @@ mlir.register_lowering(cond_p, _cond_lowering)
 
 @state.register_discharge_rule(cond_p)
 def _cond_state_discharge_rule(in_avals, out_avals, *args, branches, linear):
+  # TODO(sharadmv, mattjj): dedup references shared across branches)
   discharged_branches = tuple(
       core.ClosedJaxpr(state.discharge_state(branch.jaxpr, ())[0], ())
       for branch in branches)

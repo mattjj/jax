@@ -800,53 +800,122 @@ def run_state(f, init_state):
 #     body_fun()
 #     i += 1
 
+class IDHashable:
+  val: Any
+
+  def __init__(self, val):
+    self.val = val
+
+  def __hash__(self) -> int:
+    return id(self.val)
+
+  def __eq__(self, other):
+    return type(other) is IDHashable and id(self.val) == id(other.val)
+
+def _unify_consts(cond_consts, body_consts) -> Tuple[List[Any], List[int],
+                                                     List[int]]:
+  id_map = {}
+  cond_indices = [id_map.setdefault(IDHashable(x), len(id_map))
+                  for x in cond_consts]
+  body_indices = [id_map.setdefault(IDHashable(x), len(id_map))
+                  for x in body_consts]
+  all_consts = [a.val for a in id_map.keys()]
+  return all_consts, cond_indices, body_indices
+
 def bloop(max_iter, cond, body):
   cond, _ = flatten_fun_nokwargs(lu.wrap_init(cond), treedef_tuple(()))
   body, _ = flatten_fun_nokwargs(lu.wrap_init(body), treedef_tuple(()))
   cond_jaxpr, _, cond_consts = pe.trace_to_jaxpr_dynamic(cond, ())
   body_jaxpr, _, body_consts = pe.trace_to_jaxpr_dynamic(body, ())
-  bloop_p.bind(*cond_consts, *body_consts, ncond=len(cond_consts),
-               max_iter=max_iter,
+  all_consts, cond_idx, body_idx = _unify_consts(cond_consts, body_consts)
+
+  @lu.wrap_init
+  def cond2(*args):
+    cond_args = [args[i] for i in cond_idx]
+    return core.eval_jaxpr(cond_jaxpr, cond_args)
+
+  @lu.wrap_init
+  def body2(*args):
+    body_args = [args[i] for i in body_idx]
+    return core.eval_jaxpr(body_jaxpr, body_args)
+  all_avals = [core.raise_to_shaped(core.get_aval(a)) for a in all_consts]
+  cond_jaxpr, _, () = pe.trace_to_jaxpr_dynamic(cond2, all_avals)
+  body_jaxpr, _, () = pe.trace_to_jaxpr_dynamic(body2, all_avals)
+  bloop_p.bind(*all_consts, max_iter=max_iter,
                cond_jaxpr=pe.convert_constvars_jaxpr(cond_jaxpr),
                body_jaxpr=pe.convert_constvars_jaxpr(body_jaxpr))
 bloop_p = core.Primitive('bloop')
 bloop_p.multiple_results = True
 
 @bloop_p.def_effectful_abstract_eval
-def _bloop_abstract_eval(*consts, ncond, max_iter, cond_jaxpr, body_jaxpr):
-  cond_avals, body_avals = split_list(consts, [ncond])
+def _bloop_abstract_eval(*avals, max_iter, cond_jaxpr, body_jaxpr):
+  del max_iter
   jaxpr_aval_effects = state.get_ref_state_effects(
       [v.aval for v in cond_jaxpr.invars], cond_jaxpr.effects)
   cond_effects = [set(eff.replace(ref_aval=aval) for eff in effs) for aval, effs
-                  in zip(cond_avals, jaxpr_aval_effects)
+                  in zip(avals, jaxpr_aval_effects)
                   if isinstance(aval, ShapedArrayRef)]
 
   jaxpr_aval_effects = state.get_ref_state_effects(
       [v.aval for v in body_jaxpr.invars], body_jaxpr.effects)
   body_effects = [set(eff.replace(ref_aval=aval) for eff in effs) for aval, effs
-                  in zip(body_avals, jaxpr_aval_effects)
+                  in zip(avals, jaxpr_aval_effects)
                   if isinstance(aval, ShapedArrayRef)]
   return [], core.join_effects(*cond_effects, *body_effects)
 
 @state.register_discharge_rule(bloop_p)
-def _bloop_discharge(in_avals, out_avals, *args, ncond, max_iter,
+def _bloop_discharge(in_avals, out_avals, *args, max_iter,
                      cond_jaxpr, body_jaxpr):
   cond_jaxpr, cond_consts = state.discharge_state(cond_jaxpr, ())
   body_jaxpr, body_consts = state.discharge_state(body_jaxpr, ())
 
   def cond_fun(carry):
-    keep_going, _ = carry
-    return keep_going
+    i, keep_going, _ = carry
+    return keep_going & (i < max_iter)
 
   def body_fun(carry):
-    _, states = carry
-    keep_going, *states  = core.eval_jaxpr(cond_jaxpr, cond_consts, *states)
+    i, _, states = carry
     states = core.eval_jaxpr(body_jaxpr, body_consts, *states)
-    return keep_going, states
+    keep_going, *states  = core.eval_jaxpr(cond_jaxpr, cond_consts, *states)
+    return i + 1, keep_going, tuple(states)
 
-  # TODO de-dup refs
+  pred, *args = core.eval_jaxpr(cond_jaxpr, cond_consts, *args)
+  _, _, args = lax.while_loop(cond_fun, body_fun, (0, pred, tuple(args)))
+  return args, []
 
-  cond_args, body_args = split_list(args, [ncond])
-  pred, *states = core.eval_jaxpr(cond_jaxpr, cond_consts, *cond_args)
-  _, states = lax.while_loop(cond_fun, body_fun, (pred, states))
-  breakpoint()
+def _bloop_jvp(primals, tangents, *, max_iter, cond_jaxpr, body_jaxpr):
+  nonzero_tangents = [not isinstance(t, ad_util.Zero) for t in tangents]
+  # We need to find out which `Ref`s have nonzero tangents after running the
+  # for loop. Ordinarily we do this with a fixed point on the body jaxpr but
+  # a `for` body jaxpr is stateful and has no outputs. We therefore discharge
+  # the state effect from the jaxpr and we will now have a "symmetric" jaxpr
+  # where the inputs line up with the outputs. We use this discharged jaxpr
+  # for the fixed point.
+  discharged_jaxpr, body_consts = discharge_state(jaxpr, ())
+  for _ in range(len(nonzero_tangents)):
+    _, out_nonzero_tangents = ad.jvp_jaxpr(
+        core.ClosedJaxpr(discharged_jaxpr, body_consts),
+        [False] + nonzero_tangents, instantiate=nonzero_tangents)
+    if out_nonzero_tangents == nonzero_tangents:
+      break
+    nonzero_tangents = map(operator.or_, nonzero_tangents, out_nonzero_tangents)
+  else:
+    raise Exception("Invalid fixpoint")
+  tangents = [ad.instantiate_zeros(t) if inst else t
+              for t, inst in zip(tangents, nonzero_tangents)]
+  tangents = [t for t in tangents if type(t) is not ad_util.Zero]
+  closed_jaxpr = core.ClosedJaxpr(jaxpr, ())
+  jvp_jaxpr_, _ = ad.jvp_jaxpr(closed_jaxpr, [False] + nonzero_tangents, [])
+  jvp_jaxpr, () = jvp_jaxpr_.jaxpr, jvp_jaxpr_.consts  # TODO consts
+  jvp_which_linear = which_linear + (True,) * len(tangents)
+  out_flat = for_p.bind(*primals, *tangents, jaxpr=jvp_jaxpr,
+                        nsteps=nsteps, reverse=reverse,
+                        which_linear=jvp_which_linear, unroll=unroll)
+  # `out_flat` includes constant inputs into the `for_loop` which are converted
+  # into outputs as well. We don't care about these in AD so we throw them out.
+  out_primals, out_tangents = split_list(out_flat, [len(primals)])
+  out_tangents_iter = iter(out_tangents)
+  out_tangents = [next(out_tangents_iter) if nz else ad_util.Zero.from_value(p)
+                  for p, nz in zip(out_primals, nonzero_tangents)]
+  return out_primals, out_tangents
+ad.primitive_jvps[bloop_p] = _for_jvp
