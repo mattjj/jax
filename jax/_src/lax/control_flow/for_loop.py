@@ -839,9 +839,12 @@ def _bloop_discharge(in_avals, out_avals, *args, ncond, max_iter,
     return keep_going
 
   def body_fun(carry):
-    _, state = carry
-    keep_going, *state  = core.eval_jaxpr(cond_jaxpr, cond_consts, *state)
-    state = core.eval_jaxpr(body_jaxpr, body_consts, *state)
-    return keep_going, state
+    _, states = carry
+    keep_going, *states  = core.eval_jaxpr(cond_jaxpr, cond_consts, *states)
+    states = core.eval_jaxpr(body_jaxpr, body_consts, *states)
+    return keep_going, states
 
-  pred = core.eval_jaxpr(cond_jaxpr, cond_consts, ...)
+  cond_args, body_args = split_list(args, [ncond])
+  pred, *states = core.eval_jaxpr(cond_jaxpr, cond_consts, *cond_args)
+  _, states = lax.while_loop(cond_fun, body_fun, (pred, states))
+  breakpoint()
