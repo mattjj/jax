@@ -111,6 +111,8 @@ def _eval_jaxpr_discharge_state(
       new_invals, ans = _discharge_rules[eqn.primitive](
           in_avals, out_avals, *invals, **eqn.params)
       for new_inval, invar in zip(new_invals, eqn.invars):
+        if isinstance(invar, core.Literal):
+          continue
         if new_inval is not None:
           env.write(invar, new_inval)  # type: ignore[arg-type]
     else:
