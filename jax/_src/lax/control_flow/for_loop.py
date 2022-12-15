@@ -640,7 +640,7 @@ def _for_partial_eval_custom(saveable, in_unknowns, in_inst, eqn):
 pe.partial_eval_jaxpr_custom_rules[for_p] = _for_partial_eval_custom
 
 def _convert_outputs_to_writes(
-    nsteps: int, jaxpr: core.Jaxpr, loop_invar_res: Sequence[bool]
+    nsteps: int, jaxpr: core.Jaxpr, loop_invar_res: Sequence[bool],
     ) -> Tuple[core.Jaxpr, List[core.ShapedArray]]:
   assert not jaxpr.constvars, "Jaxpr shouldn't have constvars."
 
@@ -831,18 +831,14 @@ def bloop(max_iter, cond, body):
   pred, = core.eval_jaxpr(cond_jaxpr_, cond_consts)
 
   @lu.wrap_init
-  def cond2(pred, *args):
-    return [pred]
-
-  @lu.wrap_init
-  def body2(_, *args):
+  def body2(*args):
     cond_args = [args[i] for i in cond_idx]
     pred, = core.eval_jaxpr(cond_jaxpr_, cond_args)
     body_args = [args[i] for i in body_idx]
-    return [pred, *core.eval_jaxpr(body_jaxpr_, body_args)]
+    () = core.eval_jaxpr(body_jaxpr_, body_args)
+    return [pred]
 
-  all_avals = [core.ShapedArray((), jnp.bool_),
-               *(core.raise_to_shaped(core.get_aval(a)) for a in all_consts)]
+  all_avals = [core.raise_to_shaped(core.get_aval(a)) for a in all_consts]
   body_jaxpr, _, () = pe.trace_to_jaxpr_dynamic(body2, all_avals)
   bloop_p.bind(pred, *all_consts, max_iter=max_iter,
                jaxpr=pe.convert_constvars_jaxpr(body_jaxpr),
@@ -853,11 +849,12 @@ bloop_p.multiple_results = True
 @bloop_p.def_effectful_abstract_eval
 def _bloop_abstract_eval(*avals, max_iter, jaxpr, which_linear):
   del max_iter, which_linear
+  pred_aval, *ref_avals = avals
 
   jaxpr_aval_effects = state.get_ref_state_effects(
       [v.aval for v in jaxpr.invars], jaxpr.effects)
   body_effects = [set(eff.replace(ref_aval=aval) for eff in effs) for aval, effs
-                  in zip(avals, jaxpr_aval_effects)
+                  in zip(ref_avals, jaxpr_aval_effects)
                   if isinstance(aval, ShapedArrayRef)]
   return [], core.join_effects(*body_effects)
 
@@ -871,7 +868,7 @@ def _bloop_discharge(in_avals, out_avals, *args, max_iter, jaxpr, which_linear):
     return keep_going & (i < max_iter)
 
   def body_fun(carry):
-    i, states = carry
+    i, (_, *states) = carry
     states = core.eval_jaxpr(discharged_jaxpr, body_consts, *states)
     return i + 1, tuple(states)
 
@@ -879,31 +876,152 @@ def _bloop_discharge(in_avals, out_avals, *args, max_iter, jaxpr, which_linear):
   return args, []
 
 def _bloop_jvp(primals, tangents, *, max_iter, jaxpr, which_linear):
-  nonzero_tangents = [not isinstance(t, ad_util.Zero) for t in tangents]
+  _, *ref_tangents = tangents
+  _, *ref_nonzero_tangents = [not isinstance(t, ad_util.Zero) for t in tangents]
   # We need to find out which `Ref`s have nonzero tangents after running the
   # for loop. Ordinarily we do this with a fixed point on the body jaxpr but
-  # a `for` body jaxpr is stateful and has no outputs. We therefore discharge
-  # the state effect from the jaxpr and we will now have a "symmetric" jaxpr
-  # where the inputs line up with the outputs. We use this discharged jaxpr
+  # a `bloop` body jaxpr is stateful. We use the discharged jaxpr
   # for the fixed point.
   discharged_jaxpr, body_consts = discharge_state(jaxpr, ())
-  for _ in range(len(nonzero_tangents)):
+  for _ in range(len(ref_nonzero_tangents)):
     _, out_nonzero_tangents = ad.jvp_jaxpr(
         core.ClosedJaxpr(discharged_jaxpr, body_consts),
-        nonzero_tangents, instantiate=nonzero_tangents)
-    if out_nonzero_tangents == nonzero_tangents:
+        ref_nonzero_tangents, instantiate=[False, *ref_nonzero_tangents])
+    _, *out_ref_nonzero_tangents = out_nonzero_tangents
+    if out_ref_nonzero_tangents == ref_nonzero_tangents:
       break
-    nonzero_tangents = map(operator.or_, nonzero_tangents, out_nonzero_tangents)
+    ref_nonzero_tangents = map(operator.or_, ref_nonzero_tangents,
+                               out_ref_nonzero_tangents)
   else:
     raise Exception("Invalid fixpoint")
-  tangents = [ad.instantiate_zeros(t) if inst else t
-              for t, inst in zip(tangents, nonzero_tangents)]
-  tangents = [t for t in tangents if type(t) is not ad_util.Zero]
+  ref_tangents = [ad.instantiate_zeros(t) if inst else t
+                  for t, inst in zip(ref_tangents, ref_nonzero_tangents)]
+  ref_tangents = [t for t in ref_tangents if type(t) is not ad_util.Zero]
   closed_jaxpr = core.ClosedJaxpr(jaxpr, ())
-  jvp_jaxpr_, _ = ad.jvp_jaxpr(closed_jaxpr, nonzero_tangents, [False])
+  jvp_jaxpr_, _ = ad.jvp_jaxpr(closed_jaxpr, ref_nonzero_tangents, [False])
   jvp_jaxpr, () = jvp_jaxpr_.jaxpr, jvp_jaxpr_.consts  # TODO consts
-  jvp_which_linear = which_linear + (True,) * len(tangents)
-  () = bloop_p.bind(*primals, *tangents, jaxpr=jvp_jaxpr,
+  jvp_which_linear = which_linear + (True,) * len(ref_tangents)
+  () = bloop_p.bind(*primals, *ref_tangents, jaxpr=jvp_jaxpr,
                     max_iter=max_iter, which_linear=jvp_which_linear)
   return [], []
 ad.primitive_jvps[bloop_p] = _bloop_jvp
+
+def _bloop_partial_eval(trace, *tracers, max_iter, jaxpr, which_linear):
+  breakpoint()
+  pass
+pe.custom_partial_eval_rules[bloop_p] = _bloop_partial_eval
+
+def _bloop_partial_eval_custom(saveable, in_unknowns, in_inst, eqn):
+  pred_in_unknown, *in_unknowns = in_unknowns
+  assert not pred_in_unknown
+  del pred_in_unknown
+  pred_in_inst, *in_inst = in_inst
+  max_iter, jaxpr, which_linear = split_dict(
+      eqn.params, ["max_iter", "jaxpr", "which_linear"])
+  num_inputs = len(eqn.invars)
+  # We first need to run a fixpoint to determine which of the `Ref`s are unknown
+  # after running the for loop. However, the jaxpr has no outputs. Instead, we
+  # discharge the body and run the fixpoint with the discharged jaxpr. We can do
+  # this because the outputs of the discharged jaxpr are one-to-one with the
+  # inputs.
+  discharged_jaxpr, discharged_consts = discharge_state(jaxpr, ())
+  discharged_jaxpr = pe.convert_constvars_jaxpr(discharged_jaxpr)
+  in_unknowns, in_inst = list(in_unknowns), list(in_inst)
+  out_unknowns, out_inst =  in_unknowns, in_inst
+
+  for _ in range(num_inputs):
+    jaxpr_in_unknowns = [False] * len(discharged_consts) + in_unknowns
+    _, _, out_unknowns, out_inst, _, = pe.partial_eval_jaxpr_custom(
+        discharged_jaxpr, jaxpr_in_unknowns, True,
+          ensure_out_unknowns=[False] * num_inputs, ensure_out_inst=True,
+          saveable=saveable)
+    pred_out_unknown, *out_unknowns = out_unknowns
+    assert not pred_out_unknown
+    if out_unknowns == in_unknowns:
+      break
+    in_unknowns = map(operator.or_, in_unknowns, out_unknowns)
+  else:
+    if num_inputs > 0: raise Exception("Invalid fixpoint")
+  del out_unknowns # Redundant since it's the same as `in_unknowns`
+  new_inst = [x for x, inst in zip(eqn.invars[1:], in_inst)
+              if type(x) is core.Var and not inst]
+  in_inst = [True] * (len(eqn.invars) - 1)
+
+  # We use `partial_eval_jaxpr_custom` here because it won't remove effectful
+  # primitives like `get`/`set`.
+  jaxpr_known_resout, jaxpr_staged_resin_, _, _, num_res = \
+        pe.partial_eval_jaxpr_custom(jaxpr, in_unknowns, in_inst, [False],
+                                     [False], saveable)
+
+  # `partial_eval_jaxpr_custom` will give us jaxprs that have hybrid `Ref` and
+  # non-Ref input/outputs. However, we'd like to bind these jaxprs to a
+  # `for`, which expects only `Ref` inputs and no output. We need to convert
+  # both of these jaxprs into ones that are compatible with `for`.
+  # TODO(sharadmv,mattjj): implement "passthrough" optimization.
+  # TODO(sharadmv,mattjj): rematerialize loop-dependent values instead of
+  # passing the loop index as a residual
+
+  # `jaxpr_known_resout` is a jaxpr that maps from all the input `Refs`
+  # to output residual values (none of them should be `Ref`s). We'll need to
+  # convert the output residual values into `Ref`s that are initially empty
+  # `Ref`s that are written to at the end of the jaxpr.
+
+  # # Loop-invariant residual optimization
+  # Here we are interested in finding out which of the residuals are *not*
+  # dependent on the loop index. If a residual is not dependent on the loop
+  # index, we don't need add an extra loop dimension we're reading from when we
+  # convert it from an output into a write.
+  loop_invar_res = _loop_invariant_outputs(jaxpr_known_resout)
+
+  # TODO(sharadmv, mattjj): implement this properly (skip_first, handle index)
+  jaxpr_known, res_avals = _convert_outputs_to_writes(max_iter,
+                                                      jaxpr_known_resout,
+                                                      loop_invar_res,
+                                                      skip_first=True)
+
+  # known_invars, _ = partition_list(in_unknowns, eqn.invars)
+  # known_outvars, _ = partition_list(in_unknowns, eqn.outvars)
+  # newvar = core.gensym()
+  # resvars = map(newvar, res_avals)
+
+  # @lu.wrap_init
+  # def known(*known_vals):
+  #   empty_res = map(ad_util.zeros_like_aval, res_avals)
+  #   jaxpr_known_args = [*known_vals, *empty_res]
+  #   jaxpr_known_which_linear = (False,) * len(jaxpr_known_args)
+  #   return for_p.bind(*jaxpr_known_args, jaxpr=jaxpr_known, nsteps=nsteps,
+  #                     reverse=reverse, which_linear=jaxpr_known_which_linear,
+  #                     unroll=unroll)
+  # call_jaxpr_, _, call_jaxpr_consts = pe.trace_to_jaxpr_dynamic(
+  #     known, [v.aval for v in known_invars])
+  # call_jaxpr = core.ClosedJaxpr(call_jaxpr_, call_jaxpr_consts)
+  # eqn_known = pe.new_jaxpr_eqn(known_invars, [*known_outvars, *resvars],
+  #                              core.closed_call_p, dict(call_jaxpr=call_jaxpr),
+  #                              call_jaxpr.effects, eqn.source_info)
+
+  # jaxpr_staged = _convert_inputs_to_reads(nsteps, len(res_avals),
+  #                                         jaxpr_staged_resin_,
+  #                                         loop_invar_res)
+  # which_linear_unknown = (False,) * num_res + tuple(which_linear)
+  # params_staged = dict(eqn.params, jaxpr=jaxpr_staged, reverse=reverse,
+  #                                  nsteps=nsteps,
+  #                                  which_linear=which_linear_unknown,
+  #                                  unroll=unroll)
+
+  # @lu.wrap_init
+  # def staged(*res_and_refs):
+  #   out_flat = for_p.bind(*res_and_refs, **params_staged)
+  #   _, ans = split_list(out_flat, [num_res])
+  #   _, ans = partition_list(out_inst, ans)
+  #   return ans
+  # call_jaxpr_, _, call_jaxpr_consts = pe.trace_to_jaxpr_dynamic(
+  #     staged, [v.aval for v in [*resvars, *eqn.invars]])
+  # assert len(jaxpr_staged.invars) - 1 == len(call_jaxpr_.invars)
+  # call_jaxpr = core.ClosedJaxpr(call_jaxpr_, call_jaxpr_consts)
+  # _, outvars = partition_list(out_inst, eqn.outvars)
+  # eqn_staged = pe.new_jaxpr_eqn([*resvars, *eqn.invars], outvars,
+  #                              core.closed_call_p, dict(call_jaxpr=call_jaxpr),
+  #                              call_jaxpr.effects, eqn.source_info)
+  # new_vars = [*new_inst, *resvars]
+  # return eqn_known, eqn_staged, in_unknowns, out_inst, new_vars
+pe.partial_eval_jaxpr_custom_rules[bloop_p] = _bloop_partial_eval_custom

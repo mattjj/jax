@@ -2,22 +2,26 @@ import jax
 import jax.numpy as jnp
 from jax._src.lax.control_flow.for_loop import bloop, run_state
 
-def f(x_ref):
+def f(refs):
+  i_ref, x_ref, y_ref = refs
   def cond():
-    return x_ref[()] < 5
+    return i_ref[()] < x_ref.shape[0]
 
   def body():
-    x_ref[()] += 1.
+    i = i_ref[()]
+    y_ref[i] = jnp.sin(x_ref[i])
+    i_ref[()] += 1
 
-  bloop(2, cond, body)
+  bloop(10, cond, body)
 
+def sin(x):
+  return run_state(f, (0, x, jnp.zeros_like(x)))[2]
 
-jaxpr = jax.make_jaxpr(lambda: run_state(f, 1.))()
+print(sin(jnp.arange(4.)))
+print(jax.make_jaxpr(sin)(jnp.arange(4.)))
 
-print(jaxpr)
-print(run_state(f, 1.))
-out = jax.jvp(lambda x: run_state(f, x), (1.,), (1.,))
+out = jax.jvp(sin, (jnp.arange(4.),), (jnp.ones(4),))
 print(out)
 
-print(jax.make_jaxpr(lambda x, t: jax.jvp(lambda x: run_state(f, x), (x,),
-  (t,)))(1., 1.))
+_, f_lin = jax.linearize(sin, jnp.arange(4.))
+print(jax.make_jaxpr(f_lin)(1.))
