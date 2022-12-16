@@ -683,10 +683,8 @@ num_buffers_handlers[core.DShapedArray] = lambda _: 1
 num_buffers_handlers[core.ConcreteArray] = lambda _: 1
 
 
-def _input_handler(backend: Backend,
-                   in_type: Optional[pe.InputType],
-                   out_type: Optional[pe.OutputType],
-                   ) -> Optional[Callable]:
+def _input_handler(in_type: Optional[pe.InputType],
+                   out_type: Optional[pe.OutputType]) -> Optional[Callable]:
   if in_type is None:
     assert out_type is None
     return None
@@ -716,6 +714,16 @@ def _input_handler(backend: Backend,
       d.val for aval, _ in out_type if type(aval) is core.DShapedArray  # type: ignore
       for d in aval.shape if type(d) is core.InDBIdx]
 
+  # input_type = [(False, i32[]), (True, f32[DBIdx(0)])]
+  # means
+  # input_type = [(False, axis_size:i32[]), (True, f32[axis_size])]
+  #
+  # actually explicitly passed just one arg:
+  #   [1., 2., 3]
+  # need to 'elaborate'/'unpacks'/'infers' to be these two args
+  #   3, [1., 2., 3.]
+
+  # out_type = [(True, f32[8, InDBIdx(0)])]
   def elaborate(explicit_args: Sequence[Any]) -> Tuple[Tuple, Optional[Tuple]]:
     if needs_implicit:
       # Build full argument list, leaving Nones for implicit arguments.
@@ -743,9 +751,7 @@ def _input_handler(backend: Backend,
     return tuple(args), out_type_env and tuple(out_type_env)  # type: ignore
   return elaborate
 
-def _result_handler(backend: Backend,
-                    sticky_device: Optional[Device],
-                    out_type: pe.OutputType,
+def _result_handler(sticky_device: Optional[Device], out_type: pe.OutputType,
                     ) -> Callable:
   out_avals, kept_outputs = util.unzip2(out_type)
   handlers = map(partial(aval_to_result_handler, sticky_device), out_avals)
@@ -1185,8 +1191,8 @@ class XlaCompiledComputation(stages.XlaExecutable):
                            kept_var_idx: Set[int], keepalive: Optional[Any],
                            host_callbacks: List[Any]) -> XlaCompiledComputation:
     sticky_device = device
-    input_handler = _input_handler(backend, in_type, out_type)
-    result_handler = _result_handler(backend, sticky_device, out_type)
+    input_handler = _input_handler(in_type, out_type)
+    result_handler = _result_handler(sticky_device, out_type)
     options = xb.get_compile_options(
         num_replicas=nreps, num_partitions=1,
         device_assignment=(sticky_device,) if sticky_device else None)

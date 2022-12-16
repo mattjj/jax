@@ -690,14 +690,21 @@ def _darray_global_result_handler(global_aval, out_sharding, committed,
     return _array_global_result_handler(global_aval, out_sharding, committed,
                                         is_out_sharding_from_xla)
   else:
-    pad_shape = [d.dtype.bound if dispatch._is_bint_axis_size(d) else d
-                 for d in shape]
-    dtype = (global_aval.dtype if not core.is_opaque_dtype(global_aval.dtype)
-             else global_aval.dtype._rules.physical_avals(global_aval)[0].dtype)
-    buf_aval = core.ShapedArray(tuple(pad_shape), dtype, global_aval.weak_type)
-    padded_handler = _array_global_result_handler(
-        buf_aval, out_sharding, committed, is_out_sharding_from_xla)
-    return lambda bufs: core.DArray(global_aval, padded_handler(bufs))
+    def handler(env, bufs):
+      if env: breakpoint()
+      pad_shape = [d.dtype.bound if dispatch._is_bint_axis_size(d) else d
+                  for d in shape]
+      dtype = (global_aval.dtype if not core.is_opaque_dtype(global_aval.dtype)
+              else global_aval.dtype._rules.physical_avals(global_aval)[0].dtype)
+      buf_aval = core.ShapedArray(tuple(pad_shape), dtype, global_aval.weak_type)
+      padded_handler = _array_global_result_handler(
+          buf_aval, out_sharding, committed, is_out_sharding_from_xla)
+      return core.DArray(global_aval, padded_handler(bufs))
+      # in_env, out_env = env or (None, None)
+      # shape = [in_env[d.val] if type(d) is core.InDBIdx else
+      #          out_env[d.val] if type(d) is core.OutDBIdx else d
+      #          for d in aval.shape]
+    return handler
 pxla.global_result_handlers[(core.DShapedArray, pxla.OutputType.Array)] = _darray_global_result_handler
 
 

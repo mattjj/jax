@@ -394,10 +394,13 @@ def _shard_arg(arg, devices, arg_indices, mode):
     return shard_arg_handlers[type(arg)](arg, devices, arg_indices, mode)
 
 
+DynamicShapeInputHandler = Any
+
 @profiler.annotate_function
 def shard_args(devices: Sequence[xb.xla_client.Device],
                indices: Sequence[Sequence[Index]],
                mode: InputsHandlerMode,
+               dynamic_shape_input_handler: Optional[DynamicShapeInputHandler],
                args) -> Sequence[Union[xb.ShardedBuffer, Sequence[xb.xla_client.Buffer]]]:
   """Shard each argument data array along its leading axis.
 
@@ -413,7 +416,11 @@ def shard_args(devices: Sequence[xb.xla_client.Device],
     A list of length matching args, containing lists of per-device buffers
     for each argument.
   """
-  return [_shard_arg(arg, devices, indices[i], mode) for i, arg in enumerate(args)]
+  args, env = (dynamic_shape_input_handler(args) if dynamic_shape_input_handler
+               else (args, None))
+  sharded_args =  [_shard_arg(arg, devices, indices[i], mode)
+                   for i, arg in enumerate(args)]
+  return sharded_args, env
 
 
 shard_arg_handlers: Dict[Any, Callable[[Any, Any, Any, InputsHandlerMode], Sequence[Any]]] = {}
@@ -1888,15 +1895,18 @@ class InputsHandler:
   __slots__ = ("handler", "local_devices", "in_shardings", "input_indices",
                "mode")
 
-  def __init__(self, local_devices, in_shardings, input_indices, mode):
-    self.handler = partial(shard_args, local_devices, input_indices, mode)
+  def __init__(self, local_devices, in_shardings, input_indices, mode,
+               dynamic_shapes_input_handler):
+    self.handler = partial(shard_args, local_devices, input_indices, mode,
+                           dynamic_shapes_input_handler)
     self.local_devices = local_devices
     self.in_shardings = in_shardings
     self.input_indices = input_indices
     self.mode = mode
 
   def __call__(self, input_buffers):
-    return self.handler(input_buffers)
+    sharded_args, env = self.handler(input_buffers)
+    return sharded_args, env
 
   def __str__(self):
     return ("InputsHandler(\n"
@@ -1917,8 +1927,23 @@ class ResultsHandler:
     self.out_shardings = out_shardings
     self.out_avals = out_avals
 
-  def __call__(self, out_bufs):
-    return [h(bufs) for h, bufs in safe_zip(self.handlers, out_bufs)]
+  def __call__(self, _, out_bufs):
+    return [h(None, bufs) for h, bufs in safe_zip(self.handlers, out_bufs)]
+
+class DynamicShapeResultsHandler:
+  __slots__ = ("handlers", "out_shardings", "out_avals", "kept_outputs")
+
+  def __init__(self, handlers, out_shardings, out_avals, kept_outputs):
+    self.handlers = handlers
+    self.out_shardings = out_shardings
+    self.out_avals = out_avals
+    self.kept_outputs = kept_outputs
+
+  def __call__(self, input_env, out_bufs):
+    results = []
+    for handler, bufs in safe_zip(self.handlers, out_bufs):
+      results.append(handler((input_env, results), bufs))
+    return [r for r, keep in safe_zip(results, self.kept_outputs) if keep]
 
 
 def _get_sharding_specs(
@@ -1951,14 +1976,24 @@ def global_avals_to_results_handler(
     global_out_avals: Sequence[ShapedArray],
     shardings: Sequence[sharding_internal.XLACompatibleSharding],
     committed: bool,
-    are_out_shardings_from_xla: Sequence[bool]) -> ResultsHandler:
+    are_out_shardings_from_xla: Sequence[bool],
+    out_type: Optional[pe.OutputType] = None,
+  ) -> ResultsHandler:
   if config.jax_parallel_functions_output_gda or config.jax_array:
     handlers = [
         global_aval_to_result_handler(global_aval, s, committed, x)
         for global_aval, s, x in safe_zip(global_out_avals, shardings,
                                           are_out_shardings_from_xla)
     ]
-    return ResultsHandler(handlers, shardings, global_out_avals)
+    out_avals, kept_outputs = util.unzip2(out_type)
+    dyn_outs = any(type(aval) is core.DShapedArray and
+                   any(type(d) in (core.InDBIdx, core.OutDBIdx) for d in aval.shape)
+                   for aval in out_avals)
+    if not dyn_outs:
+      return ResultsHandler(handlers, shardings, global_out_avals)
+    else:
+      return DynamicShapeResultsHandler(handlers, shardings, global_out_avals,
+                                        kept_outputs)
   else:
     # This path is taken when the outputs are SDAs.
     assert all(isinstance(s, sharding_internal.NamedSharding) for s in shardings)
@@ -2132,7 +2167,7 @@ class ExecuteReplicated:
   @profiler.annotate_function
   def __call__(self, *args):
     args = [x for i, x in enumerate(args) if i in self.kept_var_idx]
-    input_bufs = self.in_handler(args)
+    input_bufs, input_env = self.in_handler(args)
     if (self.ordered_effects or self.has_unordered_effects or
         self.has_host_callbacks):
       out_bufs = self._call_with_tokens(input_bufs)
@@ -2148,7 +2183,7 @@ class ExecuteReplicated:
     if (config.jax_array and out_bufs and
         isinstance(out_bufs[0], xc.ShardedBuffer)):
       out_bufs = [o.get_device_buffers() for o in out_bufs]
-    return self.out_handler(out_bufs)
+    return self.out_handler(input_env, out_bufs)
 
 
 xla_pmap_p = core.MapPrimitive('xla_pmap')
@@ -2795,6 +2830,7 @@ def lower_sharding_computation(
     fun = lu.annotate(fun, in_type)
   else:
     assert global_in_avals == (None,) * len(global_in_avals)
+    in_type = fun.in_type
     global_in_avals = [aval for aval, _ in fun.in_type]
 
   with dispatch.log_elapsed_time(f"Finished tracing + transforming {name_stack} "
@@ -2977,6 +3013,8 @@ def lower_sharding_computation(
       module,
       False,
       donated_invars,
+      in_type=in_type,
+      out_type=out_type,
       mesh=None,
       global_in_avals=global_in_avals,
       global_out_avals=global_out_avals,
@@ -3143,6 +3181,7 @@ def lower_mesh_computation(
       module,
       False,
       donated_invars,
+      None, None,  # dynamic shape in_type / out_type
       mesh=mesh,
       global_in_avals=global_in_avals,
       global_out_avals=global_out_avals,
@@ -3329,6 +3368,8 @@ class UnloadedMeshExecutable:
   xla_executable: Any
   device_assignment: Sequence[xc.Device]
   backend: xb.XlaBackend
+  in_type: Optional[pe.InputType]
+  out_type: Optional[pe.OutputType]
   input_avals: Sequence[ShapedArray]
   input_shardings: Sequence[sharding_internal.XLACompatibleSharding]
   output_avals: Sequence[ShapedArray]
@@ -3346,12 +3387,15 @@ class UnloadedMeshExecutable:
 
   def load(self) -> MeshExecutable:
     input_indices = _get_input_indices(self.input_avals, self.input_shardings)
+    dynamic_shape_input_handler = dispatch._input_handler(self.in_type, self.out_type)
     handle_args = InputsHandler(self.xla_executable.local_devices(),
                                 self.input_shardings, input_indices,
-                                InputsHandlerMode.pjit_or_xmap)
+                                InputsHandlerMode.pjit_or_xmap,
+                                dynamic_shape_input_handler,
+                                )
     handle_outs = global_avals_to_results_handler(
         self.output_avals, self.output_shardings, self.committed,
-        self.are_out_shardings_from_xla)  # type: ignore  # arg-type
+        self.are_out_shardings_from_xla, self.out_type)  # type: ignore  # arg-type
 
     # This path is taken for `jit(pmap)` cases. Nothing else should flow
     # through this path. This is exactly same to what happens in `jit`.
@@ -3379,6 +3423,8 @@ class UnloadedMeshExecutable:
   @staticmethod
   def from_hlo(name: str,
                computation: Union[ir.Module, xc.XlaComputation],
+               in_type: Optional[pe.InputType],
+               out_type: Optional[pe.OutputType],
                # TODO(yashkatariya): Remove `mesh` from here once AUTO can work
                # without mesh.
                mesh: Optional[Mesh],
@@ -3488,6 +3534,8 @@ class UnloadedMeshExecutable:
           xla_executable=xla_executable,
           device_assignment=device_assignment,
           backend=backend,
+          in_type=in_type,
+          out_type=out_type,
           input_avals=input_avals,
           input_shardings=input_shardings,
           output_avals=global_out_avals,

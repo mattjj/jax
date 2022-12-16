@@ -1188,7 +1188,7 @@ InputType = Tuple[Tuple[AbstractValue, bool], ...]  # DBIdx in shapes
 # For annotating jaxpr output types, we use a sequence of pairs where the first
 # element of each pair is an AbstractValue (possibly containing InDBIdx and/or
 # OutDBIdx instances in its shape) and the second is a boolean indicating
-# whether that argument is explicit (i.e. returned by the callable).
+# whether that output is explicit (i.e. returned by the callable).
 OutputType = Tuple[Tuple[AbstractValue, bool], ...]  # InDBIdx / OutDBIdx shapes
 
 
