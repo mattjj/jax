@@ -1204,6 +1204,7 @@ def _lower_jaxpr_to_fun_cached(ctx, fn_name, call_jaxpr, effects):
     # Cacheable.
     key = (fn_name, call_jaxpr.jaxpr, tuple(effects))
     try:
+      raise KeyError  # TODO
       func_op = ctx.cached_call_jaxpr_lowerings[key]
     except KeyError:
       func_op = lower_jaxpr_to_fun(ctx, fn_name, call_jaxpr, effects)
@@ -1215,7 +1216,8 @@ def _lower_jaxpr_to_fun_cached(ctx, fn_name, call_jaxpr, effects):
 
 def _call_lowering(fn_name, stack_name, call_jaxpr, backend, ctx, avals_in,
                    avals_out, tokens_in, *args,
-                   dim_var_values: Sequence[ir.Value]):
+                   dim_var_values: Sequence[ir.Value],
+                   device=None):
   if isinstance(call_jaxpr, core.Jaxpr):
     call_jaxpr = core.ClosedJaxpr(call_jaxpr, ())
   xla.check_backend_matches(backend, ctx.platform)
@@ -1228,6 +1230,8 @@ def _call_lowering(fn_name, stack_name, call_jaxpr, backend, ctx, avals_in,
   call = func_dialect.CallOp(flat_output_types,
                              ir.FlatSymbolRefAttr.get(symbol_name),
                              flatten_lowering_ir_args(args))
+  if device is not None:
+    call.attributes['mhlo.device'] = ir.StringAttr.get(str(device))
   out_nodes = util.unflatten(call.results, map(len, output_types))
   tokens, out_nodes = util.split_list(out_nodes, [len(effects)])
   tokens_out = tokens_in.update_tokens(TokenSet(zip(effects, tokens)))
@@ -1236,11 +1240,11 @@ def _call_lowering(fn_name, stack_name, call_jaxpr, backend, ctx, avals_in,
 def _xla_call_lower(ctx, *args,
                     backend=None, name, call_jaxpr, donated_invars, inline=None,
                     device=None, keep_unused=None):
-  del device, donated_invars, inline, keep_unused  # Ignored.
+  del donated_invars, inline, keep_unused  # Ignored.
   out_nodes, tokens = _call_lowering(
       name, util.wrap_name(name, "jit"), call_jaxpr, backend,
       ctx.module_context, ctx.avals_in, ctx.avals_out, ctx.tokens_in,
-      *args, dim_var_values=ctx.dim_var_values)
+      *args, dim_var_values=ctx.dim_var_values, device=device)
   ctx.set_tokens_out(tokens)
   return out_nodes
 
