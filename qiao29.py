@@ -1,7 +1,9 @@
+import itertools
+import operator
+
 import jax
 import jax.numpy as jnp
 
-import operator
 from functools import partial
 from typing import Sequence, Any, Dict, Union, Tuple, List
 from jax import core
@@ -21,7 +23,7 @@ IsQDQ = bool
 
 def quantize(fun, args_to_quantize: Sequence[bool], example_args: Sequence[Any]):
   jaxpr = jax.make_jaxpr(fun)(*example_args)
-  num_scales = 3  # TODO don't hardcode
+  num_scales = count_scales(jaxpr, args_to_quantize)
   def fun_quantized(scales, *args):
     old_scales = list(scales)
     new_scales = []
@@ -33,12 +35,20 @@ def quantize(fun, args_to_quantize: Sequence[bool], example_args: Sequence[Any])
     return out_vals, new_scales
   return fun_quantized, num_scales
 
-# def count_dots(jaxpr):
-#   count = 0
-#   for eqn in jaxpr.eqns:
-#     if str(eqn.primitive) == 'dot_general':
-#       count += 1
-#   return count + sum(count_dots(j) for j in core.subjaxprs(jaxpr))
+def count_scales(jaxpr: core.ClosedJaxpr, args_to_quantize: Sequence[bool]
+                 ) -> int:
+  class Dummy:
+    def pop(self, _: int = -1):
+      return jnp.float32(1.)
+  cell = []
+  def count(*args):
+    new_scales = []
+    quantize_interpreter(jaxpr, args_to_quantize, Dummy(), new_scales, *args)
+    cell.append(len(new_scales))
+
+  jax.make_jaxpr(count)(*jaxpr.in_avals)
+  num_scales, = cell
+  return num_scales + sum(args_to_quantize)
 
 def qiao_quantize(x, quantized_dtype, scale):
   dtype_max = 57344
@@ -182,6 +192,6 @@ print(jaxpr)
 
 
 # TODO
-#  * [ ] don't hardcode the number of scales, instead do a second pass
+#  * [x] don't hardcode the number of scales, instead do a second pass
 #  * [ ] optimization: if a value is consumed more than once, it might get
 #        quantized more than once
