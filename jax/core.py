@@ -2567,8 +2567,8 @@ def _check_jaxpr(
           f"Value for variable '{pp_var(v, ctx)}' inconsistently typed "
           f"as {pp_aval(a, ctx)} for let-binder of type {pp_aval(v.aval, ctx)}")
     # If the variable is not a DropVar, add it to the environment.
-    if not isinstance(v, DropVar):
-      env.add(v)
+    # if not isinstance(v, DropVar):
+    env.add(v)
 
   # Check type annotations on lambda binders.
   for v in it.chain(jaxpr.constvars, jaxpr.invars):

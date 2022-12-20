@@ -1167,7 +1167,7 @@ def _partial_eval_jaxpr_custom_cached(
         map(partial(write, False, True), eqn.outvars)
   unzipped = unzip2(map(read, jaxpr.outvars))
   out_unknowns, out_inst = list(unzipped[0]), list(unzipped[1])
-  assert all(type(v) is Var for v in residuals), residuals
+  assert all(isinstance(v, Var) for v in residuals), residuals
 
   for x, inst, ensure_inst in zip(jaxpr.outvars, out_inst, ensure_out_inst):
     if ensure_inst: ensure_instantiated(inst, x)
