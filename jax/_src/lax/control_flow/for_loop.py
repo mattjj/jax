@@ -176,6 +176,16 @@ def for_loop(nsteps: Union[int, Sequence[int]],
   out_flat = out_flat[len(consts):]
   return tree_unflatten(state_tree, out_flat)
 
+def run_state_bind(*args, jaxpr: core.Jaxpr, which_linear: Tuple[bool, ...]):
+  assert not jaxpr.constvars
+  @lu.wrap_init
+  def _traceable(_, *args):
+    return core.eval_jaxpr(jaxpr, (), *args)
+  in_avals = [core.ShapedArray((), jnp.int32), *[v.aval for v in jaxpr.invars]]
+  jaxpr, _, () = pe.trace_to_jaxpr_dynamic(_traceable, in_avals)
+  return for_p.bind(*args, jaxpr=jaxpr, nsteps=1, reverse=False,
+                    unroll=1, which_linear=which_linear)
+
 Carry = TypeVar('Carry')
 X = TypeVar('X')
 Y = TypeVar('Y')
@@ -665,7 +675,7 @@ def _for_partial_eval_custom(saveable, in_unknowns, in_inst, eqn):
 pe.partial_eval_jaxpr_custom_rules[for_p] = _for_partial_eval_custom
 
 def _convert_outputs_to_writes(
-    nsteps: int, jaxpr: core.Jaxpr, loop_invar_res: Sequence[bool],
+    nsteps: Optional[int], jaxpr: core.Jaxpr, loop_invar_res: Sequence[bool],
     ) -> Tuple[core.Jaxpr, List[core.ShapedArray]]:
   assert not jaxpr.constvars, "Jaxpr shouldn't have constvars."
 
@@ -694,7 +704,7 @@ def _convert_outputs_to_writes(
   return jaxpr, [core.ShapedArray(a.shape, a.dtype) for a in res_ref_avals]
 
 def _convert_inputs_to_reads(
-    nsteps: int, num_res: int, jaxpr: core.Jaxpr,
+    nsteps: Optional[int], num_res: int, jaxpr: core.Jaxpr,
     loop_invar_res: Sequence[bool]) -> core.Jaxpr:
   assert not jaxpr.constvars, "Jaxpr should not have constvars"
 
@@ -1301,6 +1311,9 @@ def _linear_loop_partial_eval_custom(saveable, in_unknowns, in_inst, eqn):
   jaxpr_known_resout, jaxpr_staged_resin_, _, _, num_res = \
         pe.partial_eval_jaxpr_custom(jaxpr, [False, *in_unknowns],
             in_inst, [], [], saveable)
+  loop_invar_res = _loop_invariant_outputs(jaxpr)
+  jaxpr_known_resout = _convert_outputs_to_writes(None,
+      jaxpr_known_resout, [True] * num_res)
   breakpoint()
 
 pe.partial_eval_jaxpr_custom_rules[linear_loop_p] = _linear_loop_partial_eval_custom
