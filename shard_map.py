@@ -28,9 +28,7 @@ zip, unsafe_zip = util.safe_zip, zip
 
 # API
 
-AxisName = Hashable
-AxisNames = Dict[int, Tuple[AxisName, ...]]  # TODO make it a hashable dict
-Specs = Any  # PyTree[Union[PartitionSpec, AxisNames]]
+Specs = Any  # PyTree[PartitionSpec]
 
 def shard_map(f: Callable, mesh: Mesh, in_specs: Specs, out_specs: Specs):
   def wrapped(*args):
@@ -52,7 +50,10 @@ def shard_map(f: Callable, mesh: Mesh, in_specs: Specs, out_specs: Specs):
     return tree_unflatten(out_tree(), out_flat)
   return wrapped
 
-def _canonicalize_spec(spec: Union[PartitionSpec, AxisNames]) -> AxisNames:
+# Internally we use AxisNames instead of PartitionSpecs
+AxisName = Hashable
+AxisNames = Dict[int, Tuple[AxisName, ...]]  # TODO make it a hashable dict
+def _canonicalize_spec(spec: PartitionSpec) -> AxisNames:
   if isinstance(spec, PartitionSpec):
     return {i: names if isinstance(names, tuple) else (names,)
             for i, names in enumerate(spec) if names is not None}
@@ -252,7 +253,6 @@ def _primitive_applier(
   return _prim_applier(prim, tuple(params.items()), mesh,
                        tuple(tuple(ns.items()) for ns in names), tuple(avals))
 
-
 @lru_cache()
 def _prim_applier(prim, params_tup, mesh, names_tup, avals):
   params, names = dict(params_tup), tuple([dict(ns) for ns in names_tup])
@@ -276,7 +276,8 @@ def _mul_rule(avals: Sequence[core.ShapedArray], names: Sequence[AxisNames]
   return first
 transfer_rules[lax.mul_p] = _mul_rule
 
-##
+
+# Tests
 
 import os, re
 import jax
