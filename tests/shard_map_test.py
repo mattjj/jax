@@ -21,7 +21,6 @@ from jax.config import config
 from jax.experimental.maps import Mesh
 from jax.experimental.pjit import PartitionSpec as P
 from jax.interpreters import pxla
-from jax import shard_map  # TODO(mattj) change this if it doesn't pick up your top level shard_map
 from jax._src import sharding
 from jax._src import ad_checkpoint
 from jax._src import debugging
@@ -30,6 +29,8 @@ from jax._src import test_util as jtu
 from jax._src.lib import xla_bridge
 import jax.numpy as jnp
 import numpy as np
+
+import shard_map  # TODO(mattjj): move me
 
 config.parse_flags_with_absl()
 
@@ -63,8 +64,8 @@ class ShardMapTest(absltest.TestCase):
       c = shard_map.shard_map(
           identity,
           mesh,
-          in_pspecs=(P('z', ('x', 'y')),),
-          out_pspecs=P('z', ('x', 'y')))(a)
+          in_specs=(P('z', ('x', 'y')),),
+          out_specs=P('z', ('x', 'y')))(a)
       return c
 
     c = fwd(a)
@@ -84,8 +85,8 @@ class ShardMapTest(absltest.TestCase):
       c = shard_map.shard_map(
           all_gather,
           mesh,
-          in_pspecs=(P('z', ('x', 'y')),),
-          out_pspecs=P(None, ('x', 'y')))(
+          in_specs=(P('z', ('x', 'y')),),
+          out_specs=P(None, ('x', 'y')))(
               a)
       return c
 
@@ -107,8 +108,8 @@ class ShardMapTest(absltest.TestCase):
       c = shard_map.shard_map(
           matmul_partial,
           mesh,
-          in_pspecs=(P('z', 'y'), P('y', None)),
-          out_pspecs=P('z', None))(a, b)
+          in_specs=(P('z', 'y'), P('y', None)),
+          out_specs=P('z', None))(a, b)
       return c
 
     with mesh:
@@ -130,8 +131,8 @@ class ShardMapTest(absltest.TestCase):
       c = shard_map.shard_map(
           matmul_reduce_scatter,
           mesh,
-          in_pspecs=(P('z', 'y'), P('y', None)),
-          out_pspecs=P(('z', 'y'), None))(a, b)
+          in_specs=(P('z', 'y'), P('y', None)),
+          out_specs=P(('z', 'y'), None))(a, b)
       return c
 
     with mesh:
@@ -156,8 +157,8 @@ class ShardMapTest(absltest.TestCase):
       c = shard_map.shard_map(
           collective_permute,
           mesh,
-          in_pspecs=(P('x', None),),
-          out_pspecs=P('x', None))(
+          in_specs=(P('x', None),),
+          out_specs=P('x', None))(
               a)
       return c
 
@@ -181,8 +182,8 @@ class ShardMapTest(absltest.TestCase):
       c = shard_map.shard_map(
           all_to_all,
           mesh,
-          in_pspecs=(P('x', None),),
-          out_pspecs=P(None, 'x'))(
+          in_specs=(P('x', None),),
+          out_specs=P(None, 'x'))(
               a)
       return c
 

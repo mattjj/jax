@@ -1,4 +1,4 @@
-from functools import partial
+from functools import partial, lru_cache
 
 from typing import (Any, Callable, Optional, Tuple, List, Sequence, Dict,
                     Hashable, Union)
@@ -8,12 +8,12 @@ from jax.core import Tracer
 from jax import linear_util as lu
 from jax import util
 from jax._src import source_info_util
-from jax._src.util import prod
+from jax._src.util import prod, HashableFunction, unzip2, unzip3
+from jax._src.sharding import NamedSharding, PartitionSpec
 from jax.api_util import flatten_fun_nokwargs
 from jax.experimental import maps
 from jax.experimental. maps import Mesh
 from jax.experimental import pjit
-from jax.experimental.pjit import PartitionSpec
 from jax.interpreters import mlir
 from jax.interpreters import partial_eval as pe
 from jax.interpreters import pxla
@@ -29,7 +29,7 @@ zip, unsafe_zip = util.safe_zip, zip
 # API
 
 AxisName = Hashable
-AxisNames = Dict[int, Tuple[AxisName, ...]]
+AxisNames = Dict[int, Tuple[AxisName, ...]]  # TODO make it a hashable dict
 Specs = Any  # PyTree[Union[PartitionSpec, AxisNames]]
 
 def shard_map(f: Callable, mesh: Mesh, in_specs: Specs, out_specs: Specs):
@@ -37,7 +37,9 @@ def shard_map(f: Callable, mesh: Mesh, in_specs: Specs, out_specs: Specs):
     fun = lu.wrap_init(f)
     args_flat, in_tree = tree_flatten(args)
     in_specs_flat, in_tree_ = tree_flatten(in_specs)
-    assert in_tree == in_tree_  # TODO tree prefix
+    try:
+      assert in_tree == in_tree_  # TODO tree prefix
+    except: breakpoint()
     in_names_flat = tuple(map(_canonicalize_spec, in_specs_flat))
     flat_fun, out_tree = flatten_fun_nokwargs(fun, in_tree)
     def out_names_thunk():
@@ -53,7 +55,7 @@ def shard_map(f: Callable, mesh: Mesh, in_specs: Specs, out_specs: Specs):
 def _canonicalize_spec(spec: Union[PartitionSpec, AxisNames]) -> AxisNames:
   if isinstance(spec, PartitionSpec):
     return {i: names if isinstance(names, tuple) else (names,)
-            for i, names in enumerate(spec)}
+            for i, names in enumerate(spec) if names is not None}
   else:
     return spec
 
@@ -95,12 +97,12 @@ def _shard_map_staging(
     in_names: Tuple[AxisNames],
     out_names_thunk: Callable[[], Tuple[AxisNames, ...]]
   ) -> Sequence[pe.DynamicJaxprTracer]:
-  in_avals = [_shard_aval(mesh, ns, t.aval)
-              for t, ns in zip(in_tracers, in_names)]
+  in_avals = [t.aval for t in in_tracers]
+  in_avals_ = map(partial(_shard_aval, mesh), in_names, in_avals)
   with core.new_sublevel(), core.extend_axis_env_nd(mesh.shape.items()):
-    jaxpr, out_avals_, consts = pe.trace_to_subjaxpr_dynamic(fun, trace.main, in_avals)
-  out_avals = [_unshard_aval(mesh, ns, a)
-               for a, ns in zip(out_avals_, out_names_thunk())]
+    jaxpr, out_avals_, consts = pe.trace_to_subjaxpr_dynamic(
+        fun, trace.main, in_avals_)
+  out_avals = map(partial(_unshard_aval, mesh), out_names_thunk(), out_avals_)
   source_info = source_info_util.current()
   out_tracers = [pe.DynamicJaxprTracer(trace, a, source_info) for a in out_avals]
   invars = map(trace.getvar, in_tracers)
@@ -169,57 +171,110 @@ def _xla_unshard(mesh, names, aval_in, aval_out, xs):
       aval_out, axes).sharding_proto()
   return mlir.wrap_with_shard_to_full_op(result_type, sx, sharding_proto, set())
 
+
 # Eager evaluation
 
-# def _shard_map_impl(trace, fun, args, *, mesh, in_pspecs, out_pspecs_thunk):
-#   breakpoint()
-#   # TODO check pspecs are consistent with args shardings, by comparing
-#   # OpShardings
-#   with core.new_base_main(ShardMapTrace, mesh=mesh) as main:
-#     with core.new_sublevel(), core.extend_axis_env_nd(mesh.shape.items()):
-#       t = main.with_cur_sublevel()
-#       tracers = [ShardMapTracer(t, x, p) for x, p in zip(args, pspecs)]
-#       ans = fun.call_wrapped(*tracers)
-#       out_tracers = map(t.full_raise, ans)
-#       # TODO shouldn't be ignoring computed out_pspecs, gotta make things match
-#       out_vals, _ = unzip2((t.val, t.pspec) for t in out_tracers)
-#       del main, t, tracers, ans, out_tracers
-#   return out_vals
-# core.EvalTrace.process_shard_map = _shard_map_impl
+def _shard_map_impl(trace, fun, args, *, mesh, in_names, out_names_thunk):
+  args = map(partial(_device_put_from_names, mesh), in_names, args)
+  with core.new_base_main(ShardMapTrace, mesh=mesh) as main:
+    with core.new_sublevel(), core.extend_axis_env_nd(mesh.shape.items()):
+      t = main.with_cur_sublevel()
+      tracers = [ShardMapTracer(t, x, n) for x, n in zip(args, in_names)]
+      ans = fun.call_wrapped(*tracers)
+      out_tracers = map(t.full_raise, ans)
+      out_vals, out_names = unzip2((t.val, t.names) for t in out_tracers)
+      out_vals = map(partial(_match_spec, mesh), out_names, out_names_thunk(),
+                     out_vals)
+      del main, t, tracers, ans, out_tracers, out_names
+  return out_vals
+core.EvalTrace.process_shard_map = _shard_map_impl
 
-# class ShardMapTrace(core.Trace):
-#   def __init__(self, *args, mesh):
-#     super().__init__(*args)
-#     self.mesh = mesh
+def _device_put_from_names(mesh: Mesh, names: AxisNames, x: JaxType) -> JaxType:
+  return jax.device_put(x, NamedSharding(mesh, _names_to_pspec(names)))
 
-#   def pure(self, val):
-#     return ShardMapTracer(self, val, (None,) * np.ndim(val))
+def _names_to_pspec(names: AxisNames) -> PartitionSpec:
+  ndmin = max(names) if names else 0
+  return PartitionSpec(*(names.get(i, None) for i in range(ndmin)))
 
-#   def sublift(self, tracer):
-#     return ShardMapTracer(self, tracer.val, tracer.pspec)
+def _match_spec(mesh: Mesh, src: AxisNames, dst: AxisNames, x: JaxType
+                ) -> JaxType:
+  if src == dst: return x
+  return jit(_get_matcher(mesh, tuple(src), tuple(dst)))(x)
 
-#   def process_primitive(self, primitive, tracers, params):
-#     # TODO execute_sharded_on_local_devices(...)
-#     raise NotImplementedError("Eager shard map not supported.")
+@lru_cache()
+def _get_matcher(mesh, src_tup, dst_tup):
+  src, dst = _names_to_pspec(dict(src_tup)), _names_to_pspec(dict(dst_tup))
+  return shard_map(lambda x: x, mesh, (src,), dst)
 
-# class ShardMapTracer(core.Tracer):
-#   def __init__(self, trace, val, pspec):
-#     self._trace = trace
-#     self.val = val
-#     self.pspec = pspec
+class ShardMapTrace(core.Trace):
+  mesh: Mesh
 
-#   @property
-#   def aval(self):
-#     aval = core.raise_to_shaped(core.get_aval(self.val))
-#     new_shape = [sz // prod(m.shape[n] for n in names)
-#                  for sz, names in zip(aval.shape, self.pspec)]
-#     new_shape = [sz // prod(self._trace.mesh[n] for n in self.names[i])
-#                  for i, sz in enumerate(aval.shape)]
-#     return aval.update(shape=tuple(new_shape))
+  def __init__(self, *args, mesh):
+    super().__init__(*args)
+    self.mesh = mesh
 
-#   def full_lower(self):
-#     return self
+  def pure(self, val):
+    return ShardMapTracer(self, val, {})
 
+  def sublift(self, tracer):
+    return ShardMapTracer(self, tracer.val, tracer.names)
+
+  def process_primitive(self, primitive, tracers, params):
+    vals, avals, names = unzip3((t.val, t.aval, t.names) for t in tracers)
+    f, out_names = _primitive_applier(primitive, params, self.mesh, names, avals)
+    with core.eval_context(), jax.disable_jit(False):
+      out_vals = jax.jit(f)(*vals)
+    if primitive.multiple_results:
+      return map(partial(ShardMapTracer, self), out_vals, out_names)
+    return ShardMapTracer(self, out_vals, out_names)
+
+class ShardMapTracer(core.Tracer):
+  val: JaxType
+  names: AxisNames
+
+  def __init__(self, trace, val, names):
+    self._trace = trace
+    self.val = val
+    self.names = names
+
+  @property
+  def aval(self):
+    aval = core.raise_to_shaped(core.get_aval(self.val))
+    return _shard_aval(self._trace.mesh, self.names, aval)
+
+  def full_lower(self):
+    return self
+
+def _primitive_applier(
+    prim: core.Primitive, params: core.ParamDict, mesh: Mesh,
+    names: Sequence[AxisNames], avals: Sequence[core.AbstractValue]
+  ) -> Tuple[Callable, Union[AxisNames, Sequence[AxisNames]]]:
+  return _prim_applier(prim, tuple(params.items()), mesh,
+                       tuple(tuple(ns.items()) for ns in names), tuple(avals))
+
+
+@lru_cache()
+def _prim_applier(prim, params_tup, mesh, names_tup, avals):
+  params, names = dict(params_tup), tuple([dict(ns) for ns in names_tup])
+  out_names = transfer_rules[prim](avals, names, **params)
+  names_ = tuple(map(_names_to_pspec, names))
+  out_names_ = (tuple(map(_names_to_pspec, out_names)) if prim.multiple_results
+                else _names_to_pspec(out_names))
+  f = shard_map(partial(prim.bind, **params), mesh, names_, out_names_)
+  return f, out_names
+
+transfer_rules = {}
+
+from jax._src.lax import lax
+
+def _mul_rule(avals: Sequence[core.ShapedArray], names: Sequence[AxisNames]
+              ) -> AxisNames:
+  if not any(names):
+    return {}
+  first, *rest = [n for n in names if n]
+  assert all(first == other for other in rest)
+  return first
+transfer_rules[lax.mul_p] = _mul_rule
 
 ##
 
@@ -256,6 +311,10 @@ def g(x):
 print(g(x))
 
 @jax.jit
+def g(x):
+  return shard_map(f, mesh, in_specs=(pspec,), out_specs=pspec)(x)
+print(g(x))
+
 def g(x):
   return shard_map(f, mesh, in_specs=(pspec,), out_specs=pspec)(x)
 print(g(x))
