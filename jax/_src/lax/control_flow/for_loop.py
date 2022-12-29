@@ -1271,7 +1271,7 @@ def _linear_loop_jvp(primals, tangents, *, jaxpr: core.Jaxpr,
   closed_jaxpr = core.ClosedJaxpr(jaxpr, ())
   jvp_jaxpr_, _ = ad.jvp_jaxpr(closed_jaxpr, [False, *nonzero_tangents], [])
   jvp_jaxpr, () = jvp_jaxpr_.jaxpr, jvp_jaxpr_.consts  # TODO consts
-  jvp_which_linear = tuple((*which_linear, *(False,) * len(ref_tangents)))
+  jvp_which_linear = tuple((*which_linear, *(True,) * len(ref_tangents)))
   linear_loop_p.bind(*primals, *ref_tangents, jaxpr=jvp_jaxpr,
                      which_linear=jvp_which_linear, reverse=reverse)
   return [], []
