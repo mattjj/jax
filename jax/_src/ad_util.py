@@ -42,6 +42,9 @@ def add_impl(xs, ys):
 
 @add_jaxvals_p.def_abstract_eval
 def add_abstract(xs, ys):
+  from jax._src import state
+  assert not isinstance(xs, state.ShapedArrayRef)
+  assert not isinstance(ys, state.ShapedArrayRef)
   return lattice_join(xs, ys)
 
 jaxval_zeros_likers: Dict[type, Array] = {}

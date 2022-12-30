@@ -66,6 +66,7 @@ class Environment:
     return self.env[v]
 
   def write(self, v: core.Var, val: Any) -> None:
+    assert v.aval.shape == val.shape
     self.env[v] = val
 
 class DischargeRule(Protocol):

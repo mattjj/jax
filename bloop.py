@@ -41,14 +41,46 @@ def sin(x):
 # out = jax.jvp(sin, (jnp.arange(4.),), (jnp.ones(4),))
 # print(out)
 
-sin_sum = lambda x: sin(x).sum()
-cos = jax.grad(sin_sum)
+# _, f_lin = jax.linearize(sin, jnp.arange(4.))
+# print(jax.make_jaxpr(f_lin)(jnp.ones(4)))
+# print(f_lin(jnp.ones(4)))
 
-_, f_lin = jax.linearize(sin, jnp.arange(4.))
-print(jax.make_jaxpr(f_lin)(jnp.ones(4)))
-print(f_lin(jnp.ones(4)))
+from jax._src import test_util as jtu
 
-print(jax.make_jaxpr(cos)(jnp.arange(4.)))
-print(sin(jnp.arange(4.)))
-print(cos(jnp.arange(4.)))
-print(jax.grad(lambda x: cos(x).sum())(jnp.arange(4.)))
+jtu.check_grads(sin, (jnp.arange(4.),), order=3)
+print("Done!")
+
+def make_vjp(f):
+  def f_vjp(*args):
+    out_primal_py, vjp_py = jax.vjp(f, *args)
+    return vjp_py(out_primal_py)[0]
+  return f_vjp
+sin_vjp = make_vjp(sin)
+sin_vjp2 = make_vjp(jnp.sin)
+# print(sin_vjp(jnp.arange(4.)))
+# print(sin_vjp2(jnp.arange(4.)))
+
+# print(jax.jvp(sin_vjp, (jnp.arange(4.),), (jnp.ones(4),)))
+# print(jax.jvp(sin_vjp2, (jnp.arange(4.),), (jnp.ones(4),)))
+
+# x, sin_vjp_lin = jax.linearize(sin_vjp, jnp.arange(4.))
+# y, sin_vjp2_lin = jax.linearize(sin_vjp2, jnp.arange(4.))
+x = jnp.arange(4.)
+print(jax.linearize(sin_vjp, x)[0])
+print(jax.linearize(sin_vjp2, x)[0])
+# print(x, y)
+
+# print(jax.make_jaxpr(cos)(jnp.arange(4.)))
+# print(sin(jnp.arange(4.)))
+# print(cos(jnp.arange(4.)))
+# print(sin(jnp.arange(4.)))
+# print(cos(jnp.arange(4.)))
+# print(jax.make_jaxpr(sin)(jnp.arange(4.)))
+# print(jax.make_jaxpr(cos)(jnp.arange(4.)))
+# neg_sin = jax.grad(lambda x: cos(x).sum())
+# print(neg_sin(jnp.arange(4.)))
+# print(jax.make_jaxpr(neg_sin)(jnp.arange(4.)))
+# neg_cos = jax.grad(lambda x: neg_sin(x).sum())
+# print(jax.make_jaxpr(neg_cos)(jnp.arange(4.)))
+# print(jax.grad(lambda x: cos(x).sum())(jnp.arange(4.)))
+# print(jax.grad(lambda x: cos(x).sum())(jnp.arange(4.)))
