@@ -81,6 +81,7 @@ _discharge_rules: dict[core.Primitive, DischargeRule] = {}
 def register_discharge_rule(prim: core.Primitive):
   def register(f: DischargeRule):
     _discharge_rules[prim] = f
+    return f
   return register
 
 def _has_refs(eqn: core.JaxprEqn):

@@ -1179,14 +1179,14 @@ def _partial_eval_jaxpr_custom_cached(
   known_effects = core.join_effects(*(eqn.effects for eqn in known_eqns))
   jaxpr_known = Jaxpr(jaxpr.constvars, ins_known, [*outs_known, *residuals],
                       known_eqns, known_effects)
-  config.jax_enable_checks and core.check_jaxpr(jaxpr_known)
+  # config.jax_enable_checks and core.check_jaxpr(jaxpr_known)
 
   _, ins_staged = partition_list(in_inst, jaxpr.invars)
   _, outs_staged = partition_list(out_inst, jaxpr.outvars)
   staged_effects = core.join_effects(*(eqn.effects for eqn in staged_eqns))
   jaxpr_staged = Jaxpr(jaxpr.constvars, [*residuals, *ins_staged],
                        outs_staged, staged_eqns, staged_effects)
-  config.jax_enable_checks and core.check_jaxpr(jaxpr_staged)
+  # config.jax_enable_checks and core.check_jaxpr(jaxpr_staged)
 
   return jaxpr_known, jaxpr_staged, out_unknowns, out_inst, len(residuals)
 

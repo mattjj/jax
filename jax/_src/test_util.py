@@ -60,7 +60,7 @@ flags.DEFINE_string(
 
 flags.DEFINE_integer(
   'jax_num_generated_cases',
-  int(os.getenv('JAX_NUM_GENERATED_CASES', '10')),
+  int(os.getenv('JAX_NUM_GENERATED_CASES', '1000')),
   help='Number of generated cases to test')
 
 flags.DEFINE_integer(

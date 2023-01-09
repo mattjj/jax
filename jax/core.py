@@ -2511,19 +2511,19 @@ def check_jaxpr(jaxpr: Jaxpr):
     except: pass
     return ctx, pp_settings
 
-  try:
-    _check_jaxpr(ctx_factory, jaxpr)
-  except JaxprTypeError as e:
-    ctx, pp_settings = ctx_factory()
-    if len(e.args) == 2:
-      msg, eqnidx = e.args
-      jaxpr_str = str(pp_jaxpr_eqn_range(jaxpr, eqnidx - 10, eqnidx + 10, ctx,
-                                         pp_settings))
-    else:
-      msg, = e.args
-      jaxpr_str = str(pp_jaxpr_eqn_range(jaxpr, 0, 20, ctx, pp_settings))
-    msg = "\n\n".join([msg, "while checking jaxpr:", jaxpr_str])
-    raise JaxprTypeError(msg) from None
+  # try:
+  _check_jaxpr(ctx_factory, jaxpr)
+  # except JaxprTypeError as e:
+  #   ctx, pp_settings = ctx_factory()
+  #   if len(e.args) == 2:
+  #     msg, eqnidx = e.args
+  #     jaxpr_str = str(pp_jaxpr_eqn_range(jaxpr, eqnidx - 10, eqnidx + 10, ctx,
+  #                                        pp_settings))
+  #   else:
+  #     msg, = e.args
+  #     jaxpr_str = str(pp_jaxpr_eqn_range(jaxpr, 0, 20, ctx, pp_settings))
+  #   msg = "\n\n".join([msg, "while checking jaxpr:", jaxpr_str])
+  #   raise JaxprTypeError(msg) from None
 
 def _check_jaxpr(
     ctx_factory: Callable[[], Tuple[JaxprPpContext, JaxprPpSettings]],
@@ -2578,42 +2578,42 @@ def _check_jaxpr(
   # Check each eqn.
   for eqn_idx, eqn in enumerate(jaxpr.eqns):
     prim = eqn.primitive
-    try:
-      in_atoms = map(read, eqn.invars)
-      in_avals = [x.aval for x in in_atoms]  # use in_atoms for dyn shapes
+    # try:
+    in_atoms = map(read, eqn.invars)
+    in_avals = [x.aval for x in in_atoms]  # use in_atoms for dyn shapes
 
-      # Compute the type of the primitive application.
-      if prim in custom_typechecks:
-        out_type, effects = custom_typechecks[prim](*in_atoms, **eqn.params)
-      elif prim.call_primitive:
-        out_type, effects = _check_call(ctx_factory, prim, in_atoms, eqn.params)
-      elif prim.map_primitive:
-        out_type, effects = _check_map(ctx_factory, prim, in_avals, eqn.params)
-      else:
-        out_type, effects = check_eqn(prim, in_avals, eqn.params)
+    # Compute the type of the primitive application.
+    if prim in custom_typechecks:
+      out_type, effects = custom_typechecks[prim](*in_atoms, **eqn.params)
+    elif prim.call_primitive:
+      out_type, effects = _check_call(ctx_factory, prim, in_atoms, eqn.params)
+    elif prim.map_primitive:
+      out_type, effects = _check_map(ctx_factory, prim, in_avals, eqn.params)
+    else:
+      out_type, effects = check_eqn(prim, in_avals, eqn.params)
 
-      # Check the computed effect type matches the eqn's annotation, and is
-      # included in the jaxpr's annotation.
-      if eqn.effects != effects:
-        raise JaxprTypeError("Inferred effects do not match equation effects. "
-                             f"Equation effects: {eqn.effects}. "
-                             f"Jaxpr effects: {effects}")
-      if not eqn.effects.issubset(jaxpr.effects):
-        raise JaxprTypeError("Equation effects are not subset of Jaxpr effects. "
-                             f"Equation effects: {eqn.effects}. "
-                             f"Jaxpr effects: {jaxpr.effects}")
+    # Check the computed effect type matches the eqn's annotation, and is
+    # included in the jaxpr's annotation.
+    if eqn.effects != effects:
+      raise JaxprTypeError("Inferred effects do not match equation effects. "
+                           f"Equation effects: {eqn.effects}. "
+                           f"Jaxpr effects: {effects}")
+    if not eqn.effects.issubset(jaxpr.effects):
+      raise JaxprTypeError("Equation effects are not subset of Jaxpr effects. "
+                           f"Equation effects: {eqn.effects}. "
+                           f"Jaxpr effects: {jaxpr.effects}")
 
-      # Check out_type matches the let-binders' annotation (after substitution).
-      out_type = substitute_vars_in_output_ty(out_type, eqn.invars, eqn.outvars)
-      map(write, eqn.outvars, out_type)
+    # Check out_type matches the let-binders' annotation (after substitution).
+    out_type = substitute_vars_in_output_ty(out_type, eqn.invars, eqn.outvars)
+    map(write, eqn.outvars, out_type)
 
-    except JaxprTypeError as e:
-      ctx, settings = ctx_factory()
-      msg, = e.args
-      src = source_info_util.summarize(eqn.source_info)
-      msg = "\n\n".join([msg, "in equation:", str(pp.nest(2, pp_eqn(eqn, ctx, settings))),
-                         f"from source: {src}"])
-      raise JaxprTypeError(msg, eqn_idx) from None
+    # except JaxprTypeError as e:
+    #   ctx, settings = ctx_factory()
+    #   msg, = e.args
+    #   src = source_info_util.summarize(eqn.source_info)
+    #   msg = "\n\n".join([msg, "in equation:", str(pp.nest(2, pp_eqn(eqn, ctx, settings))),
+    #                      f"from source: {src}"])
+    #   raise JaxprTypeError(msg, eqn_idx) from None
 
   # TODO(mattjj): include output type annotation on jaxpr and check it here
   map(read, jaxpr.outvars)

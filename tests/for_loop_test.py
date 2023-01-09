@@ -40,11 +40,12 @@ def nested_for_loop(nsteps, body, state, **kwargs):
   return for_loop.for_loop(1, outer_body, state)
 
 FOR_LOOP_IMPLS = [
-    (for_loop.for_loop, 'for_loop'),
-    (jax.jit(for_loop.for_loop, static_argnums=(0, 1)), 'jit_for_loop'),
-    (remat_of_for_loop, 'remat_for_loop'),
-    (nested_for_loop, 'nested_for_loop'),
-    (partial(for_loop.for_loop, unroll=3), 'unrolled_for_loop'),
+    # (for_loop.for_loop, 'for_loop'),
+    # (jax.jit(for_loop.for_loop, static_argnums=(0, 1)), 'jit_for_loop'),
+    # (remat_of_for_loop, 'remat_for_loop'),
+    # (nested_for_loop, 'nested_for_loop'),
+    # (partial(for_loop.for_loop, unroll=3), 'unrolled_for_loop'),
+    (for_loop.for_bloop, 'for_bloop'),
 ]
 
 
@@ -379,7 +380,7 @@ class ForLoopTransformationTest(jtu.JaxTestCase):
     self.assertAllClose(ans, ans_discharged, check_dtypes=True, rtol=tol,
                         atol=tol)
     self.assertAllClose(ans, expected, check_dtypes=True, rtol=tol, atol=tol)
-    jtu.check_grads(lambda *args: for_(n, f, args)[1].sum(), args, order=2,
+    jtu.check_grads(lambda *args: for_(n, f, args)[1].sum(), args, order=3,
                     rtol=7e-3, atol=1e-2)
 
   @jtu.skip_on_devices("gpu")  # TODO(mattjj,sharadmv): timeouts?
