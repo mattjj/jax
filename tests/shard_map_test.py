@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import functools
+import os
 import unittest
 
 from absl.testing import absltest
@@ -47,8 +48,28 @@ def create_inputs(a_sharding, b_sharding):
       jax.sharding.NamedSharding(mesh, b_sharding))
   return mesh, m1, m2
 
+# Run all tests with 8 CPU devices.
+def setUpModule():
+  global prev_xla_flags
+  prev_xla_flags = os.getenv("XLA_FLAGS")
+  flags_str = prev_xla_flags or ""
+  # Don't override user-specified device count, or other XLA flags.
+  if "xla_force_host_platform_device_count" not in flags_str:
+    os.environ["XLA_FLAGS"] = (flags_str +
+                               " --xla_force_host_platform_device_count=8")
+  # Clear any cached backends so new CPU backend will pick up the env var.
+  xla_bridge.get_backend.cache_clear()
 
-class ShardMapTest(absltest.TestCase):
+# Reset to previous configuration in case other test modules will be run.
+def tearDownModule():
+  if prev_xla_flags is None:
+    del os.environ["XLA_FLAGS"]
+  else:
+    os.environ["XLA_FLAGS"] = prev_xla_flags
+  xla_bridge.get_backend.cache_clear()
+
+
+class ShardMapTest(jtu.JaxTestCase):
 
   def test_identity(self):
 
@@ -162,9 +183,8 @@ class ShardMapTest(absltest.TestCase):
               a)
       return c
 
-    with mesh:
-      c = fwd(a)
-    self.assertTrue((c[1, :] == a[0, :]).all())
+    c = fwd(a)
+    self.assertAllClose(c[1, :], a[0, :])
 
   def test_all_to_all(self):
 
@@ -187,9 +207,7 @@ class ShardMapTest(absltest.TestCase):
               a)
       return c
 
-    with mesh:
-      c = fwd(a)
-
+    c = fwd(a)
     assert (c == jnp.reshape(a.T, (1, 64))).all()
 
 if __name__ == '__main__':
