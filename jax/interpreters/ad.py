@@ -345,6 +345,40 @@ class JVPTrace(Trace):
                    for p, t in zip(primal_out, tangent_out)]
     return [JVPTracer(self, p, t) for p, t in zip(primal_out, tangent_out)]
 
+  def process_shard_map(self, shard_map_p, f, tracers, mesh, in_names, out_names_thunk):
+    # From jvp(shard_map() to shard_map(jvp()
+    # Need to do accounting for in shardings
+    primals, tangents = unzip2((t.primal, t.tangent) for t in tracers)
+    # Some of the tangents are zero objects
+    # for example in the case of scalars
+    which_nz = [     type(t) is not Zero           for t in tangents]
+    tangents = [t if type(t) is not Zero else None for t in tangents]
+    args, in_tree = tree_flatten((primals, tangents))
+    # This takes the function f which gives us back jvp(f)
+    f_jvp = jvp_subtrace(f, self.main)
+    f_jvp, which_nz_out = nonzero_tangent_outputs(f_jvp)
+
+    tangent_in_names = [ax for ax, nz in zip(in_names, which_nz) if nz]
+    # We don't know the output pytree shape,
+    # but we do the prefix
+    # thunk = no argument lambda, purpose to delay computation
+    @as_hashable_function(closure=out_names_thunk)
+      # Create a new out axes with the tangents ones too
+    def new_out_names_thunk():
+      out_ax = out_names_thunk()
+      return (*out_ax, *(ax for ax, nz in zip(out_ax, which_nz_out()) if nz))
+    params = dict(mesh=mesh, in_names=(*in_names, *tangent_in_names),
+              out_names_thunk=new_out_names_thunk)
+    f_jvp, out_tree = traceable(f_jvp, in_tree)
+    # Now call bind
+    result = shard_map_p.bind(f_jvp, *args, **params)
+    primal_out, tangent_out = tree_unflatten(out_tree(), result)
+    # Recall we filtered the zeros from the tangents before
+    # We go back to having an equal number - in order to be able to zip them up
+    tangent_out = [Zero(get_aval(p).at_least_vspace()) if t is None else t
+                for p, t in zip(primal_out, tangent_out)]
+    return [JVPTracer(self, p, t) for p, t in zip(primal_out, tangent_out)]
+
   def post_process_call(self, call_primitive, out_tracers, params):
     primals, tangents = unzip2((t.primal, t.tangent) for t in out_tracers)
     out, treedef = tree_flatten((primals, tangents))

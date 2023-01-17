@@ -1,0 +1,36 @@
+#!/usr/bin/zsh
+# example usage:
+# $ onmod test.py python2 {}
+# $ onmod . make
+# Can also run intotify remotely:
+# $ onmod myhost:testdir rsync -rt {} .
+# (no trailing slash on the source directory. -t preserves modification times,
+# allowing incremental transfer)
+
+
+fname=$1
+command=$(echo ${@:2} | sed "s|{}|$fname|")
+count=0
+remote=
+if [[ $fname == *:* ]]; then
+    host_fname=(${(s/:/)fname})
+    host=$host_fname[1]
+    fname=$host_fname[2]
+    maybe_remote=(ssh $host)
+fi
+
+run_command () {
+    zsh -c $command
+    # echo '--------------------' $count '--------------------' >&2
+    echo
+    echo '          ================' $count '================          ' >&2
+    echo
+    count=$(($count + 1))
+}
+
+exec {FD}< <($maybe_remote inotifywait -mre close_write $fname 2>&1)
+read line <&$FD # burn first output line
+while read line <&$FD; do
+    while read -t 0 line <&$FD; do; done
+    run_command
+done

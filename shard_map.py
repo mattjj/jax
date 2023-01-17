@@ -429,7 +429,7 @@ if __name__ == '__main__':
   def f(x):
     # return x
     # return 2 * x
-    return jax.lax.mul(2., x)
+    return jax.lax.sin(x)
     # return x.sum(keepdims=True)
 
   mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ('x', 'y'))
@@ -437,87 +437,77 @@ if __name__ == '__main__':
   sharding = jax.sharding.NamedSharding(mesh, P('x', 'y'))
   x = jax.device_put(jnp.arange(8 * 8.).reshape(8, 8), sharding)
 
-  ## test basics: can we run?
 
-  @jax.make_jaxpr
-  def g(x):
-    return shard_map(f, mesh, in_specs=(P('x', 'y'),), out_specs=P('x', 'y'))(x)
-  print(g(x))
+  
 
-  @jax.jit
-  def g(x):
-    return shard_map(f, mesh, in_specs=(P('x', 'y'),), out_specs=P('x', 'y'))(x)
-  print(g(x))
+  # ## test basics: can we run?
 
   def g(x):
     return shard_map(f, mesh, in_specs=(P('x', 'y'),), out_specs=P('x', 'y'))(x)
-  print(g(x))
+  print(jax.jvp(g, [x], [x]))
 
-  ## test guaranteed-repeated checking against out specs
-  def f(x):
-    return jax.lax.psum(x, ('x',))
-  def g(x):
-    return shard_map(f, mesh, in_specs=(P('x', 'y'),), out_specs=P(None, 'y'))(x)
-  print(g(x))  # no error
-  g = jax.jit(g)
-  print(g(x))  # no error
+  from jax._src.test_util import check_grads
 
-  def f(x):
-    return jax.lax.mul(x, 2.)
-  def g(x):
-    return shard_map(f, mesh, in_specs=(P('x', 'y'),), out_specs=P(None, 'y'))(x)
-  try:
-    g(x)
-  except:
-    print('good error!')
-  else:
-    raise Exception
-  g = jax.jit(g)
-  try:
-    with jax.enable_checks():
-      g(x)
-  except:
-    print('good error!')
-  else:
-    raise Exception
+  check_grads(g, [x], 2, ['fwd'])
 
-  ## test eager control flow
+  # @jax.jit
+  # def g(x):
+  #   return shard_map(f, mesh, in_specs=(P('x', 'y'),), out_specs=P('x', 'y'))(x)
+  # print(g(x))
 
-  x = jnp.arange(2 * 2.).reshape(2, 2)
-
-  def f(x):
-    y = jax.lax.psum(x, ('x', 'y'))
-    # if y > 0:
-    if jax.lax.gt(y, 0.):
-      return x
-    else:
-      return -x
-
-  def g(x):
-    return shard_map(f, mesh, in_specs=(P('x', 'y'),), out_specs=P('x', 'y'))(x)
-
-  print(g(x))
+  # def g(x):
+  #   return shard_map(f, mesh, in_specs=(P('x', 'y'),), out_specs=P('x', 'y'))(x)
+  # print(g(x))
 
 
-  ## test outer jit detects shard_map's mesh
-  x = jnp.array(2.0)
-  f = shard_map(lambda x: x.reshape(1, *x.shape), mesh, P(), P('x'))
-  y = jax.jit(f)(x)  # doesnt work
-  print(y)
+  # ## test replication checking against out specs (eager)
+  # def f(x):
+  #   return jax.lax.psum(x, ('x',))
+  # def g(x):
+  #   return shard_map(f, mesh, in_specs=(P('x', 'y'),), out_specs=P(None, 'y'))(x)
+  # try:
+  #   print(g(x))
+  # except:
+  #   print('good error!')
 
 
-  ## vmap
+  # ## test eager conrtrol flow
 
-  x = jax.device_put(jnp.arange(8 * 8.).reshape(8, 8), sharding)
+  # x = jnp.arange(2 * 2.).reshape(2, 2)
 
-  def f(x):
-    return jax.lax.mul(2., x)
+  # def f(x):
+  #   y = jax.lax.psum(x, ('x', 'y'))
+  #   # if y > 0:
+  #   if jax.lax.gt(y, 0.):
+  #     return x
+  #   else:
+  #     return -x
 
-  def g(x):
-    return shard_map(f, mesh, in_specs=(P('y'),), out_specs=P('y'))(x)
-  y = jax.vmap(g, axis_name='x')(x)
-  print(y)
+  # def g(x):
+  #   return shard_map(f, mesh, in_specs=(P('x', 'y'),), out_specs=P('x', 'y'))(x)
 
-  # y = jax.vmap(g, spmd_axis_name='x')(x)
+  # print(g(x))
+
+
+  # ## test outer jit detects shard_map's mesh
+  # x = jnp.array(2.0)
+  # f = shard_map(lambda x: x.reshape(1, *x.shape), mesh, P(), P('x'))
+  # y = jax.jit(f)(x)  # doesnt work
   # print(y)
+
+
+  # ## vmap
+
+  # x = jax.device_put(jnp.arange(8 * 8.).reshape(8, 8), sharding)
+
+  # def f(x):
+  #   return jax.lax.mul(2., x)
+
+  # def g(x):
+  #   return shard_map(f, mesh, in_specs=(P('y'),), out_specs=P('y'))(x)
+  # y = jax.vmap(g, axis_name='x')(x)
+  # print(y)
+
+  # # y = jax.vmap(g, spmd_axis_name='x')(x)
+  # # print(y)
 
