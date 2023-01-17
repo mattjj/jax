@@ -35,11 +35,13 @@ zip, unsafe_zip = util.safe_zip, zip
 # TODO [x] tree prefix handling
 # TODO [x] ShardMapTrace.process_call
 # TODO [x] adapt eager mode to use subset of mesh names (to check replication)
-# TODO [ ] refine eager-shmap-of-jit checking when (p)jit is initial-style
-# TODO [ ] better error if output rank doesn't match out spec for concatenation
+# TODO [ ] vmap rule
 # TODO [ ] static checker for replication checks (in typecheck rule)
 # TODO [ ] custom_jvp / custom_vjp handling
+# TODO [ ] try to implement pmap in terms of shard_map
+# TODO [ ] better error if output rank doesn't match out spec for concatenation
 # TODO [ ] name stack
+# TODO [ ] refine eager-shmap-of-jit checking when (p)jit is initial-style
 
 
 # API
@@ -91,7 +93,7 @@ class ShardMapPrimitive(core.Primitive):
         fun, top_trace and top_trace.level, mesh)
     tracers = map(top_trace.full_raise, args)
     outs = top_trace.process_shard_map(  # pytype: disable=attribute-error
-        fun, tracers, mesh=mesh, in_names=in_names,
+        shard_map_p, fun, tracers, mesh=mesh, in_names=in_names,
         out_names_thunk=out_names_thunk)
     return map(core.full_lower, core.apply_todos(env_trace_todo(), outs))
 
@@ -106,7 +108,7 @@ def process_env_traces(fun, top_trace, mesh):
 # Staging
 
 def _shard_map_staging(
-    trace: pe.DynamicJaxprTrace, fun: lu.WrappedFun,
+    trace: pe.DynamicJaxprTrace, prim: core.Primitive, fun: lu.WrappedFun,
     in_tracers: Sequence[pe.DynamicJaxprTracer], *, mesh: Mesh,
     in_names: Tuple[AxisNames],
     out_names_thunk: Callable[[], Tuple[AxisNames, ...]]
@@ -127,8 +129,8 @@ def _shard_map_staging(
     jaxpr = pe.convert_constvars_jaxpr(jaxpr)
   params = dict(mesh=mesh, in_names=in_names, out_names=out_names_thunk(),
                 jaxpr=jaxpr)
-  eqn = pe.new_jaxpr_eqn([*constvars, *invars], outvars, shard_map_p,
-                         params, jaxpr.effects, source_info)
+  eqn = pe.new_jaxpr_eqn([*constvars, *invars], outvars, prim, params,
+                         jaxpr.effects, source_info)
   trace.frame.add_eqn(eqn)
   return out_tracers
 pe.DynamicJaxprTrace.process_shard_map = _shard_map_staging
@@ -198,7 +200,8 @@ def _xla_unshard(mesh, names, aval_in, aval_out, xs):
 
 # Eager evaluation
 
-def _shard_map_impl(trace, fun, args, *, mesh, in_names, out_names_thunk):
+def _shard_map_impl(trace, prim, fun, args, *, mesh, in_names, out_names_thunk):
+  del prim
   args = map(partial(_device_put_from_names, mesh), in_names, args)
   args = map(partial(_unmatch_spec, mesh), in_names, args)
   in_repl = [set(mesh.axis_names) - set(n for ns in names.values() for n in ns)
