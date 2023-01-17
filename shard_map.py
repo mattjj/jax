@@ -22,6 +22,8 @@ from jax.interpreters import mlir
 from jax.interpreters import partial_eval as pe
 from jax.interpreters import xla
 from jax.interpreters import pxla
+from jax.interpreters import ad
+from jax.interpreters import partial_eval
 from jax.interpreters.pxla import Mesh
 from jax.tree_util import tree_flatten
 from jax.tree_util import tree_map
@@ -414,6 +416,69 @@ def _shard_map_batch(
   return map(make_tracer, out_vals, out_dims())
 batching.BatchTrace.process_shard_map = _shard_map_batch
 
+def shard_map_jvp(self, shard_map_p, f, tracers, mesh, in_names, out_names_thunk):
+  # From jvp(shard_map() to shard_map(jvp()
+  # Need to do accounting for in shardings
+  primals, tangents = unzip2((t.primal, t.tangent) for t in tracers)
+  # Some of the tangents are zero objects
+  # for example in the case of scalars
+  which_nz = [     type(t) is not ad.Zero           for t in tangents]
+  tangents = [t if type(t) is not ad.Zero else None for t in tangents]
+  args, in_tree = tree_flatten((primals, tangents))
+  # This takes the function f which gives us back jvp(f)
+  f_jvp = ad.jvp_subtrace(f, self.main)
+  f_jvp, which_nz_out = ad.nonzero_tangent_outputs(f_jvp)
+
+  tangent_in_names = [ax for ax, nz in zip(in_names, which_nz) if nz]
+  # We don't know the output pytree shape,
+  # but we do the prefix
+  # thunk = no argument lambda, purpose to delay computation
+  @as_hashable_function(closure=out_names_thunk)
+    # Create a new out axes with the tangents ones too
+  def new_out_names_thunk():
+    out_ax = out_names_thunk()
+    return (*out_ax, *(ax for ax, nz in zip(out_ax, which_nz_out()) if nz))
+  params = dict(mesh=mesh, in_names=(*in_names, *tangent_in_names),
+            out_names_thunk=new_out_names_thunk)
+  f_jvp, out_tree = ad.traceable(f_jvp, in_tree)
+  # Now call bind
+  result = shard_map_p.bind(f_jvp, *args, **params)
+  primal_out, tangent_out = tree_unflatten(out_tree(), result)
+  # Recall we filtered the zeros from the tangents before
+  # We go back to having an equal number - in order to be able to zip them up
+  tangent_out = [ad.Zero(ad.get_aval(p).at_least_vspace()) if t is None else t
+              for p, t in zip(primal_out, tangent_out)]
+  return [ad.JVPTracer(self, p, t) for p, t in zip(primal_out, tangent_out)]
+ad.JVPTrace.process_shard_map = shard_map_jvp
+
+
+def shard_map_partial_eval(self, shard_map_p, f, tracers, mesh, in_names, out_names_thunk):
+  # We want to turn partial eval of shardmap into known and unknown parts
+  # Basic problem of partial eval is here is a fn, and _some_ of it's inputs
+  # Known: We know them!
+  # Given we know some, compute as much as you can now, and give me the outputs
+  # + intermediates
+  # AND, give me a function which will take the unknown inputs we don't know yet, 
+  # and with the intermediates, turn that into the final outputs
+
+  # in_avals: avals for unknown stuff, in_consts: values for known stuff
+  # in_knowns: list of booleans of length = arg list, tells us which 
+  # are known and unknown
+  in_knowns, unk_in_avals, in_consts = pe.partition_pvals([t.pval for t in tracers])
+
+  # const: known. Splits list into the two sets
+  unk_in_names, const_in_names = pe.partition_list(in_knowns, in_names)
+
+  # Now need to run the known stuff, and make a jaxpr for the unknown stuff
+  # for a mapped primitive. In shard_map, this means dividing an axis - in
+  # more tradiitional maps, this means deleting an axis. 
+  unk_in_avals_ = map(partial(_shard_aval, mesh), unk_in_names, unk_in_avals)
+
+  breakpoint()
+
+partial_eval.JaxprTrace.process_shard_map = shard_map_partial_eval
+
+
 
 # Crappy in-line tests, to be deleted.
 
@@ -449,6 +514,8 @@ if __name__ == '__main__':
   from jax._src.test_util import check_grads
 
   check_grads(g, [x], 2, ['fwd'])
+
+  jax.linearize(g, x)
 
   # @jax.jit
   # def g(x):
