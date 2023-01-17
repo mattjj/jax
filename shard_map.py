@@ -11,11 +11,13 @@ from jax import util
 from jax._src import dispatch
 from jax._src import pjit
 from jax._src import source_info_util
-from jax._src.util import prod, HashableFunction, unzip2, unzip3
+from jax._src.util import (prod, HashableFunction, unzip2, unzip3,
+                           as_hashable_function)
 from jax._src.sharding import NamedSharding, PartitionSpec
 from jax._src.lax import parallel as lax_parallel
 from jax.api_util import flatten_fun_nokwargs
 from jax.experimental import maps
+from jax.interpreters import batching
 from jax.interpreters import mlir
 from jax.interpreters import partial_eval as pe
 from jax.interpreters import xla
@@ -345,7 +347,39 @@ def _psum_rule(*in_repl, axes, axis_index_groups):
   return [r | set(axes) for r in in_repl]
 
 
+# Batching
+
+def _shard_map_batch(
+    trace: batching.BatchTrace, prim: core.Primitive, fun: lu.WrappedFun,
+    in_tracers: Sequence[batching.BatchTracer], mesh: Mesh,
+    in_names: Tuple[AxisNames],
+    out_names_thunk: Callable[[], Tuple[AxisNames, ...]]
+  ) -> Sequence[batching.BatchTracer]:
+  in_vals, in_dims = unzip2((t.val, t.batch_dim) for t in in_tracers)
+  if all(bdim is batching.not_mapped for bdim in in_dims):
+    return prim.bind(fun, *in_vals, mesh=mesh, in_names=in_names,
+                     out_names_thunk=out_names_thunk)
+  if trace.spmd_axis_name is not None:
+    raise NotImplementedError  # TODO add named axis to specs
+  fun, out_dims = batching.batch_subtrace(fun, trace.main, tuple(in_dims))
+  new_in_names = [{ax + (d is not batching.not_mapped and ax <= d): names[ax]
+                   for ax in names} for names, d in zip(in_names, in_dims)]
+  @as_hashable_function(closure=out_names_thunk)
+  def new_out_names_thunk():
+    out_names = out_names_thunk()
+    return [{ax + (d is not batching.not_mapped and ax <= d): names[ax]
+             for ax in names} for names, d in zip(out_names, out_dims())]
+  new_params = dict(mesh=mesh, in_names=new_in_names,
+                    out_names_thunk=new_out_names_thunk)
+  out_vals = prim.bind(fun, *in_vals, **new_params)
+  make_tracer = partial(batching.BatchTracer, trace,
+                        source_info=source_info_util.current())
+  return map(make_tracer, out_vals, out_dims())
+batching.BatchTrace.process_shard_map = _shard_map_batch
+
+
 # Crappy in-line tests, to be deleted.
+
 if __name__ == '__main__':
   import os
   import jax
@@ -357,29 +391,29 @@ if __name__ == '__main__':
 
   def f(x):
     # return x
-    return 2 * x
+    # return 2 * x
+    return jax.lax.mul(2., x)
     # return x.sum(keepdims=True)
 
   mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ('x', 'y'))
-  pspec = P('x', 'y')
 
-  sharding = jax.sharding.NamedSharding(mesh, pspec)
+  sharding = jax.sharding.NamedSharding(mesh, P('x', 'y'))
   x = jax.device_put(jnp.arange(8 * 8.).reshape(8, 8), sharding)
 
-  ## test basics: can we run?
+  # ## test basics: can we run?
 
   @jax.make_jaxpr
   def g(x):
-    return shard_map(f, mesh, in_specs=(pspec,), out_specs=pspec)(x)
+    return shard_map(f, mesh, in_specs=(P('x', 'y'),), out_specs=P('x', 'y'))(x)
   print(g(x))
 
   @jax.jit
   def g(x):
-    return shard_map(f, mesh, in_specs=(pspec,), out_specs=pspec)(x)
+    return shard_map(f, mesh, in_specs=(P('x', 'y'),), out_specs=P('x', 'y'))(x)
   print(g(x))
 
   def g(x):
-    return shard_map(f, mesh, in_specs=(pspec,), out_specs=pspec)(x)
+    return shard_map(f, mesh, in_specs=(P('x', 'y'),), out_specs=P('x', 'y'))(x)
   print(g(x))
 
 
@@ -417,4 +451,20 @@ if __name__ == '__main__':
   f = shard_map(lambda x: x.reshape(1, *x.shape), mesh, P(), P('x'))
   y = jax.jit(f)(x)  # doesnt work
   print(y)
+
+
+  ## vmap
+
+  x = jax.device_put(jnp.arange(8 * 8.).reshape(8, 8), sharding)
+
+  def f(x):
+    return jax.lax.mul(2., x)
+
+  def g(x):
+    return shard_map(f, mesh, in_specs=(P('y'),), out_specs=P('y'))(x)
+  y = jax.vmap(g, axis_name='x')(x)
+  print(y)
+
+  # y = jax.vmap(g, spmd_axis_name='x')(x)
+  # print(y)
 
