@@ -1,7 +1,7 @@
 from functools import partial, lru_cache
 
 from typing import (Any, Callable, Optional, Tuple, List, Set, Sequence, Dict,
-                    Hashable, Union)
+                    Hashable, Union, Protocol)
 
 import jax
 from jax import core
@@ -352,8 +352,12 @@ def _prim_applier(prim, params_tup, mesh):
     return tree_map(_add_singleton, outs)
   return apply
 
+class RepRule(Protocol):
+  def __call__(self, Mesh, *in_rep: Set[AxisName], **params: Any
+               ) -> Set[AxisName]:
+    ...
 
-_rep_rules = {}
+_rep_rules: Dict[core.Primitive, RepRule] = {}
 register_rule = lambda prim: lambda rule: _rep_rules.setdefault(prim, rule)
 
 def _default_rep_rule(_, *in_rep, **__):
