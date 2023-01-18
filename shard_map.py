@@ -36,19 +36,11 @@ P = PartitionSpec
 map, unsafe_map = util.safe_map, map
 zip, unsafe_zip = util.safe_zip, zip
 
-# TODO [x] tree prefix handling
-# TODO [x] ShardMapTrace.process_call
-# TODO [x] adapt eager mode to use subset of mesh names (to check repeats)
-# TODO [x] vmap rule
-# TODO [x] static checker for repeatedness (in typecheck rule)
-#        [ ] HOP checker rules (at least jit!)
 # TODO [ ] jvp, partial eval, and transpose w/ sholto@
 # TODO [ ] try to implement pmap in terms of shard_map
 # TODO [ ] custom_jvp / custom_vjp handling
 # TODO [ ] better error if output rank doesn't match out spec for concatenation
 # TODO [ ] name stack
-# TODO [ ] refine eager-shmap-of-jit checking when (p)jit is initial-style
-
 
 # API
 
@@ -81,7 +73,6 @@ def _canonicalize_spec(spec: PartitionSpec) -> AxisNames:
   else:
     return spec
 
-
 # Primitive
 
 JaxType = Any
@@ -109,7 +100,6 @@ shard_map_p = ShardMapPrimitive('shard_map')
 
 def process_env_traces(fun, top_trace, mesh):
   return fun, lambda: []  # TODO needed for closing over tracers
-
 
 # Staging
 
@@ -157,7 +147,6 @@ def _unshard_aval(mesh: Mesh, names: AxisNames, aval: core.AbstractValue
   else:
     raise NotImplementedError  # TODO add table with handlers
 
-
 # Type-checking
 
 def _shard_map_typecheck(*in_atoms, jaxpr, mesh, in_names, out_names):
@@ -203,7 +192,6 @@ def _valid_repeats(rep: Set[AxisName], dst: AxisNames) -> bool:
   unmentioned = set(mesh.axis_names) - {n for ns in dst.values() for n in ns}
   return unmentioned.issubset(rep)
 
-
 # Lowering
 
 def _shard_map_lowering(ctx, *in_nodes, jaxpr, mesh, in_names, out_names):
@@ -239,7 +227,6 @@ def _xla_unshard(mesh, names, aval_in, aval_out, xs):
   sharding_proto = pxla.mesh_sharding_specs(mesh.shape, mesh.axis_names)(
       aval_out, axes).sharding_proto()
   return mlir.wrap_with_shard_to_full_op(result_type, sx, sharding_proto, set())
-
 
 # Eager evaluation
 
@@ -364,16 +351,6 @@ def _prim_applier(prim, params_tup, mesh):
     return tree_map(_add_singleton, outs)
   return apply
 
-# Rep rules are for tracking when values are guaranteed to be equal across
-# mapped instances, ultimately used for checking when it's safe to omit an axis
-# name in an out_spec. Without the safety check, we wouldn't need names tracked.
-# Some collectives have outputs equal across all instances along some mesh axes
-# (psum and other reducers, all_gather) while others are sure to introduce
-# divergences (axis_index). The default is to intersect the arguments'
-# sets of names along which inputs are repeated (i.e. output only repeated along
-# an axis if all inputs are repeated along that axis). We need rules for
-# collectives and HOPs.
-
 def _rep_rule(prim, *in_rep, **params):
   return set.intersection(*in_rep)
 
@@ -384,7 +361,6 @@ register_rule = lambda prim: lambda rule: _rep_rules.setdefault(prim, rule)
 def _psum_rule(*in_rep, axes, axis_index_groups):
   if axis_index_groups is not None: raise NotImplementedError
   return [r | set(axes) for r in in_rep]
-
 
 # Batching
 
@@ -416,69 +392,39 @@ def _shard_map_batch(
   return map(make_tracer, out_vals, out_dims())
 batching.BatchTrace.process_shard_map = _shard_map_batch
 
-def shard_map_jvp(self, shard_map_p, f, tracers, mesh, in_names, out_names_thunk):
-  # From jvp(shard_map() to shard_map(jvp()
-  # Need to do accounting for in shardings
+# Autodiff
+
+def _shard_map_jvp(self, shard_map_p, f, tracers, mesh, in_names,
+                   out_names_thunk):
   primals, tangents = unzip2((t.primal, t.tangent) for t in tracers)
-  # Some of the tangents are zero objects
-  # for example in the case of scalars
   which_nz = [     type(t) is not ad.Zero           for t in tangents]
   tangents = [t if type(t) is not ad.Zero else None for t in tangents]
   args, in_tree = tree_flatten((primals, tangents))
-  # This takes the function f which gives us back jvp(f)
   f_jvp = ad.jvp_subtrace(f, self.main)
   f_jvp, which_nz_out = ad.nonzero_tangent_outputs(f_jvp)
-
   tangent_in_names = [ax for ax, nz in zip(in_names, which_nz) if nz]
-  # We don't know the output pytree shape,
-  # but we do the prefix
-  # thunk = no argument lambda, purpose to delay computation
   @as_hashable_function(closure=out_names_thunk)
-    # Create a new out axes with the tangents ones too
   def new_out_names_thunk():
     out_ax = out_names_thunk()
     return (*out_ax, *(ax for ax, nz in zip(out_ax, which_nz_out()) if nz))
   params = dict(mesh=mesh, in_names=(*in_names, *tangent_in_names),
             out_names_thunk=new_out_names_thunk)
   f_jvp, out_tree = ad.traceable(f_jvp, in_tree)
-  # Now call bind
   result = shard_map_p.bind(f_jvp, *args, **params)
   primal_out, tangent_out = tree_unflatten(out_tree(), result)
-  # Recall we filtered the zeros from the tangents before
-  # We go back to having an equal number - in order to be able to zip them up
   tangent_out = [ad.Zero(ad.get_aval(p).at_least_vspace()) if t is None else t
               for p, t in zip(primal_out, tangent_out)]
   return [ad.JVPTracer(self, p, t) for p, t in zip(primal_out, tangent_out)]
-ad.JVPTrace.process_shard_map = shard_map_jvp
+ad.JVPTrace.process_shard_map = _shard_map_jvp
 
-
-def shard_map_partial_eval(self, shard_map_p, f, tracers, mesh, in_names, out_names_thunk):
-  # We want to turn partial eval of shardmap into known and unknown parts
-  # Basic problem of partial eval is here is a fn, and _some_ of it's inputs
-  # Known: We know them!
-  # Given we know some, compute as much as you can now, and give me the outputs
-  # + intermediates
-  # AND, give me a function which will take the unknown inputs we don't know yet, 
-  # and with the intermediates, turn that into the final outputs
-
-  # in_avals: avals for unknown stuff, in_consts: values for known stuff
-  # in_knowns: list of booleans of length = arg list, tells us which 
-  # are known and unknown
-  in_knowns, unk_in_avals, in_consts = pe.partition_pvals([t.pval for t in tracers])
-
-  # const: known. Splits list into the two sets
+def _shard_map_partial_eval(self, shard_map_p, f, tracers, mesh, in_names,
+                            out_names_thunk):
+  in_pvals = [t.pval for t in tracers]
+  in_knowns, unk_in_avals, in_consts = pe.partition_pvals(in_pvals)
   unk_in_names, const_in_names = pe.partition_list(in_knowns, in_names)
-
-  # Now need to run the known stuff, and make a jaxpr for the unknown stuff
-  # for a mapped primitive. In shard_map, this means dividing an axis - in
-  # more tradiitional maps, this means deleting an axis. 
   unk_in_avals_ = map(partial(_shard_aval, mesh), unk_in_names, unk_in_avals)
-
   breakpoint()
-
-partial_eval.JaxprTrace.process_shard_map = shard_map_partial_eval
-
-
+partial_eval.JaxprTrace.process_shard_map = _shard_map_partial_eval
 
 # Crappy in-line tests, to be deleted.
 
@@ -502,8 +448,6 @@ if __name__ == '__main__':
   sharding = jax.sharding.NamedSharding(mesh, P('x', 'y'))
   x = jax.device_put(jnp.arange(8 * 8.).reshape(8, 8), sharding)
 
-
-  
 
   # ## test basics: can we run?
 
