@@ -23,7 +23,6 @@ from jax.interpreters import partial_eval as pe
 from jax.interpreters import xla
 from jax.interpreters import pxla
 from jax.interpreters import ad
-from jax.interpreters import partial_eval
 from jax.interpreters.pxla import Mesh
 from jax.tree_util import tree_flatten
 from jax.tree_util import tree_map
@@ -157,7 +156,7 @@ def _shard_map_typecheck(*in_atoms, jaxpr, mesh, in_names, out_names):
   in_rep = map(partial(_in_names_to_rep, mesh), in_names)
   out_rep = _output_rep(mesh, jaxpr, in_rep)
   for rep, dst in zip(out_rep, out_names):
-    if not _valid_repeats(rep, dst): raise core.JaxprTypeError()
+    if not _valid_repeats(mesh, rep, dst): raise core.JaxprTypeError()
   out_avals_sharded = [x.aval for x in jaxpr.outvars]
   out_avals = map(partial(_unshard_aval, mesh), out_names, out_avals_sharded)
   return out_avals, jaxpr.effects
@@ -168,19 +167,20 @@ def _in_names_to_rep(mesh: Mesh, names: AxisNames) -> Set[AxisName]:
 
 def _output_rep(mesh: Mesh, jaxpr: core.Jaxpr, in_rep: Sequence[Set[AxisName]],
                 ) -> Sequence[Set[AxisName]]:
+  mesh_names = set(mesh.axis_names)
   env: Dict[core.Var, Set[AxisName]] = {}
 
   def read(x: core.Atom) -> Set[AxisName]:
-    return env[x] if type(x) is core.Var else set(mesh.axis_names)
+    return env[x] if type(x) is core.Var else mesh_names
 
   def write(v: core.Var, val: Set[AxisName]) -> None:
     env[v] = val
 
-  map(write, jaxpr.constvars, [set(mesh.axis_names)] * len(jaxpr.constvars))
+  map(write, jaxpr.constvars, [mesh_names] * len(jaxpr.constvars))
   map(write, jaxpr.invars, in_rep)
   for e in jaxpr.eqns:
-    rule = _rep_rules.get(e.primitive, partial(_rep_rule, e.primitive))
-    out_rep = rule(*map(read, e.invars), **e.params)
+    rule = _rep_rules.get(e.primitive, _default_rep_rule)
+    out_rep = rule(mesh_names, *map(read, e.invars), **e.params)
     if e.primitive.multiple_results:
       out_rep = [out_rep] * len(e.outvars) if type(out_rep) is set else out_rep
       map(write, e.outvars, out_rep)
@@ -188,7 +188,7 @@ def _output_rep(mesh: Mesh, jaxpr: core.Jaxpr, in_rep: Sequence[Set[AxisName]],
       write(e.outvars[0], out_rep)
   return map(read, jaxpr.outvars)
 
-def _valid_repeats(rep: Set[AxisName], dst: AxisNames) -> bool:
+def _valid_repeats(mesh: Mesh, rep: Set[AxisName], dst: AxisNames) -> bool:
   unmentioned = set(mesh.axis_names) - {n for ns in dst.values() for n in ns}
   return unmentioned.issubset(rep)
 
@@ -266,7 +266,7 @@ def _get_unmatcher(mesh, src_tup):
 
 def _match_spec(mesh: Mesh, rep: Set[AxisName], dst: AxisNames, x: JaxType
                 ) -> JaxType:
-  if not _valid_repeats(rep, dst):
+  if not _valid_repeats(mesh, rep, dst):
     raise Exception  # TODO add parameter to opt out of check
   return jax.jit(_get_matcher(mesh, tuple(dst.items())))(x)
 
@@ -298,7 +298,8 @@ class ShardMapTrace(core.Trace):
     f = _primitive_applier(prim, params, self.mesh)
     with core.eval_context(), jax.disable_jit(False):
       out_vals = jax.jit(f)(*in_vals)
-    out_rep = _rep_rules.get(prim, partial(_rep_rule, prim))(*in_rep, **params)
+    rule = _rep_rules.get(prim, _default_rep_rule)
+    out_rep = rule(self.mesh, *in_rep, **params)
     if prim.multiple_results:
       out_rep = [out_rep] * len(out_vals) if type(out_rep) is set else out_rep
       return map(partial(ShardMapTracer, self), out_rep, out_vals)
@@ -351,16 +352,23 @@ def _prim_applier(prim, params_tup, mesh):
     return tree_map(_add_singleton, outs)
   return apply
 
-def _rep_rule(prim, *in_rep, **params):
-  return set.intersection(*in_rep)
 
 _rep_rules = {}
 register_rule = lambda prim: lambda rule: _rep_rules.setdefault(prim, rule)
 
+def _default_rep_rule(_, *in_rep, **__):
+  return set.intersection(*in_rep)
+
 @register_rule(lax_parallel.psum_p)
-def _psum_rule(*in_rep, axes, axis_index_groups):
+def _psum_rule(_, *in_rep, axes, axis_index_groups):
   if axis_index_groups is not None: raise NotImplementedError
   return [r | set(axes) for r in in_rep]
+
+@register_rule(lax_parallel.axis_index_p)
+def _axis_index_rule(mesh, *, axis_name):
+  if not isinstance(axis_index, tuple):
+    axis_index = axis_index,
+  return set(mesh.axis_names) - set(axis_index)
 
 # Batching
 
@@ -424,7 +432,7 @@ def _shard_map_partial_eval(self, shard_map_p, f, tracers, mesh, in_names,
   unk_in_names, const_in_names = pe.partition_list(in_knowns, in_names)
   unk_in_avals_ = map(partial(_shard_aval, mesh), unk_in_names, unk_in_avals)
   breakpoint()
-partial_eval.JaxprTrace.process_shard_map = _shard_map_partial_eval
+pe.JaxprTrace.process_shard_map = _shard_map_partial_eval
 
 # Crappy in-line tests, to be deleted.
 
@@ -435,7 +443,6 @@ if __name__ == '__main__':
 
   jax.config.update('jax_platform_name', 'cpu')
   os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=32"
-
 
   def f(x):
     # return x
@@ -448,77 +455,73 @@ if __name__ == '__main__':
   sharding = jax.sharding.NamedSharding(mesh, P('x', 'y'))
   x = jax.device_put(jnp.arange(8 * 8.).reshape(8, 8), sharding)
 
+  ## test basics: can we run?
 
-  # ## test basics: can we run?
+  @jax.jit
+  def g(x):
+    return shard_map(f, mesh, in_specs=(P('x', 'y'),), out_specs=P('x', 'y'))(x)
+  print(g(x))
 
+  def g(x):
+    return shard_map(f, mesh, in_specs=(P('x', 'y'),), out_specs=P('x', 'y'))(x)
+  print(g(x))
+
+  ## test replication checking against out specs (eager)
+  def f(x):
+    return jax.lax.psum(x, ('x',))
+  def g(x):
+    return shard_map(f, mesh, in_specs=(P('x', 'y'),), out_specs=P(None, 'y'))(x)
+  try:
+    print(g(x))
+  except:
+    print('good error!')
+
+  ## test eager conrtrol flow
+
+  x = jnp.arange(2 * 2.).reshape(2, 2)
+
+  def f(x):
+    y = jax.lax.psum(x, ('x', 'y'))
+    # if y > 0:
+    if jax.lax.gt(y, 0.):
+      return x
+    else:
+      return -x
+
+  def g(x):
+    return shard_map(f, mesh, in_specs=(P('x', 'y'),), out_specs=P('x', 'y'))(x)
+
+  print(g(x))
+
+  ## test outer jit detects shard_map's mesh
+  x = jnp.array(2.0)
+  f = shard_map(lambda x: x.reshape(1, *x.shape), mesh, P(), P('x'))
+  y = jax.jit(f)(x)  # doesnt work
+  print(y)
+
+  ## vmap
+
+  x = jax.device_put(jnp.arange(8 * 8.).reshape(8, 8), sharding)
+
+  def f(x):
+    return jax.lax.mul(2., x)
+
+  def g(x):
+    return shard_map(f, mesh, in_specs=(P('y'),), out_specs=P('y'))(x)
+  y = jax.vmap(g, axis_name='x')(x)
+  print(y)
+
+  # y = jax.vmap(g, spmd_axis_name='x')(x)
+  # print(y)
+
+  # ## jvp
   def g(x):
     return shard_map(f, mesh, in_specs=(P('x', 'y'),), out_specs=P('x', 'y'))(x)
   print(jax.jvp(g, [x], [x]))
 
   from jax._src.test_util import check_grads
-
   check_grads(g, [x], 2, ['fwd'])
 
-  jax.linearize(g, x)
-
-  # @jax.jit
-  # def g(x):
-  #   return shard_map(f, mesh, in_specs=(P('x', 'y'),), out_specs=P('x', 'y'))(x)
-  # print(g(x))
-
-  # def g(x):
-  #   return shard_map(f, mesh, in_specs=(P('x', 'y'),), out_specs=P('x', 'y'))(x)
-  # print(g(x))
-
-
-  # ## test replication checking against out specs (eager)
-  # def f(x):
-  #   return jax.lax.psum(x, ('x',))
-  # def g(x):
-  #   return shard_map(f, mesh, in_specs=(P('x', 'y'),), out_specs=P(None, 'y'))(x)
-  # try:
-  #   print(g(x))
-  # except:
-  #   print('good error!')
-
-
-  # ## test eager conrtrol flow
-
-  # x = jnp.arange(2 * 2.).reshape(2, 2)
-
-  # def f(x):
-  #   y = jax.lax.psum(x, ('x', 'y'))
-  #   # if y > 0:
-  #   if jax.lax.gt(y, 0.):
-  #     return x
-  #   else:
-  #     return -x
-
-  # def g(x):
-  #   return shard_map(f, mesh, in_specs=(P('x', 'y'),), out_specs=P('x', 'y'))(x)
-
-  # print(g(x))
-
-
-  # ## test outer jit detects shard_map's mesh
-  # x = jnp.array(2.0)
-  # f = shard_map(lambda x: x.reshape(1, *x.shape), mesh, P(), P('x'))
-  # y = jax.jit(f)(x)  # doesnt work
-  # print(y)
-
-
-  # ## vmap
-
-  # x = jax.device_put(jnp.arange(8 * 8.).reshape(8, 8), sharding)
-
-  # def f(x):
-  #   return jax.lax.mul(2., x)
-
-  # def g(x):
-  #   return shard_map(f, mesh, in_specs=(P('y'),), out_specs=P('y'))(x)
-  # y = jax.vmap(g, axis_name='x')(x)
-  # print(y)
-
-  # # y = jax.vmap(g, spmd_axis_name='x')(x)
-  # # print(y)
+  # ## linearize
+  # jax.linearize(g, x)
 
