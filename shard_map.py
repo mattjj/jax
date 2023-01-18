@@ -119,11 +119,10 @@ def _shard_map_staging(
   invars = map(trace.getvar, in_tracers)
   constvars = map(trace.getvar, map(trace.instantiate_const, consts))
   outvars = map(trace.makevar, out_tracers)
-  in_names= ({},) * len(consts) + tuple(in_names)
   with core.extend_axis_env_nd(mesh.shape.items()):
     jaxpr = pe.convert_constvars_jaxpr(jaxpr)
-  params = dict(mesh=mesh, in_names=in_names, out_names=out_names_thunk(),
-                jaxpr=jaxpr)
+  params = dict(mesh=mesh, in_names=({},) * len(consts) + tuple(in_names),
+                out_names=out_names_thunk(), jaxpr=jaxpr)
   eqn = pe.new_jaxpr_eqn([*constvars, *invars], outvars, prim, params,
                          jaxpr.effects, source_info)
   trace.frame.add_eqn(eqn)
