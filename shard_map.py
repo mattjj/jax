@@ -41,11 +41,13 @@ zip, unsafe_zip = util.safe_zip, zip
 #        [x] partial eval
 #        [ ] transpose
 # TODO [x] better eager repr
+# TODO [ ] more rep rules
 # TODO [ ] try nesting
-# TODO [ ] try to implement pmap in terms of shard_map
-# TODO [ ] custom_jvp / custom_vjp handling
+# TODO [ ] try to implement (nested) pmap in terms of shard_map
+# TODO [ ] actually write tests...
+# TODO [ ] custom_jvp / custom_vjp eager handling
 # TODO [-] better errors
-#        [x] broadcast_prefix problem
+#        [x] broadcast_prefix errors
 #        [ ] if output rank doesn't match out spec for concatenation
 # TODO [ ] name stack
 
@@ -496,7 +498,6 @@ def _shard_map_partial_eval(self, shard_map_p, f, tracers, mesh, in_names,
                           jaxpr.effects, source_info_util.current())
   for t in out_tracers: t.recipe = eqn
   return pe.merge_lists(out_knowns, out_tracers, out_consts)
-
 partial_eval.JaxprTrace.process_shard_map = _shard_map_partial_eval
 
 # Crappy in-line tests, to be deleted.
