@@ -27,10 +27,8 @@ from jax.interpreters import pxla
 from jax.interpreters import ad
 from jax.interpreters import partial_eval
 from jax.interpreters.pxla import Mesh
-from jax.tree_util import tree_flatten
-from jax.tree_util import tree_map
-from jax.tree_util import tree_unflatten
-from jax._src.tree_util import broadcast_prefix
+from jax.tree_util import tree_map, tree_flatten, tree_unflatten
+from jax._src.tree_util import broadcast_prefix, prefix_errors
 import numpy as np
 
 P = PartitionSpec
@@ -46,7 +44,8 @@ zip, unsafe_zip = util.safe_zip, zip
 # TODO [ ] try nesting
 # TODO [ ] try to implement pmap in terms of shard_map
 # TODO [ ] custom_jvp / custom_vjp handling
-# TODO [ ] better errors
+# TODO [-] better errors
+#        [x] broadcast_prefix problem
 #        [ ] if output rank doesn't match out spec for concatenation
 # TODO [ ] name stack
 
@@ -58,12 +57,18 @@ def shard_map(f: Callable, mesh: Mesh, in_specs: Specs, out_specs: Specs):
   def wrapped(*args):
     fun = lu.wrap_init(f)
     args_flat, in_tree = tree_flatten(args)
-    in_specs_flat = broadcast_prefix(in_specs, args)
+    try: in_specs_flat = broadcast_prefix(in_specs, args)
+    except ValueError:
+      e, *_ = prefix_errors(in_specs, args)
+      raise e('shard_map in_specs') from None
     in_names_flat = tuple(map(_canonicalize_spec, in_specs_flat))
     flat_fun, out_tree = flatten_fun_nokwargs(fun, in_tree)
     def out_names_thunk():
       dummy = tree_unflatten(out_tree(), [object()] * out_tree().num_leaves)
-      out_specs_flat = broadcast_prefix(out_specs, dummy)
+      try: out_specs_flat = broadcast_prefix(out_specs, dummy)
+      except ValueError:
+        e, *_ = prefix_errors(out_specs, dummy)
+        raise e('shard_map out_specs') from None
       return tuple(map(_canonicalize_spec, out_specs_flat))
     out_flat = shard_map_p.bind(
         flat_fun, *args_flat, mesh=mesh, in_names=in_names_flat,
@@ -258,8 +263,7 @@ def _shard_map_impl(trace, prim, fun, args, *, mesh, in_names, out_names_thunk):
       out_tracers = map(t.full_raise, ans)
       outs_, out_rep = unzip2((t.val, t.rep) for t in out_tracers)
       del main, t, in_tracers, ans, out_tracers
-  outs = map(partial(_match_spec, mesh), out_rep, out_names_thunk(), outs_)
-  return outs
+  return map(partial(_match_spec, mesh), out_rep, out_names_thunk(), outs_)
 core.EvalTrace.process_shard_map = _shard_map_impl
 
 def _device_put_from_names(mesh: Mesh, names: AxisNames, x: JaxType) -> JaxType:
@@ -586,18 +590,18 @@ if __name__ == '__main__':
 
   ## test eager conrtrol flow
 
-  x = jnp.arange(2 * 2.).reshape(2, 2)
+  # x = jnp.arange(2 * 2.).reshape(2, 2)
 
-  def f(x):
-    y = jax.lax.psum(x, ('x', 'y'))
-    if y < 0:
-      return x
-    else:
-      return -x
+  # def f(x):
+  #   y = jax.lax.psum(x, ('x', 'y'))
+  #   if y < 0:
+  #     return x
+  #   else:
+  #     return -x
 
-  def g(x):
-    return shard_map(f, mesh, in_specs=(P('x', 'y'),), out_specs=P('x', 'y'))(x)
-  print(g(x))
+  # def g(x):
+  #   return shard_map(f, mesh, in_specs=(P('x', 'y'),), out_specs=P('x', 'y'))(x)
+  # print(g(x))
 
   # ## test outer jit detects shard_map's mesh
   # x = jnp.array(2.0)
@@ -621,3 +625,18 @@ if __name__ == '__main__':
   # # y = jax.vmap(g, spmd_axis_name='x')(x)
   # # print(y)
 
+
+  ## test tree prefix error
+
+#   @partial(shard_map, mesh=mesh, in_specs=([P('x', 'y')],), out_specs=P('x', 'y'))
+#   def f(x):
+#     print(x)
+#     return x
+#   try: f([x, x])
+#   except: print('good error')
+#   else: raise Exception
+
+#   @partial(shard_map, mesh=mesh, in_specs=([P('x', 'y')],), out_specs=P('x', 'y'))
+#   def f(x):
+#     return x
+#   print(f([x]))
