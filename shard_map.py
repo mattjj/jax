@@ -42,7 +42,7 @@ zip, unsafe_zip = util.safe_zip, zip
 #        [x] jvp
 #        [x] partial eval
 #        [ ] transpose
-# TODO [ ] better eager repr
+# TODO [x] better eager repr
 # TODO [ ] try nesting
 # TODO [ ] try to implement pmap in terms of shard_map
 # TODO [ ] custom_jvp / custom_vjp handling
@@ -321,13 +321,23 @@ class ShardMapTrace(core.Trace):
 
   def process_call(self, call_primitive, fun, tracers, params):
     if call_primitive is not xla.xla_call_p: raise NotImplementedError
+    fun, jaxpr = _something_shady(fun)  # TODO remove when jit is initial style
     bind = HashableFunction(
         lambda *args, **kwargs: call_primitive.bind(fun, *args, **kwargs),
         (call_primitive, fun))
     fake_primitive = pxla._FakePrimitive(multiple_results=True, bind=bind)
-    # TODO until initial-style jit, assume no repeats on jit output
     _rep_rules[fake_primitive] = lambda *_, **__: set()
-    return self.process_primitive(fake_primitive, tracers, params)
+    out_tracers_ = self.process_primitive(fake_primitive, tracers, params)
+    out_vals = [t.val for t in out_tracers_]
+    out_rep = _output_rep(self.mesh, jaxpr(), [t.rep for t in tracers])
+    return map(partial(ShardMapTracer, self), out_rep, out_vals)
+
+@lu.transformation_with_aux
+def _something_shady(*args, **kwargs):
+  out = yield args, kwargs
+  main = core.thread_local_state.trace_state.trace_stack.dynamic  # forgive me
+  jaxpr, _ = main.jaxpr_stack[-1].to_jaxpr(out)
+  yield out, jaxpr
 
 class ShardMapTracer(core.Tracer):
   rep: Set[AxisName]
@@ -444,20 +454,14 @@ ad.JVPTrace.process_shard_map = _shard_map_jvp
 def _shard_map_partial_eval(self, shard_map_p, f, tracers, mesh, in_names,
                             out_names_thunk):
   in_pvals = [t.pval for t in tracers]
-  # in_knowns: List[bool], unk_in_avals: List[core.AbstractValue], in_consts: List[MaybeTracer]
   in_knowns, unk_in_avals, in_consts = pe.partition_pvals(in_pvals)
   unk_in_names, known_in_names = pe.partition_list(in_knowns, in_names)
   unk_in_avals_sharded = map(partial(_shard_aval, mesh), unk_in_names, unk_in_avals)
-
-  # Wrap f to perform partial evaluation and plumb out aux data.
   f = pe.trace_to_subjaxpr_nounits(f, self.main, False)
   f_known, aux = pe.partial_eval_wrapper_nounits(f, tuple(in_knowns),
-                                                tuple(unk_in_avals_sharded))
-  # For pmap, we have in_axes and out_axes
-  # For shmap, we have in_names and out_names
-  # We have to split those into the 'known' side and the 'unknown' side
+                                                 tuple(unk_in_avals_sharded))
   unk_in_names, known_in_names = pe.partition_list(in_knowns, in_names)
-  
+
   @as_hashable_function(closure=out_names_thunk)
   def known_out_names():
     out_knowns, _, jaxpr, _ = aux()
@@ -467,34 +471,19 @@ def _shard_map_partial_eval(self, shard_map_p, f, tracers, mesh, in_names,
 
   known_params = dict(mesh=mesh, in_names=(*known_in_names,),
                       out_names_thunk=known_out_names)
-  
-  out: List[MaybeTracer] = shard_map_p.bind(f_known, *in_consts, **known_params)
-  # this jaxpr is the unkown side (taking unknowns and residuals)
-  # Takes residuals as constants, 
+  out = shard_map_p.bind(f_known, *in_consts, **known_params)
   out_knowns, out_avals_sharded, jaxpr, env = aux()
   out_consts, res = pe.split_list(out, [len(out) - len(jaxpr.constvars)])
-  # We can only check_jaxpr with the dynamic axis environment extended:
   with core.extend_axis_env_nd(mesh.shape.items()):
     jaxpr = pe.convert_constvars_jaxpr(jaxpr)
-
-  # We've run the known side! Now to build a jaxpr equation 
-  # for the unknown side
-  # (Now to do the 'known unknowns' :) )
   unknown_out_names, _ = pe.partition_list(out_knowns, out_names_thunk())
-  # env is instead if unknown values closed over some value 
-  # There are 3 types of input on the unknown side: residuals,
-  # closed_over_constants, original 'unknown' args. 
-  unknown_in_names = ({0: (*mesh.axis_names,)},) * len(res) + ({},) * len(env) + (*unk_in_names,)
-
-  # Create the input tracers for the staged-out (unkonwn-value) call.
+  unknown_in_names = (({0: (*mesh.axis_names,)},) * len(res) + ({},) * len(env)
+                      + (*unk_in_names,))
   const_tracers = map(self.new_instantiated_const, res)
   env_tracers = map(self.full_raise, env)
   unknown_arg_tracers = [t for t in tracers if not t.is_known()]
-  # Adjust params for staged-out call on unknown values.
-  # Signature is different when tracing vs staged out
   unknown_params = dict(mesh=mesh, in_names=unknown_in_names,
                         out_names=unknown_out_names, jaxpr=jaxpr)
-  # back to global view
   out_avals = map(partial(_unshard_aval, mesh), unknown_out_names, out_avals_sharded)
   out_tracers = [pe.JaxprTracer(self, pe.PartialVal.unknown(a), None)
                  for a in out_avals]
@@ -502,10 +491,8 @@ def _shard_map_partial_eval(self, shard_map_p, f, tracers, mesh, in_names,
                           out_tracers, shard_map_p, unknown_params,
                           jaxpr.effects, source_info_util.current())
   for t in out_tracers: t.recipe = eqn
-
-  # dual to partition list
   return pe.merge_lists(out_knowns, out_tracers, out_consts)
-  
+
 partial_eval.JaxprTrace.process_shard_map = _shard_map_partial_eval
 
 # Crappy in-line tests, to be deleted.
@@ -518,11 +505,10 @@ if __name__ == '__main__':
   jax.config.update('jax_platform_name', 'cpu')
   os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=32"
 
-
   def f(x):
     # return x
-    # return 2 * x
-    return jax.lax.sin(x)
+    return 2 * x
+    # return jax.lax.sin(x)
     # return x.sum(keepdims=True)
 
   mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ('x', 'y'))
@@ -532,12 +518,12 @@ if __name__ == '__main__':
 
   ## eager repr
 
-  print(x)
-  @partial(shard_map, mesh=mesh, in_specs=P('x', 'y'), out_specs=P('x', 'y'))
-  def f(x):
-    print(x)
-    return x
-  f(x)
+  # print(x)
+  # @partial(shard_map, mesh=mesh, in_specs=P('x', 'y'), out_specs=P('x', 'y'))
+  # def f(x):
+  #   print(x)
+  #   return x
+  # f(x)
 
   ## nesting
 
@@ -567,7 +553,7 @@ if __name__ == '__main__':
   # print(jnp.allclose(y, y_))
   # print(jnp.allclose(y_dot, y_dot_))
 
-  # ## test basics: can we run?
+  ## test basics: can we run?
 
   # @jax.jit
   # def g(x):
@@ -579,34 +565,39 @@ if __name__ == '__main__':
   # print(g(x))
 
 
-  # ## test replication checking against out specs (eager)
+  ## test replication checking against out specs (eager)
   # def f(x):
-  #   return jax.lax.psum(x, ('x',))
+  #   return 2 * x
   # def g(x):
   #   return shard_map(f, mesh, in_specs=(P('x', 'y'),), out_specs=P(None, 'y'))(x)
   # try:
   #   print(g(x))
   # except:
   #   print('good error!')
-
-
-  # ## test eager conrtrol flow
-
-  # x = jnp.arange(2 * 2.).reshape(2, 2)
+  # else:
+  #   raise Exception
 
   # def f(x):
-  #   y = jax.lax.psum(x, ('x', 'y'))
-  #   # if y > 0:
-  #   if jax.lax.gt(y, 0.):
-  #     return x
-  #   else:
-  #     return -x
-
+  #   return jax.lax.psum(x, 'x')
   # def g(x):
-  #   return shard_map(f, mesh, in_specs=(P('x', 'y'),), out_specs=P('x', 'y'))(x)
-
+  #   return shard_map(f, mesh, in_specs=(P('x', 'y'),), out_specs=P(None, 'y'))(x)
   # print(g(x))
 
+
+  ## test eager conrtrol flow
+
+  x = jnp.arange(2 * 2.).reshape(2, 2)
+
+  def f(x):
+    y = jax.lax.psum(x, ('x', 'y'))
+    if y < 0:
+      return x
+    else:
+      return -x
+
+  def g(x):
+    return shard_map(f, mesh, in_specs=(P('x', 'y'),), out_specs=P('x', 'y'))(x)
+  print(g(x))
 
   # ## test outer jit detects shard_map's mesh
   # x = jnp.array(2.0)
