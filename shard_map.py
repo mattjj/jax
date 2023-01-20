@@ -1,5 +1,6 @@
-from functools import partial, lru_cache
+from __future__ import annotations
 
+from functools import partial, lru_cache
 from typing import (Any, Callable, Optional, Tuple, List, Set, Sequence, Dict,
                     Hashable, Union)
 
@@ -37,10 +38,16 @@ P = PartitionSpec
 map, unsafe_map = util.safe_map, map
 zip, unsafe_zip = util.safe_zip, zip
 
-# TODO [ ] jvp, partial eval, and transpose w/ sholto@
+# TODO [-] autodiff w/ sholto@
+#        [x] jvp
+#        [x] partial eval
+#        [ ] transpose
+# TODO [ ] better eager repr
+# TODO [ ] try nesting
 # TODO [ ] try to implement pmap in terms of shard_map
 # TODO [ ] custom_jvp / custom_vjp handling
-# TODO [ ] better error if output rank doesn't match out spec for concatenation
+# TODO [ ] better errors
+#        [ ] if output rank doesn't match out spec for concatenation
 # TODO [ ] name stack
 
 # API
@@ -342,8 +349,17 @@ class ShardMapTracer(core.Tracer):
       aval = core.raise_to_shaped(aval)
       return core.mapped_aval(self._trace.mesh.size, 0, aval)
 
-  def full_lower(self):
+  def full_lower(self) -> ShardMapTracer:
     return self
+
+  def __str__(self) -> str:
+    with core.eval_context():
+      blocks = list(self.val)
+    mesh = self._trace.mesh
+    axis_names = f"({', '.join(map(str, mesh.axis_names))})"
+    return '\n'.join(
+        f"On {device} at mesh coordinates {axis_names} = {idx}:\n{block}\n"
+        for (idx, device), block in zip(np.ndenumerate(mesh.devices), blocks))
 
 def _primitive_applier(prim: core.Primitive, params: core.ParamDict, mesh: Mesh,
                        ) -> Callable:
@@ -514,24 +530,44 @@ if __name__ == '__main__':
   sharding = jax.sharding.NamedSharding(mesh, P('x', 'y'))
   x = jax.device_put(jnp.arange(8 * 8.).reshape(8, 8), sharding)
 
+  ## eager repr
+
+  print(x)
+  @partial(shard_map, mesh=mesh, in_specs=P('x', 'y'), out_specs=P('x', 'y'))
+  def f(x):
+    print(x)
+    return x
+  f(x)
+
+  ## nesting
+
+  # @partial(shard_map, mesh=mesh, in_specs=P('x'), out_specs=P('x'))
+  # def f(x):
+  #   @partial(shard_map, mesh=mesh, in_specs=('y'), out_specs=P('y'))
+  #   def g(x):
+  #     return x
+  #   return g(x)
+  # f(x)
+
+  # # autodiff tests
+
+  # def g(x):
+  #   return shard_map(f, mesh, in_specs=(P('x', 'y'),), out_specs=P('x', 'y'))(x)
+  # print(jax.jvp(g, [x], [x]))
+
+  # from jax._src.test_util import check_grads
+
+  # check_grads(g, [x], 2, ['fwd'])
+
+  # y, y_dot = jax.jvp(g, [x], [x])
+
+  # y_, g_lin = jax.linearize(g, x)
+  # y_dot_ = g_lin(x)
+
+  # print(jnp.allclose(y, y_))
+  # print(jnp.allclose(y_dot, y_dot_))
 
   # ## test basics: can we run?
-
-  def g(x):
-    return shard_map(f, mesh, in_specs=(P('x', 'y'),), out_specs=P('x', 'y'))(x)
-  print(jax.jvp(g, [x], [x]))
-
-  from jax._src.test_util import check_grads
-
-  check_grads(g, [x], 2, ['fwd'])
-
-  y, y_dot = jax.jvp(g, [x], [x])
-
-  y_, g_lin = jax.linearize(g, x)
-  y_dot_ = g_lin(x)
-
-  print(jnp.allclose(y, y_))
-  print(jnp.allclose(y_dot, y_dot_))
 
   # @jax.jit
   # def g(x):
