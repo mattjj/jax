@@ -5,20 +5,18 @@ from functools import partial, lru_cache
 import inspect
 from typing import (Any, Callable, Optional, Tuple, List, Set, Sequence, Dict,
                     Hashable, Union)
+import numpy as np
 
 import jax
 from jax import core
 from jax.core import Tracer
 from jax._src import linear_util as lu
-from jax import util
-from jax._src import dispatch
-from jax._src import pjit
 from jax._src import source_info_util
-from jax._src.util import (prod, HashableFunction, unzip2, unzip3,
-                           as_hashable_function, memoize)
-from jax._src.sharding import NamedSharding, PartitionSpec
+from jax._src import traceback_util
+from jax._src import util
 from jax._src.lax import parallel as lax_parallel
-from jax._src.core import Jaxpr
+from jax._src.sharding import NamedSharding, PartitionSpec
+from jax._src.util import (prod, HashableFunction, unzip2, unzip3, as_hashable_function, memoize)
 from jax.api_util import flatten_fun_nokwargs
 from jax.experimental import maps
 from jax.interpreters import batching
@@ -28,15 +26,21 @@ from jax.interpreters import xla
 from jax.interpreters import pxla
 from jax.interpreters import ad
 from jax.interpreters.pxla import Mesh
-from jax.tree_util import tree_map, tree_flatten, tree_unflatten, tree_structure
-from jax._src.tree_util import (broadcast_prefix, prefix_errors, PyTreeDef,
-                                _generate_key_paths)
-import numpy as np
+from jax.tree_util import (tree_map, tree_flatten, tree_unflatten, tree_structure, tree_leaves)
+from jax._src.tree_util import (broadcast_prefix, prefix_errors, PyTreeDef, _generate_key_paths)
 
 P = PartitionSpec
 
 map, unsafe_map = util.safe_map, map
 zip, unsafe_zip = util.safe_zip, zip
+traceback_util.register_exclusion(__file__)
+
+# import ipdb, sys, traceback
+# def info(type, value, tb):
+#     traceback.print_exception(type, value, tb)
+#     ipdb.pm()
+# sys.excepthook = info
+
 
 # TODO [-] autodiff w/ sholto@
 #        [x] jvp
@@ -47,6 +51,7 @@ zip, unsafe_zip = util.safe_zip, zip
 # TODO [x] better errors
 #        [x] broadcast_prefix errors
 #        [x] if output rank doesn't match out spec for concatenation
+#        [x] validate that in_specs / out_specs are indeed pytrees of pspecs
 # TODO [ ] try nesting
 # TODO [ ] more rep rules
 # TODO [ ] try to implement (nested) pmap in terms of shard_map
@@ -58,7 +63,19 @@ zip, unsafe_zip = util.safe_zip, zip
 
 Specs = Any  # PyTree[PartitionSpec]
 
+@traceback_util.api_boundary
 def shard_map(f: Callable, mesh: Mesh, in_specs: Specs, out_specs: Specs):
+  # TODO improve these error messages
+  if not callable(f):
+    raise TypeError("shard_map requires a callable for its first argument, "
+                    f"but got {f} of type {type(f)}.")
+  if not isinstance(mesh, Mesh):
+    raise TypeError("shard_map requires a `jax.sharding.Mesh` instance for its "
+                    f"second argument, but got {mesh} of type {type(mesh)}.")
+  _check_specs(SpecErrorType.input, in_specs)
+  _check_specs(SpecErrorType.out, out_specs)
+
+  @traceback_util.api_boundary
   def wrapped(*args):
     fun = lu.wrap_init(f)
     args_flat, in_tree = tree_flatten(args)
@@ -66,7 +83,7 @@ def shard_map(f: Callable, mesh: Mesh, in_specs: Specs, out_specs: Specs):
     except ValueError:
       e, *_ = prefix_errors(in_specs, args)
       raise e('shard_map in_specs') from None
-    _check_specs(f, in_tree, in_specs, in_specs_flat, args_flat)
+    _check_flat_specs(f, in_tree, in_specs, in_specs_flat, args_flat)
     in_names_flat = tuple(map(_canonicalize_spec, in_specs_flat))
     flat_fun, out_tree = flatten_fun_nokwargs(fun, in_tree)
 
@@ -93,7 +110,21 @@ def shard_map(f: Callable, mesh: Mesh, in_specs: Specs, out_specs: Specs):
     return tree_unflatten(out_tree(), out_flat)
   return wrapped
 
-# Internally we use AxisNames instead of PartitionSpecs
+def _check_specs(error_type: SpecErrorType, specs: Any) -> None:
+  maybe_specs = tree_leaves(specs)
+  if all(isinstance(p, P) for p in maybe_specs):
+    return
+  prefix = 'in' if error_type == SpecErrorType.input else 'out'
+  specs_aug = _generate_key_paths(specs)
+  msgs = [f"  {prefix}_specs{key.pprint()} is {x} of type {type(x).__name__}, "
+          for key, x in _generate_key_paths(specs) if not isinstance(x, P)]
+  raise TypeError(
+      f"shard_map {prefix}_specs argument must be a pytree of "
+      f"`jax.sharding.PartitionSpec` instances, but:\n\n"
+      + '\n\n'.join(msgs) + '\n\n'
+      f"Check the {prefix}_specs values passed to shard_map.")
+
+# Internally use AxisNames = Dict[int, Tuple[AxisName, ...]], not PartitionSpecs
 AxisName = Hashable
 AxisNames = Dict[int, Tuple[AxisName, ...]]  # TODO make it a hashable dict
 def _canonicalize_spec(spec: PartitionSpec) -> AxisNames:
@@ -103,8 +134,8 @@ def _canonicalize_spec(spec: PartitionSpec) -> AxisNames:
   else:
     return spec
 
-def _check_specs(f: Callble, in_tree, in_specs: Specs, in_specs_flat: List,
-                 xs: List) -> None:
+def _check_flat_specs(f: Callble, in_tree, in_specs: Specs,
+                      in_specs_flat: List[P], xs: List) -> None:
   in_avals = [core.raise_to_shaped(core.get_aval(x)) for x in xs]
   fail = [a if not len(p) <= a.ndim else False
           for p, a in zip(in_specs_flat, in_avals)]
@@ -630,13 +661,13 @@ if __name__ == '__main__':
 
   ## nesting
 
-  # @partial(shard_map, mesh=mesh, in_specs=P('x'), out_specs=P('x'))
-  # def f(x):
-  #   @partial(shard_map, mesh=mesh, in_specs=('y'), out_specs=P('y'))
-  #   def g(x):
-  #     return x
-  #   return g(x)
-  # f(x)
+#   @partial(shard_map, mesh=mesh, in_specs=P('x'), out_specs=P('x'))
+#   def f(x):
+#     @partial(shard_map, mesh=mesh, in_specs=('y'), out_specs=P('y'))
+#     def g(x):
+#       return x
+#     return g(x)
+#   jax.jit(f)(x)
 
   # # autodiff tests
 
