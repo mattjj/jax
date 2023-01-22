@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import enum
 from functools import partial, lru_cache
 import inspect
 from typing import (Any, Callable, Optional, Tuple, List, Set, Sequence, Dict,
@@ -27,7 +28,7 @@ from jax.interpreters import xla
 from jax.interpreters import pxla
 from jax.interpreters import ad
 from jax.interpreters.pxla import Mesh
-from jax.tree_util import tree_map, tree_flatten, tree_unflatten
+from jax.tree_util import tree_map, tree_flatten, tree_unflatten, tree_structure
 from jax._src.tree_util import (broadcast_prefix, prefix_errors, PyTreeDef,
                                 _generate_key_paths)
 import numpy as np
@@ -42,14 +43,15 @@ zip, unsafe_zip = util.safe_zip, zip
 #        [x] partial eval
 #        [ ] transpose
 # TODO [x] better eager repr
-# TODO [ ] more rep rules
+# TODO [x] fix scalar residual problem
+# TODO [x] better errors
+#        [x] broadcast_prefix errors
+#        [x] if output rank doesn't match out spec for concatenation
 # TODO [ ] try nesting
+# TODO [ ] more rep rules
 # TODO [ ] try to implement (nested) pmap in terms of shard_map
 # TODO [ ] actually write tests...
 # TODO [ ] custom_jvp / custom_vjp eager handling
-# TODO [-] better errors
-#        [x] broadcast_prefix errors
-#        [ ] if output rank doesn't match out spec for concatenation
 # TODO [ ] name stack
 
 # API
@@ -64,7 +66,7 @@ def shard_map(f: Callable, mesh: Mesh, in_specs: Specs, out_specs: Specs):
     except ValueError:
       e, *_ = prefix_errors(in_specs, args)
       raise e('shard_map in_specs') from None
-    _check_specs(f, in_specs, in_specs_flat, args_flat)
+    _check_specs(f, in_tree, in_specs, in_specs_flat, args_flat)
     in_names_flat = tuple(map(_canonicalize_spec, in_specs_flat))
     flat_fun, out_tree = flatten_fun_nokwargs(fun, in_tree)
 
@@ -81,7 +83,13 @@ def shard_map(f: Callable, mesh: Mesh, in_specs: Specs, out_specs: Specs):
           flat_fun, *args_flat, mesh=mesh, in_names=in_names_flat,
           out_names_thunk=out_names_thunk)
     except _SpecError as e:
-      raise _out_spec_error(f, out_tree(), out_specs, *e.args) from None
+      failures, = e.args
+      msg = _spec_error(SpecErrorType.out, f, out_tree(), out_specs, failures)
+      if any(fail and not fail.shape for fail in failures):
+        msg += (" In particular, for rank 0 outputs which are not constant "
+                "over the mesh, add at least one (singleton) axis to them so "
+                "that they can be concatenated using out_specs.")
+      raise ValueError(msg) from None
     return tree_unflatten(out_tree(), out_flat)
   return wrapped
 
@@ -95,27 +103,57 @@ def _canonicalize_spec(spec: PartitionSpec) -> AxisNames:
   else:
     return spec
 
-def _check_specs(f: Callble, in_specs: Specs, in_specs_flat: List, xs: List
-                 ) -> None:
-  pass  # TODO
+def _check_specs(f: Callble, in_tree, in_specs: Specs, in_specs_flat: List,
+                 xs: List) -> None:
+  in_avals = [core.raise_to_shaped(core.get_aval(x)) for x in xs]
+  fail = [a if not len(p) <= a.ndim else False
+          for p, a in zip(in_specs_flat, in_avals)]
+  if any(fail):
+    msg = _spec_error(SpecErrorType.input, f, in_tree, in_specs, fail)
+    raise ValueError(msg)
 
-def _out_spec_error(f: Callable, out_tree: PyTreeDef, out_specs: Specs,
-                    failures: List[core.ShapedArray]) -> Exception:
-  # [x] instead of flat_output_idx, return all mismatches
-  # [ ] make a tree of key paths for out_specs, broadcast it to full tree
-  breakpoint()
-  failures_flat = _generate_key_paths(tree_unflatten(out_tree, failures))
-  out_specs_flat = _generate_key_paths(out_specs)
-  # make a tree of key paths for out_tree
-  # map a function which compares output shapes with pspecs, accumulates msgs
+SpecErrorType = enum.Enum('SpecErrorType', ['input', 'out'])
+
+def _spec_error(error_type: SpecErrorType, f: Callable, tree: PyTreeDef,
+                specs: Specs, failures_flat: List[core.ShapedArray]) -> str:
+  if error_type == SpecErrorType.input:
+    prefix, base = 'in', 'args'
+    dummy_args = tree_unflatten(tree, [False] * tree.num_leaves)
+    try:
+      ba = inspect.signature(f).bind(*dummy_args)
+    except (TypeError, ValueError):
+      ba = None
+  else:
+    prefix, base = 'out', f'{f.__name__}(*args)'
+  failures = tree_unflatten(tree, failures_flat)
+  failures_aug = _generate_key_paths(failures)
+  out_specs_ = tree_unflatten(tree_structure(specs), _generate_key_paths(specs))
+  leaf = lambda x: type(x) is tuple and len(x) == 2 and type(x[1]) is P
+  out_specs_aug = broadcast_prefix(out_specs_, failures, is_leaf=leaf)
+  msgs = []
+  for (spec_key, spec), (fail_key, fail) in zip(out_specs_aug, failures_aug):
+    if fail:
+      if error_type == SpecErrorType.input and ba is not None:
+        arg_key, *keys = fail_key.keys
+        extra = (f", where {base}[{arg_key.key}] is bound to {f.__name__}'s "
+                 f"parameter {list(ba.arguments.keys())[arg_key.key]},")
+      else:
+        extra = ""
+      msgs.append(
+          f"  {prefix}_specs{spec_key.pprint()} is {spec} which has length "
+          f"{len(spec)}, but\n"
+          f"  {base}{fail_key.pprint()}{extra} has shape {fail.str_short()}, "
+          f"which has rank {fail.ndim} (<{len(spec)})")
+  assert msgs
   msg = (f"shard_map applied to the function '{f.__name__}' was given an "
-         f"out_specs entry which is incompatible with the corresponding "
-         f"output value from the function:\n\n"
-         f"    out_specs{key_path.pprint()} has length {l}, but\n"
-         f"    f(*args){key_path.pprint()} has rank only {k}.\n\n"
-         f"Entries in out_specs must be of length no greater than the number "
-         f"of axes in the corresponding output value.")
-  return ValueError(msg)
+         f"{prefix}_specs entry which is too long to be compatible with the "
+         f"corresponding {prefix}put value from the function:\n\n"
+         + '\n'.join(msgs) + '\n\n' +
+         f"Entries in {prefix}_specs must be of length no greater than the "
+         f"number of axes in the corresponding {prefix}put value.\n\n"
+         f"Either revise the spec to be shorter, or modify '{f.__name__}' so "
+         f"that its {prefix}puts have sufficient rank.")
+  return msg
 
 # Primitive
 
@@ -165,6 +203,7 @@ def _shard_map_staging(
   with core.new_sublevel(), core.extend_axis_env_nd(mesh.shape.items()):
     jaxpr, out_avals_, consts = pe.trace_to_subjaxpr_dynamic(
         fun, trace.main, in_avals_)
+  _check_names(out_names_thunk(), out_avals_)
   out_avals = map(partial(_unshard_aval, mesh), out_names_thunk(), out_avals_)
   source_info = source_info_util.current()
   out_tracers = [pe.DynamicJaxprTracer(trace, a, source_info) for a in out_avals]
@@ -294,7 +333,8 @@ def _shard_map_impl(trace, prim, fun, args, *, mesh, in_names, out_names_thunk):
       out_tracers = map(t.full_raise, ans)
       outs_, out_rep = unzip2((t.val, t.rep) for t in out_tracers)
       del main, t, in_tracers, ans, out_tracers
-  _check_names(out_names_thunk(), outs_)
+  out_avals = [core.mapped_aval(x.shape[0], 0, core.get_aval(x)) for x in outs_]
+  _check_names(out_names_thunk(), out_avals)
   return map(partial(_match_spec, mesh), out_rep, out_names_thunk(), outs_)
 core.EvalTrace.process_shard_map = _shard_map_impl
 
@@ -321,10 +361,10 @@ def _match_spec(mesh: Mesh, rep: Set[AxisName], dst: AxisNames, x: JaxType
     raise Exception  # TODO add parameter to opt out of check
   return jax.jit(_get_matcher(mesh, tuple(dst.items())))(x)
 
-def _check_names(names: Sequence[AxisNames], xs: JaxType) -> None:
-  failures = [core.raise_to_shaped(core.get_aval(x)) if not max(ns) < x.ndim - 1
-              else None for ns, x in zip(names, xs)]
-  if any(failures): raise _SpecError(failures)
+def _check_names(names: Sequence[AxisNames], avals: core.ShapedArray) -> None:
+  # fail = [a if not max(n) < a.ndim - 1 else False for n, a in zip(names, avals)]
+  fail = [a if not max(n) < a.ndim else False for n, a in zip(names, avals)]
+  if any(fail): raise _SpecError(fail)
 class _SpecError(Exception): pass
 
 @lru_cache()
@@ -479,6 +519,7 @@ def _shard_map_jvp(self, shard_map_p, f, tracers, mesh, in_names,
   f_jvp = ad.jvp_subtrace(f, self.main)
   f_jvp, which_nz_out = ad.nonzero_tangent_outputs(f_jvp)
   tangent_in_names = [ax for ax, nz in zip(in_names, which_nz) if nz]
+
   @as_hashable_function(closure=out_names_thunk)
   def new_out_names_thunk():
     out_ax = out_names_thunk()
@@ -599,9 +640,9 @@ if __name__ == '__main__':
 
   # # autodiff tests
 
-  def g(x):
-    return shard_map(f, mesh, in_specs=(P('x', 'y'),), out_specs=P('x', 'y'))(x)
-  print(jax.jvp(g, [x], [x]))
+  # def g(x):
+  #   return shard_map(f, mesh, in_specs=(P('x', 'y'),), out_specs=P('x', 'y'))(x)
+  # print(jax.jvp(g, [x], [x]))
 
   # from jax._src.test_util import check_grads
 
@@ -609,8 +650,8 @@ if __name__ == '__main__':
 
   # y, y_dot = jax.jvp(g, [x], [x])
 
-  y_, g_lin = jax.linearize(g, x)
-  y_dot_ = g_lin(x)
+  # y_, g_lin = jax.linearize(g, x)
+  # y_dot_ = g_lin(x)
 
   # print(jnp.allclose(y, y_))
   # print(jnp.allclose(y_dot, y_dot_))
@@ -698,3 +739,28 @@ if __name__ == '__main__':
 #   def f(x):
 #     return x
 #   print(f([x]))
+
+  ## rank errors
+
+  # def foo(): return {'hi': [3.]}
+  # try:
+  #   shard_map(foo, mesh=mesh, in_specs=(), out_specs={'hi': P('x')})()
+  # except ValueError:
+  #   print('good error')
+  # else:
+  #   raise Exception("uh oh")
+
+  # try:
+  #   jax.jit(lambda: shard_map(foo, mesh=mesh, in_specs=(), out_specs={'hi': P('x')})())()
+  # except ValueError:
+  #   print('good error')
+  # else:
+  #   raise Exception("uh oh")
+
+  # def foo(x): pass
+  # try:
+  #   shard_map(foo, mesh=mesh, in_specs=({'hi': P('x')},), out_specs=())({'hi': [jnp.array(3.)]})
+  # except ValueError:
+  #   print('good error')
+  # else:
+  #   raise Exception('uh oh')
