@@ -52,11 +52,12 @@ traceback_util.register_exclusion(__file__)
 #        [x] broadcast_prefix errors
 #        [x] if output rank doesn't match out spec for concatenation
 #        [x] validate that in_specs / out_specs are indeed pytrees of pspecs
-# TODO [ ] actually write tests...
+# TODO [ ] remove default rep rule behavior in favor of convenience wrappers<
+#          and add good rule coverage
+# TODO [ ] actually write thorough tests...
 # TODO [ ] try nesting
 #        [ ] eager
 #        [ ] staged: convert out and then back into manual in lowering rule?
-# TODO [ ] more rep rules
 # TODO [ ] try to implement (nested) pmap in terms of shard_map
 # TODO [ ] custom_jvp / custom_vjp eager handling
 # TODO [ ] name stack
@@ -509,7 +510,6 @@ def _rep_rule(prim, *in_rep, **params):
   return set.intersection(*in_rep)
 
 _rep_rules = {}
-# TODO remove default behavior?
 register_rule = lambda prim: lambda rule: _rep_rules.setdefault(prim, rule)
 
 @register_rule(lax_parallel.psum_p)
