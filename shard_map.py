@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from functools import partial, lru_cache
+import inspect
 from typing import (Any, Callable, Optional, Tuple, List, Set, Sequence, Dict,
                     Hashable, Union)
 
@@ -13,7 +14,7 @@ from jax._src import dispatch
 from jax._src import pjit
 from jax._src import source_info_util
 from jax._src.util import (prod, HashableFunction, unzip2, unzip3,
-                           as_hashable_function)
+                           as_hashable_function, memoize)
 from jax._src.sharding import NamedSharding, PartitionSpec
 from jax._src.lax import parallel as lax_parallel
 from jax._src.core import Jaxpr
@@ -25,10 +26,10 @@ from jax.interpreters import partial_eval as pe
 from jax.interpreters import xla
 from jax.interpreters import pxla
 from jax.interpreters import ad
-from jax.interpreters import partial_eval
 from jax.interpreters.pxla import Mesh
 from jax.tree_util import tree_map, tree_flatten, tree_unflatten
-from jax._src.tree_util import broadcast_prefix, prefix_errors
+from jax._src.tree_util import (broadcast_prefix, prefix_errors, PyTreeDef,
+                                _generate_key_paths)
 import numpy as np
 
 P = PartitionSpec
@@ -63,8 +64,11 @@ def shard_map(f: Callable, mesh: Mesh, in_specs: Specs, out_specs: Specs):
     except ValueError:
       e, *_ = prefix_errors(in_specs, args)
       raise e('shard_map in_specs') from None
+    _check_specs(f, in_specs, in_specs_flat, args_flat)
     in_names_flat = tuple(map(_canonicalize_spec, in_specs_flat))
     flat_fun, out_tree = flatten_fun_nokwargs(fun, in_tree)
+
+    @memoize
     def out_names_thunk():
       dummy = tree_unflatten(out_tree(), [object()] * out_tree().num_leaves)
       try: out_specs_flat = broadcast_prefix(out_specs, dummy)
@@ -72,9 +76,12 @@ def shard_map(f: Callable, mesh: Mesh, in_specs: Specs, out_specs: Specs):
         e, *_ = prefix_errors(out_specs, dummy)
         raise e('shard_map out_specs') from None
       return tuple(map(_canonicalize_spec, out_specs_flat))
-    out_flat = shard_map_p.bind(
-        flat_fun, *args_flat, mesh=mesh, in_names=in_names_flat,
-        out_names_thunk=out_names_thunk)
+    try:
+      out_flat = shard_map_p.bind(
+          flat_fun, *args_flat, mesh=mesh, in_names=in_names_flat,
+          out_names_thunk=out_names_thunk)
+    except _SpecError as e:
+      raise _out_spec_error(f, out_tree(), out_specs, *e.args) from None
     return tree_unflatten(out_tree(), out_flat)
   return wrapped
 
@@ -87,6 +94,28 @@ def _canonicalize_spec(spec: PartitionSpec) -> AxisNames:
             for i, names in enumerate(spec) if names is not None}
   else:
     return spec
+
+def _check_specs(f: Callble, in_specs: Specs, in_specs_flat: List, xs: List
+                 ) -> None:
+  pass  # TODO
+
+def _out_spec_error(f: Callable, out_tree: PyTreeDef, out_specs: Specs,
+                    failures: List[core.ShapedArray]) -> Exception:
+  # [x] instead of flat_output_idx, return all mismatches
+  # [ ] make a tree of key paths for out_specs, broadcast it to full tree
+  breakpoint()
+  failures_flat = _generate_key_paths(tree_unflatten(out_tree, failures))
+  out_specs_flat = _generate_key_paths(out_specs)
+  # make a tree of key paths for out_tree
+  # map a function which compares output shapes with pspecs, accumulates msgs
+  msg = (f"shard_map applied to the function '{f.__name__}' was given an "
+         f"out_specs entry which is incompatible with the corresponding "
+         f"output value from the function:\n\n"
+         f"    out_specs{key_path.pprint()} has length {l}, but\n"
+         f"    f(*args){key_path.pprint()} has rank only {k}.\n\n"
+         f"Entries in out_specs must be of length no greater than the number "
+         f"of axes in the corresponding output value.")
+  return ValueError(msg)
 
 # Primitive
 
@@ -265,6 +294,7 @@ def _shard_map_impl(trace, prim, fun, args, *, mesh, in_names, out_names_thunk):
       out_tracers = map(t.full_raise, ans)
       outs_, out_rep = unzip2((t.val, t.rep) for t in out_tracers)
       del main, t, in_tracers, ans, out_tracers
+  _check_names(out_names_thunk(), outs_)
   return map(partial(_match_spec, mesh), out_rep, out_names_thunk(), outs_)
 core.EvalTrace.process_shard_map = _shard_map_impl
 
@@ -290,6 +320,12 @@ def _match_spec(mesh: Mesh, rep: Set[AxisName], dst: AxisNames, x: JaxType
   if not _valid_repeats(rep, dst):
     raise Exception  # TODO add parameter to opt out of check
   return jax.jit(_get_matcher(mesh, tuple(dst.items())))(x)
+
+def _check_names(names: Sequence[AxisNames], xs: JaxType) -> None:
+  failures = [core.raise_to_shaped(core.get_aval(x)) if not max(ns) < x.ndim - 1
+              else None for ns, x in zip(names, xs)]
+  if any(failures): raise _SpecError(failures)
+class _SpecError(Exception): pass
 
 @lru_cache()
 def _get_matcher(mesh, dst_tup):
@@ -464,6 +500,7 @@ def _shard_map_partial_eval(self, shard_map_p, f, tracers, mesh, in_names,
   unk_in_names, known_in_names = pe.partition_list(in_knowns, in_names)
   unk_in_avals_sharded = map(partial(_shard_aval, mesh), unk_in_names, unk_in_avals)
   f = pe.trace_to_subjaxpr_nounits(f, self.main, False)
+  f = _promote_scalar_residuals(f)
   f_known, aux = pe.partial_eval_wrapper_nounits(f, tuple(in_knowns),
                                                  tuple(unk_in_avals_sharded))
   unk_in_names, known_in_names = pe.partition_list(in_knowns, in_names)
@@ -472,12 +509,16 @@ def _shard_map_partial_eval(self, shard_map_p, f, tracers, mesh, in_names,
   def known_out_names():
     out_knowns, _, jaxpr, _ = aux()
     _, out_known_names = pe.partition_list(out_knowns, out_names_thunk())
+    assert not any(not v.aval.shape for v in jaxpr.constvars)
     res_names = ({0: (*mesh.axis_names,)},) * len(jaxpr.constvars)
     return (*out_known_names, *res_names)
 
   known_params = dict(mesh=mesh, in_names=(*known_in_names,),
                       out_names_thunk=known_out_names)
-  out = shard_map_p.bind(f_known, *in_consts, **known_params)
+  try:
+    out = shard_map_p.bind(f_known, *in_consts, **known_params)
+  except _SpecError as e:
+    breakpoint()
   out_knowns, out_avals_sharded, jaxpr, env = aux()
   out_consts, res = pe.split_list(out, [len(out) - len(jaxpr.constvars)])
   with core.extend_axis_env_nd(mesh.shape.items()):
@@ -498,7 +539,23 @@ def _shard_map_partial_eval(self, shard_map_p, f, tracers, mesh, in_names,
                           jaxpr.effects, source_info_util.current())
   for t in out_tracers: t.recipe = eqn
   return pe.merge_lists(out_knowns, out_tracers, out_consts)
-partial_eval.JaxprTrace.process_shard_map = _shard_map_partial_eval
+pe.JaxprTrace.process_shard_map = _shard_map_partial_eval
+
+@lu.transformation
+def _promote_scalar_residuals(*args, **kwargs):
+  jaxpr, (out_pvals, out_consts, env) = yield args, kwargs
+  which_scalar = [isinstance(v.aval, core.ShapedArray) and not v.aval.shape
+                  for v in jaxpr.constvars]
+  out_consts_ = [jax.lax.broadcast(x, (1,)) if scalar else x
+                 for x, scalar in zip(out_consts, which_scalar)]
+  @lu.wrap_init
+  def fun(*args):
+    out_consts = [x.reshape(*x.shape[1:]) if scalar else x
+                  for x, scalar in zip(out_consts_, which_scalar)]
+    return core.eval_jaxpr(jaxpr, out_consts, *args)
+  in_avals = [v.aval for v in jaxpr.invars]
+  jaxpr, _, out_consts  = pe.trace_to_jaxpr_dynamic(fun, in_avals)
+  yield jaxpr, (out_pvals, out_consts, env)
 
 # Crappy in-line tests, to be deleted.
 
@@ -542,9 +599,9 @@ if __name__ == '__main__':
 
   # # autodiff tests
 
-  # def g(x):
-  #   return shard_map(f, mesh, in_specs=(P('x', 'y'),), out_specs=P('x', 'y'))(x)
-  # print(jax.jvp(g, [x], [x]))
+  def g(x):
+    return shard_map(f, mesh, in_specs=(P('x', 'y'),), out_specs=P('x', 'y'))(x)
+  print(jax.jvp(g, [x], [x]))
 
   # from jax._src.test_util import check_grads
 
@@ -552,8 +609,8 @@ if __name__ == '__main__':
 
   # y, y_dot = jax.jvp(g, [x], [x])
 
-  # y_, g_lin = jax.linearize(g, x)
-  # y_dot_ = g_lin(x)
+  y_, g_lin = jax.linearize(g, x)
+  y_dot_ = g_lin(x)
 
   # print(jnp.allclose(y, y_))
   # print(jnp.allclose(y_dot, y_dot_))
