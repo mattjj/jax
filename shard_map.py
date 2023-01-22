@@ -14,9 +14,10 @@ from jax._src import linear_util as lu
 from jax._src import source_info_util
 from jax._src import traceback_util
 from jax._src import util
-from jax._src.lax import parallel as lax_parallel
+from jax._src.lax import lax, parallel as lax_parallel
 from jax._src.sharding import NamedSharding, PartitionSpec
-from jax._src.util import (prod, HashableFunction, unzip2, unzip3, as_hashable_function, memoize)
+from jax._src.util import (prod, HashableFunction, unzip2, unzip3,
+                           as_hashable_function, memoize)
 from jax.api_util import flatten_fun_nokwargs
 from jax.experimental import maps
 from jax.interpreters import batching
@@ -26,8 +27,10 @@ from jax.interpreters import xla
 from jax.interpreters import pxla
 from jax.interpreters import ad
 from jax.interpreters.pxla import Mesh
-from jax.tree_util import (tree_map, tree_flatten, tree_unflatten, tree_structure, tree_leaves)
-from jax._src.tree_util import (broadcast_prefix, prefix_errors, PyTreeDef, _generate_key_paths)
+from jax.tree_util import (tree_map, tree_flatten, tree_unflatten,
+                           tree_structure, tree_leaves)
+from jax._src.tree_util import (broadcast_prefix, prefix_errors, PyTreeDef,
+                                _generate_key_paths)
 
 P = PartitionSpec
 
@@ -52,7 +55,7 @@ traceback_util.register_exclusion(__file__)
 #        [x] broadcast_prefix errors
 #        [x] if output rank doesn't match out spec for concatenation
 #        [x] validate that in_specs / out_specs are indeed pytrees of pspecs
-# TODO [ ] remove default rep rule behavior in favor of convenience wrappers<
+# TODO [ ] remove default rep rule behavior in favor of convenience wrappers,
 #          and add good rule coverage
 # TODO [ ] actually write thorough tests...
 # TODO [ ] try nesting
@@ -507,16 +510,24 @@ def _prim_applier(prim, params_tup, mesh):
   return apply
 
 def _rep_rule(prim, *in_rep, **params):
-  return set.intersection(*in_rep)
+  raise NotImplementedError(f"no replication rule for {prim}")
 
 _rep_rules = {}
 register_rule = lambda prim: lambda rule: _rep_rules.setdefault(prim, rule)
+register_standard = lambda prim: _rep_rules.setdefault(prim, _standard_rep_rule)
+
+def _standard_rep_rule(*in_rep, **_):
+  return set.intersection(*in_rep)
+
+register_standard(lax.dot_general_p)
+register_standard(lax_parallel.reduce_scatter_p)
+register_standard(lax_parallel.ppermute_p)
+register_standard(lax_parallel.all_to_all_p)
 
 @register_rule(lax_parallel.psum_p)
 def _psum_rule(*in_rep, axes, axis_index_groups):
   if axis_index_groups is not None: raise NotImplementedError
-  if not isinstance(axes, tuple):
-    axes = axes,
+  axes = (axes,) if not isinstance(axes, tuple) else axes
   return [r | set(axes) for r in in_rep]
 
 @register_rule(lax_parallel.all_gather_p)
@@ -525,8 +536,7 @@ def _all_gather_p(in_rep, all_gather_dimension, axis_name, axis_size,
   if axis_index_groups is not None: raise NotImplementedError
   if not tiled: raise NotImplementedError
   del axis_index_groups, tiled, axis_size, all_gather_dimension
-  if not isinstance(axis_name, tuple):
-    axis_name = axis_name,
+  axis_name = (axis_name,) if not isinstance(axis_name, tuple) else axis_name
   return in_rep | set(axis_name)
 
 # Batching
