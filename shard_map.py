@@ -52,10 +52,12 @@ traceback_util.register_exclusion(__file__)
 #        [x] broadcast_prefix errors
 #        [x] if output rank doesn't match out spec for concatenation
 #        [x] validate that in_specs / out_specs are indeed pytrees of pspecs
+# TODO [ ] actually write tests...
 # TODO [ ] try nesting
+#        [ ] eager
+#        [ ] staged: convert out and then back into manual in lowering rule?
 # TODO [ ] more rep rules
 # TODO [ ] try to implement (nested) pmap in terms of shard_map
-# TODO [ ] actually write tests...
 # TODO [ ] custom_jvp / custom_vjp eager handling
 # TODO [ ] name stack
 
@@ -272,13 +274,18 @@ def _unshard_aval(mesh: Mesh, names: AxisNames, aval: core.AbstractValue
 
 def _shard_map_typecheck(*in_atoms, jaxpr, mesh, in_names, out_names):
   for v, x, in_name in zip(jaxpr.invars, in_atoms, in_names):
-    if not core.typecompat(v.aval, _shard_aval(mesh, x.aval)):
-      raise core.JaxprTypeError()
-  core.check_jaxpr(jaxpr)
+    if not core.typecompat(v.aval, _shard_aval(mesh, in_name, x.aval)):
+      raise core.JaxprTypeError("shard_map argument avals not compatible with "
+                                "jaxpr binder avals and in_names")
+  with core.extend_axis_env_nd(tuple(mesh.shape.items())):
+    core.check_jaxpr(jaxpr)
   in_rep = map(partial(_in_names_to_rep, mesh), in_names)
   out_rep = _output_rep(mesh, jaxpr, in_rep)
   for rep, dst in zip(out_rep, out_names):
-    if not _valid_repeats(rep, dst): raise core.JaxprTypeError()
+    if not _valid_repeats(mesh, rep, dst):
+      # TODO add parameter to opt out of check
+      raise core.JaxprTypeError("shard_map can't prove output is sufficiently "
+                                "replicated")
   out_avals_sharded = [x.aval for x in jaxpr.outvars]
   out_avals = map(partial(_unshard_aval, mesh), out_names, out_avals_sharded)
   return out_avals, jaxpr.effects
@@ -309,7 +316,7 @@ def _output_rep(mesh: Mesh, jaxpr: core.Jaxpr, in_rep: Sequence[Set[AxisName]],
       write(e.outvars[0], out_rep)
   return map(read, jaxpr.outvars)
 
-def _valid_repeats(rep: Set[AxisName], dst: AxisNames) -> bool:
+def _valid_repeats(mesh: Mesh, rep: Set[AxisName], dst: AxisNames) -> bool:
   unmentioned = set(mesh.axis_names) - {n for ns in dst.values() for n in ns}
   return unmentioned.issubset(rep)
 
@@ -388,7 +395,7 @@ def _get_unmatcher(mesh, src_tup):
 
 def _match_spec(mesh: Mesh, rep: Set[AxisName], dst: AxisNames, x: JaxType
                 ) -> JaxType:
-  if not _valid_repeats(rep, dst):
+  if not _valid_repeats(mesh, rep, dst):
     raise Exception  # TODO add parameter to opt out of check
   return jax.jit(_get_matcher(mesh, tuple(dst.items())))(x)
 
@@ -502,12 +509,25 @@ def _rep_rule(prim, *in_rep, **params):
   return set.intersection(*in_rep)
 
 _rep_rules = {}
+# TODO remove default behavior?
 register_rule = lambda prim: lambda rule: _rep_rules.setdefault(prim, rule)
 
 @register_rule(lax_parallel.psum_p)
 def _psum_rule(*in_rep, axes, axis_index_groups):
   if axis_index_groups is not None: raise NotImplementedError
+  if not isinstance(axes, tuple):
+    axes = axes,
   return [r | set(axes) for r in in_rep]
+
+@register_rule(lax_parallel.all_gather_p)
+def _all_gather_p(in_rep, all_gather_dimension, axis_name, axis_size,
+                  axis_index_groups, tiled):
+  if axis_index_groups is not None: raise NotImplementedError
+  if not tiled: raise NotImplementedError
+  del axis_index_groups, tiled, axis_size, all_gather_dimension
+  if not isinstance(axis_name, tuple):
+    axis_name = axis_name,
+  return in_rep | set(axis_name)
 
 # Batching
 
@@ -661,13 +681,13 @@ if __name__ == '__main__':
 
   ## nesting
 
-#   @partial(shard_map, mesh=mesh, in_specs=P('x'), out_specs=P('x'))
-#   def f(x):
-#     @partial(shard_map, mesh=mesh, in_specs=('y'), out_specs=P('y'))
-#     def g(x):
-#       return x
-#     return g(x)
-#   jax.jit(f)(x)
+  @partial(shard_map, mesh=mesh, in_specs=P('x'), out_specs=P('x'))
+  def f(x):
+    @partial(shard_map, mesh=mesh, in_specs=P('x', 'y'), out_specs=P('x', 'y'))
+    def g(x):
+      return x
+    return g(x)
+  f(x)
 
   # # autodiff tests
 

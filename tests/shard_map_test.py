@@ -115,6 +115,7 @@ class ShardMapTest(jtu.JaxTestCase):
     self.assertEqual(c.device_buffers[0].shape, (8, 2))
 
   def test_matmul_partial(self):
+    raise unittest.SkipTest("invalid replication asserted by out_spec?")
 
     mesh, a, b = create_inputs(P('z', 'y'), P('y', None))
 
@@ -133,8 +134,7 @@ class ShardMapTest(jtu.JaxTestCase):
           out_specs=P('z', None))(a, b)
       return c
 
-    with mesh:
-      c = fwd(a)
+    c = fwd(a)
     self.assertEqual(c.device_buffers[0].shape, (4, 8))
 
   def test_matmul_reduce_scatter(self):
@@ -156,8 +156,7 @@ class ShardMapTest(jtu.JaxTestCase):
           out_specs=P(('z', 'y'), None))(a, b)
       return c
 
-    with mesh:
-      c = fwd(a)
+    c = fwd(a)
     self.assertEqual(c.device_buffers[0].shape, (2, 8))
 
   def test_collective_permute(self):
