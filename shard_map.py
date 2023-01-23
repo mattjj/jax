@@ -519,25 +519,38 @@ register_standard = lambda prim: _rep_rules.setdefault(prim, _standard_rep_rule)
 def _standard_rep_rule(*in_rep, **_):
   return set.intersection(*in_rep)
 
-register_standard(lax.dot_general_p)
-register_standard(lax_parallel.reduce_scatter_p)
+for o in lax.__dict__.values():
+  if isinstance(o, core.Primitive): register_standard(o)
+
 register_standard(lax_parallel.ppermute_p)
-register_standard(lax_parallel.all_to_all_p)
 
 @register_rule(lax_parallel.psum_p)
 def _psum_rule(*in_rep, axes, axis_index_groups):
   if axis_index_groups is not None: raise NotImplementedError
   axes = (axes,) if not isinstance(axes, tuple) else axes
-  return [r | set(axes) for r in in_rep]
+  return [r | set(axes) for r in in_rep]  # introduces replication
 
 @register_rule(lax_parallel.all_gather_p)
-def _all_gather_p(in_rep, all_gather_dimension, axis_name, axis_size,
-                  axis_index_groups, tiled):
+def _all_gather_rule(in_rep, *, all_gather_dimension, axis_name, axis_size,
+                     axis_index_groups, tiled):
   if axis_index_groups is not None: raise NotImplementedError
   if not tiled: raise NotImplementedError
-  del axis_index_groups, tiled, axis_size, all_gather_dimension
   axis_name = (axis_name,) if not isinstance(axis_name, tuple) else axis_name
-  return in_rep | set(axis_name)
+  return in_rep | set(axis_name)  # introduces replication
+
+@register_rule(lax_parallel.reduce_scatter_p)
+def _reduce_scatter_rule(in_rep, *, scatter_dimension, axis_name, axis_size,
+                         axis_index_groups, tiled):
+  if axis_index_groups is not None: raise NotImplementedError
+  if not tiled: raise NotImplementedError
+  return in_rep - {axis_name}  # removes replication
+
+@register_rule(lax_parallel.all_to_all_p)
+def _reduce_scatter_rule(in_rep, *, split_axis, concat_axis, axis_name,
+                         axis_index_groups):
+  if axis_index_groups is not None: raise NotImplementedError
+  return in_rep - {axis_name}  # removes replication
+
 
 # Batching
 
