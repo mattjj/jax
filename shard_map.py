@@ -617,10 +617,7 @@ def _shard_map_partial_eval(self, shard_map_p, f, tracers, mesh, in_names,
 
   known_params = dict(mesh=mesh, in_names=(*known_in_names,),
                       out_names_thunk=known_out_names)
-  try:
-    out = shard_map_p.bind(f_known, *in_consts, **known_params)
-  except _SpecError as e:
-    breakpoint()
+  out = shard_map_p.bind(f_known, *in_consts, **known_params)
   out_knowns, out_avals_sharded, jaxpr, env = aux()
   out_consts, res = pe.split_list(out, [len(out) - len(jaxpr.constvars)])
   with core.extend_axis_env_nd(mesh.shape.items()):
