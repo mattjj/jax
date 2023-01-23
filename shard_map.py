@@ -54,7 +54,10 @@ traceback_util.register_exclusion(__file__)
 #        [x] broadcast_prefix errors
 #        [x] if output rank doesn't match out spec for concatenation
 #        [x] validate that in_specs / out_specs are indeed pytrees of pspecs
+#        [x] axis isn't evenly divisible
 #        [ ] "shard_map can't prove", and add option to opt out of this check
+#        [ ] maybe switch from 'exhaustive' errors to 'statistics' errors, like
+#            https://github.com/google/jax/pull/12800
 # TODO [x] remove default rep rule behavior in favor of convenience wrappers,
 #          and add good rule coverage
 # TODO [ ] actually write thorough tests...
@@ -88,7 +91,7 @@ def shard_map(f: Callable, mesh: Mesh, in_specs: Specs, out_specs: Specs):
     except ValueError:
       e, *_ = prefix_errors(in_specs, args)
       raise e('shard_map in_specs') from None
-    _check_flat_specs(f, in_tree, in_specs, in_specs_flat, args_flat)
+    _check_specs_vs_args(f, mesh, in_tree, in_specs, in_specs_flat, args_flat)
     in_names_flat = tuple(map(_canonicalize_spec, in_specs_flat))
     flat_fun, out_tree = flatten_fun_nokwargs(fun, in_tree)
 
@@ -105,29 +108,15 @@ def shard_map(f: Callable, mesh: Mesh, in_specs: Specs, out_specs: Specs):
           flat_fun, *args_flat, mesh=mesh, in_names=in_names_flat,
           out_names_thunk=out_names_thunk)
     except _SpecError as e:
-      failures, = e.args
-      msg = _spec_error(SpecErrorType.out, f, out_tree(), out_specs, failures)
-      if any(fail and not fail.shape for fail in failures):
+      fails, = e.args
+      msg = _spec_rank_error(SpecErrorType.out, f, out_tree(), out_specs, fails)
+      if any(fail and not fail.shape for fail in fails):
         msg += (" In particular, for rank 0 outputs which are not constant "
                 "over the mesh, add at least one (singleton) axis to them so "
                 "that they can be concatenated using out_specs.")
       raise ValueError(msg) from None
     return tree_unflatten(out_tree(), out_flat)
   return wrapped
-
-def _check_specs(error_type: SpecErrorType, specs: Any) -> None:
-  maybe_specs = tree_leaves(specs)
-  if all(isinstance(p, P) for p in maybe_specs):
-    return
-  prefix = 'in' if error_type == SpecErrorType.input else 'out'
-  specs_aug = _generate_key_paths(specs)
-  msgs = [f"  {prefix}_specs{key.pprint()} is {x} of type {type(x).__name__}, "
-          for key, x in _generate_key_paths(specs) if not isinstance(x, P)]
-  raise TypeError(
-      f"shard_map {prefix}_specs argument must be a pytree of "
-      f"`jax.sharding.PartitionSpec` instances, but:\n\n"
-      + '\n\n'.join(msgs) + '\n\n'
-      f"Check the {prefix}_specs values passed to shard_map.")
 
 # Internally use AxisNames = Dict[int, Tuple[AxisName, ...]], not PartitionSpecs
 AxisName = Hashable
@@ -139,57 +128,122 @@ def _canonicalize_spec(spec: PartitionSpec) -> AxisNames:
   else:
     return spec
 
-def _check_flat_specs(f: Callble, in_tree, in_specs: Specs,
-                      in_specs_flat: List[P], xs: List) -> None:
-  in_avals = [core.raise_to_shaped(core.get_aval(x)) for x in xs]
-  fail = [a if not len(p) <= a.ndim else False
-          for p, a in zip(in_specs_flat, in_avals)]
-  if any(fail):
-    msg = _spec_error(SpecErrorType.input, f, in_tree, in_specs, fail)
-    raise ValueError(msg)
+# Error checking and messages
 
 SpecErrorType = enum.Enum('SpecErrorType', ['input', 'out'])
 
-def _spec_error(error_type: SpecErrorType, f: Callable, tree: PyTreeDef,
-                specs: Specs, failures_flat: List[core.ShapedArray]) -> str:
+def _check_specs(error_type: SpecErrorType, specs: Any) -> None:
+  if all(isinstance(p, P) for p in tree_leaves(specs)): return
+  prefix = 'in' if error_type == SpecErrorType.input else 'out'
+  specs_aug = _generate_key_paths(specs)
+  msgs = [f"  {prefix}_specs{key.pprint()} is {x} of type {type(x).__name__}, "
+          for key, x in _generate_key_paths(specs) if not isinstance(x, P)]
+  raise TypeError(
+      f"shard_map {prefix}_specs argument must be a pytree of "
+      f"`jax.sharding.PartitionSpec` instances, but:\n\n"
+      + '\n\n'.join(msgs) + '\n\n'
+      f"Check the {prefix}_specs values passed to shard_map.")
+
+def _check_specs_vs_args(
+    f: Callble, mesh: Mesh, in_tree: PyTreeDef, in_specs: Specs,
+    in_specs_flat: List[P], xs: List) -> None:
+  in_avals = [core.raise_to_shaped(core.get_aval(x)) for x in xs]
+  fail = [a if not len(p) <= a.ndim else False  # bool b/c None is a pytree
+          for p, a in zip(in_specs_flat, in_avals)]
+  if any(fail):
+    msg = _spec_rank_error(SpecErrorType.input, f, in_tree, in_specs, fail)
+    raise ValueError(msg)
+  in_names_flat = tuple(map(_canonicalize_spec, in_specs_flat))
+  fail = [a if any(a.shape[d] % prod(mesh.shape[n] for n in ns)
+                   for d, ns in names.items()) else False
+          for a, names in zip(in_avals, in_names_flat)]
+  if any(fail):
+    msg = _spec_divisibility_error(f, mesh, in_tree, in_specs, fail)
+    raise ValueError(msg)
+
+def _spec_rank_error(
+    error_type: SpecErrorType, f: Callable, tree: PyTreeDef, specs: Specs,
+    fails: List[Union[core.ShapedArray, bool]]) -> str:
   if error_type == SpecErrorType.input:
     prefix, base = 'in', 'args'
-    dummy_args = tree_unflatten(tree, [False] * tree.num_leaves)
-    try:
-      ba = inspect.signature(f).bind(*dummy_args)
-    except (TypeError, ValueError):
-      ba = None
+    ba = _try_infer_args(f, tree)
   else:
     prefix, base = 'out', f'{f.__name__}(*args)'
-  failures = tree_unflatten(tree, failures_flat)
-  failures_aug = _generate_key_paths(failures)
-  out_specs_ = tree_unflatten(tree_structure(specs), _generate_key_paths(specs))
-  leaf = lambda x: type(x) is tuple and len(x) == 2 and type(x[1]) is P
-  out_specs_aug = broadcast_prefix(out_specs_, failures, is_leaf=leaf)
   msgs = []
-  for (spec_key, spec), (fail_key, fail) in zip(out_specs_aug, failures_aug):
-    if fail:
-      if error_type == SpecErrorType.input and ba is not None:
-        arg_key, *keys = fail_key.keys
-        extra = (f", where {base}[{arg_key.key}] is bound to {f.__name__}'s "
-                 f"parameter {list(ba.arguments.keys())[arg_key.key]},")
-      else:
-        extra = ""
-      msgs.append(
-          f"  {prefix}_specs{spec_key.pprint()} is {spec} which has length "
-          f"{len(spec)}, but\n"
-          f"  {base}{fail_key.pprint()}{extra} has shape {fail.str_short()}, "
-          f"which has rank {fail.ndim} (<{len(spec)})")
+  for (spec_key, spec), (fail_key, aval) in _iter_paths(tree, specs, fails):
+    if error_type == SpecErrorType.input and ba is not None:
+      arg_key, *_ = fail_key.keys
+      extra = (f", where {base}[{arg_key.key}] is bound to {f.__name__}'s "
+               f"parameter '{list(ba.arguments.keys())[arg_key.key]}',")
+    else:
+      extra = ""
+    msgs.append(
+        f"{prefix}_specs{spec_key.pprint()} is {spec} which has length "
+        f"{len(spec)}, but"
+        f"{base}{fail_key.pprint()}{extra} has shape {aval.str_short()}, "
+        f"which has rank {aval.ndim} (and {aval.ndim} < {len(spec)})")
   assert msgs
   msg = (f"shard_map applied to the function '{f.__name__}' was given an "
          f"{prefix}_specs entry which is too long to be compatible with the "
          f"corresponding {prefix}put value from the function:\n\n"
-         + '\n'.join(msgs) + '\n\n' +
+         + '\n\n'.join(msgs) + '\n\n' +
          f"Entries in {prefix}_specs must be of length no greater than the "
          f"number of axes in the corresponding {prefix}put value.\n\n"
          f"Either revise the spec to be shorter, or modify '{f.__name__}' so "
          f"that its {prefix}puts have sufficient rank.")
   return msg
+
+def _spec_divisibility_error(
+    f: Callable, mesh: Mesh, tree: PyTreeDef, specs: Specs,
+    fails: List[Union[core.ShapedArray, bool]]) -> str:
+  ba = _try_infer_args(f, tree)
+  msgs = []
+  for (spec_key, spec), (fail_key, aval) in _iter_paths(tree, specs, fails):
+    if ba is not None:
+      arg_key, *_ = fail_key.keys
+      extra = (f", where args[{arg_key.key}] is bound to {f.__name__}'s "
+               f"parameter '{list(ba.arguments.keys())[arg_key.key]}',")
+    names = _canonicalize_spec(spec)
+    for d, ns in names.items():
+      if aval.shape[d] % prod(mesh.shape[n] for n in ns):
+        axis = f"axes {ns}" if len(ns) > 1 else f"axis '{ns[0]}'"
+        total = 'total ' if len(ns) > 1 else ''
+        sz = prod(mesh.shape[n] for n in ns)
+        msgs.append(
+            f"args{fail_key.pprint()} of shape {aval.str_short()}{extra} "
+            f"corresponds to in_specs{spec_key.pprint()} of value {spec}, "
+            f"which maps array axis {d} (of size {aval.shape[d]}) to mesh "
+            f"{axis} (of {total}size {sz}), but {sz} does not evenly divide "
+            f"{aval.shape[d]}")
+  assert msgs
+  msg = (f"shard_map applied to the function '{f.__name__}' was given argument "
+         f"arrays with axis sizes that are not evenly divisible by the "
+         f"corresponding mesh axis sizes:\n\n"
+         f"The mesh given has shape {mesh.device_ids.shape} with corresponding "
+         f"axis names {mesh.axis_names}.\n\n"
+         + '\n\n'.join(msgs) + '\n\n' +
+         f"Array arguments' axis sizes must be evenly divisible by the mesh "
+         f"axis or axes indicated by the corresponding elements of the "
+         f"argument's in_specs entry. Consider checking that in_pspecs are "
+         f"correct, and if so consider changing the mesh axis sizes or else "
+         f"padding the input and adapting '{f.__name__}' appropriately.")
+  return msg
+
+def _try_infer_args(f, tree):
+  dummy_args = tree_unflatten(tree, [False] * tree.num_leaves)
+  try:
+    return inspect.signature(f).bind(*dummy_args)
+  except (TypeError, ValueError):
+    return None
+
+def _iter_paths(
+    tree: PyTreeDef, specs: Specs, fails: List[Union[core.ShapedArray, bool]]):
+  failures = tree_unflatten(tree, fails)
+  failures_aug = _generate_key_paths(failures)
+  specs_ = tree_unflatten(tree_structure(specs), _generate_key_paths(specs))
+  leaf = lambda x: type(x) is tuple and len(x) == 2 and type(x[1]) is P
+  specs_aug = broadcast_prefix(specs_, failures, is_leaf=leaf)
+  return list(filter(lambda tup: tup[1][0], zip(specs_aug, failures_aug)))
 
 # Primitive
 
@@ -703,11 +757,12 @@ if __name__ == '__main__':
 
   @partial(shard_map, mesh=mesh, in_specs=P('x'), out_specs=P('x'))
   def f(x):
-    @partial(shard_map, mesh=mesh, in_specs=P('x', 'y'), out_specs=P('x', 'y'))
-    def g(x):
-      return x
-    return g(x)
-  f(x)
+    return x
+    # @partial(shard_map, mesh=mesh, in_specs=P('x', 'y'), out_specs=P('x', 'y'))
+    # def g(x):
+    #   return x
+    # return g(x)
+  f(np.arange(5.))
 
   # # autodiff tests
 
