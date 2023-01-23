@@ -1,5 +1,5 @@
 colorama>=0.4.4
-flatbuffers==2.0
+flatbuffers==23.1.21
 pillow>=8.3.1
 pytest-benchmark
 pytest-xdist
