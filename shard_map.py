@@ -44,18 +44,18 @@ traceback_util.register_exclusion(__file__)
 #     ipdb.pm()
 # sys.excepthook = info
 
-
 # TODO [-] autodiff w/ sholto@
 #        [x] jvp
 #        [x] partial eval
 #        [ ] transpose
 # TODO [x] better eager repr
 # TODO [x] fix scalar residual problem
-# TODO [x] better errors
+# TODO [-] better errors
 #        [x] broadcast_prefix errors
 #        [x] if output rank doesn't match out spec for concatenation
 #        [x] validate that in_specs / out_specs are indeed pytrees of pspecs
-# TODO [ ] remove default rep rule behavior in favor of convenience wrappers,
+#        [ ] "shard_map can't prove", and add option to opt out of this check
+# TODO [x] remove default rep rule behavior in favor of convenience wrappers,
 #          and add good rule coverage
 # TODO [ ] actually write thorough tests...
 # TODO [ ] try nesting
@@ -71,7 +71,6 @@ Specs = Any  # PyTree[PartitionSpec]
 
 @traceback_util.api_boundary
 def shard_map(f: Callable, mesh: Mesh, in_specs: Specs, out_specs: Specs):
-  # TODO improve these error messages
   if not callable(f):
     raise TypeError("shard_map requires a callable for its first argument, "
                     f"but got {f} of type {type(f)}.")
@@ -287,7 +286,6 @@ def _shard_map_typecheck(*in_atoms, jaxpr, mesh, in_names, out_names):
   out_rep = _output_rep(mesh, jaxpr, in_rep)
   for rep, dst in zip(out_rep, out_names):
     if not _valid_repeats(mesh, rep, dst):
-      # TODO add parameter to opt out of check
       raise core.JaxprTypeError("shard_map can't prove output is sufficiently "
                                 "replicated")
   out_avals_sharded = [x.aval for x in jaxpr.outvars]
@@ -400,7 +398,8 @@ def _get_unmatcher(mesh, src_tup):
 def _match_spec(mesh: Mesh, rep: Set[AxisName], dst: AxisNames, x: JaxType
                 ) -> JaxType:
   if not _valid_repeats(mesh, rep, dst):
-    raise Exception  # TODO add parameter to opt out of check
+    raise Exception("shard_map couldn't prove output is sufficiently "
+                    "replicated")
   return jax.jit(_get_matcher(mesh, tuple(dst.items())))(x)
 
 def _check_names(names: Sequence[AxisNames], avals: core.ShapedArray) -> None:
@@ -509,6 +508,8 @@ def _prim_applier(prim, params_tup, mesh):
     return tree_map(_add_singleton, outs)
   return apply
 
+# Static replication checking
+
 def _rep_rule(prim, *in_rep, **params):
   raise NotImplementedError(f"no replication rule for {prim}")
 
@@ -522,7 +523,7 @@ def _standard_rep_rule(*in_rep, **_):
 for o in lax.__dict__.values():
   if isinstance(o, core.Primitive): register_standard(o)
 
-register_standard(lax_parallel.ppermute_p)
+register_standard(lax_parallel.ppermute_p)  # doesn't change replication
 
 @register_rule(lax_parallel.psum_p)
 def _psum_rule(*in_rep, axes, axis_index_groups):
@@ -550,7 +551,6 @@ def _reduce_scatter_rule(in_rep, *, split_axis, concat_axis, axis_name,
                          axis_index_groups):
   if axis_index_groups is not None: raise NotImplementedError
   return in_rep - {axis_name}  # removes replication
-
 
 # Batching
 
