@@ -323,7 +323,9 @@ def _unshard_aval(mesh: Mesh, names: AxisNames, aval: core.AbstractValue
                  ) -> core.AbstractValue:
   if isinstance(aval, core.ShapedArray):
     return aval.update(tuple(sz * prod(mesh.shape[n] for n in names.get(i, ()))
-                             for i, sz in enumerate(aval.shape)))
+                             for i, sz in enumerate(aval.shape)),
+                       named_shape={k: v for k, v in aval.named_shape.items()
+                                    if k not in mesh.shape})
   else:
     raise NotImplementedError  # TODO add table with handlers
 
@@ -723,6 +725,20 @@ def _promote_scalar_residuals(*args, **kwargs):
   jaxpr, _, out_consts  = pe.trace_to_jaxpr_dynamic(fun, in_avals)
   yield jaxpr, (out_pvals, out_consts, env)
 
+# TODO do we really need axis substitution? (only for used_axis_names...)
+def _shard_map_axis_subst(params, subst, traverse):
+  if 'jaxpr' not in params:
+    return params
+  if not traverse:
+    return params
+  def shadowed_subst(name):
+    return (name,) if name in params['mesh'].shape else subst(name)
+  with core.extend_axis_env_nd(params['mesh'].shape.items()):
+    new_jaxpr = core.subst_axis_names_jaxpr(params['jaxpr'], shadowed_subst)
+  return dict(params, jaxpr=new_jaxpr)
+core.axis_substitution_rules[shard_map_p] = _shard_map_axis_subst
+
+
 # Crappy in-line tests, to be deleted.
 
 if __name__ == '__main__':
@@ -755,14 +771,14 @@ if __name__ == '__main__':
 
   ## nesting
 
-  @partial(shard_map, mesh=mesh, in_specs=P('x'), out_specs=P('x'))
-  def f(x):
-    return x
-    # @partial(shard_map, mesh=mesh, in_specs=P('x', 'y'), out_specs=P('x', 'y'))
-    # def g(x):
-    #   return x
-    # return g(x)
-  f(np.arange(5.))
+  # @partial(shard_map, mesh=mesh, in_specs=P('x'), out_specs=P('x'))
+  # def f(x):
+  #   return x
+  #   # @partial(shard_map, mesh=mesh, in_specs=P('x', 'y'), out_specs=P('x', 'y'))
+  #   # def g(x):
+  #   #   return x
+  #   # return g(x)
+  # f(np.arange(5.))
 
   # # autodiff tests
 
@@ -890,3 +906,4 @@ if __name__ == '__main__':
   #   print('good error')
   # else:
   #   raise Exception('uh oh')
+
