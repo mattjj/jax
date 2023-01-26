@@ -1,3 +1,16 @@
+# Copyright 2023 The JAX Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from __future__ import annotations
 
 import enum
@@ -5,11 +18,13 @@ from functools import partial, lru_cache
 import inspect
 from typing import (Any, Callable, Optional, Tuple, List, Set, Sequence, Dict,
                     Hashable, Union)
+
 import numpy as np
 
 import jax
 from jax import core
 from jax.core import Tracer
+from jax._src import ad_util
 from jax._src import linear_util as lu
 from jax._src import source_info_util
 from jax._src import traceback_util
@@ -501,9 +516,7 @@ class ShardMapTrace(core.Trace):
   def process_call(self, call_primitive, fun, tracers, params):
     if call_primitive is not xla.xla_call_p: raise NotImplementedError
     fun, jaxpr = _something_shady(fun)  # TODO remove when jit is initial style
-    bind = HashableFunction(
-        lambda *args, **kwargs: call_primitive.bind(fun, *args, **kwargs),
-        (call_primitive, fun))
+    bind = partial(call_primitive.bind, fun)  # TODO caching
     fake_primitive = pxla._FakePrimitive(multiple_results=True, bind=bind)
     _rep_rules[fake_primitive] = lambda *_, **__: set()
     out_tracers_ = self.process_primitive(fake_primitive, tracers, params)
@@ -512,8 +525,8 @@ class ShardMapTrace(core.Trace):
     return map(partial(ShardMapTracer, self), out_rep, out_vals)
 
 @lu.transformation_with_aux
-def _something_shady(*args, **kwargs):
-  out = yield args, kwargs
+def _something_shady(*args):
+  out = yield args, {}
   main = core.thread_local_state.trace_state.trace_stack.dynamic  # forgive me
   jaxpr, _ = main.jaxpr_stack[-1].to_jaxpr(out)
   yield out, jaxpr
@@ -578,6 +591,7 @@ def _standard_rep_rule(*in_rep, **_):
 
 for o in lax.__dict__.values():
   if isinstance(o, core.Primitive): register_standard(o)
+register_standard(ad_util.add_any_p)
 
 register_standard(lax_parallel.ppermute_p)  # doesn't change replication
 
@@ -655,7 +669,7 @@ def _shard_map_jvp(self, shard_map_p, f, tracers, mesh, in_names,
     out_ax = out_names_thunk()
     return (*out_ax, *(ax for ax, nz in zip(out_ax, which_nz_out()) if nz))
   params = dict(mesh=mesh, in_names=(*in_names, *tangent_in_names),
-            out_names_thunk=new_out_names_thunk)
+                out_names_thunk=new_out_names_thunk)
   f_jvp, out_tree = ad.traceable(f_jvp, in_tree)
   result = shard_map_p.bind(f_jvp, *args, **params)
   primal_out, tangent_out = tree_unflatten(out_tree(), result)
@@ -667,13 +681,13 @@ ad.JVPTrace.process_shard_map = _shard_map_jvp
 def _shard_map_partial_eval(self, shard_map_p, f, tracers, mesh, in_names,
                             out_names_thunk):
   in_pvals = [t.pval for t in tracers]
-  in_knowns, unk_in_avals, in_consts = pe.partition_pvals(in_pvals)
+  in_knowns, in_avals, in_consts = pe.partition_pvals(in_pvals)
   unk_in_names, known_in_names = pe.partition_list(in_knowns, in_names)
-  unk_in_avals_sharded = map(partial(_shard_aval, mesh), unk_in_names, unk_in_avals)
+  in_avals_sharded = map(partial(_shard_aval, mesh), unk_in_names, in_avals)
   f = pe.trace_to_subjaxpr_nounits(f, self.main, False)
   f = _promote_scalar_residuals(f)
-  f_known, aux = pe.partial_eval_wrapper_nounits(f, tuple(in_knowns),
-                                                 tuple(unk_in_avals_sharded))
+  f_known, aux = pe.partial_eval_wrapper_nounits(
+      f, (*in_knowns,), (*in_avals_sharded,))
   unk_in_names, known_in_names = pe.partition_list(in_knowns, in_names)
 
   @as_hashable_function(closure=out_names_thunk)
@@ -691,19 +705,19 @@ def _shard_map_partial_eval(self, shard_map_p, f, tracers, mesh, in_names,
   out_consts, res = pe.split_list(out, [len(out) - len(jaxpr.constvars)])
   with core.extend_axis_env_nd(mesh.shape.items()):
     jaxpr = pe.convert_constvars_jaxpr(jaxpr)
-  unknown_out_names, _ = pe.partition_list(out_knowns, out_names_thunk())
-  unknown_in_names = (({0: (*mesh.axis_names,)},) * len(res) + ({},) * len(env)
+  unk_out_names, _ = pe.partition_list(out_knowns, out_names_thunk())
+  unk_in_names = (({0: (*mesh.axis_names,)},) * len(res) + ({},) * len(env)
                       + (*unk_in_names,))
   const_tracers = map(self.new_instantiated_const, res)
   env_tracers = map(self.full_raise, env)
-  unknown_arg_tracers = [t for t in tracers if not t.is_known()]
-  unknown_params = dict(mesh=mesh, in_names=unknown_in_names,
-                        out_names=unknown_out_names, jaxpr=jaxpr)
-  out_avals = map(partial(_unshard_aval, mesh), unknown_out_names, out_avals_sharded)
+  unk_arg_tracers = [t for t in tracers if not t.is_known()]
+  unk_params = dict(mesh=mesh, in_names=unk_in_names,
+                    out_names=unk_out_names, jaxpr=jaxpr)
+  out_avals = map(partial(_unshard_aval, mesh), unk_out_names, out_avals_sharded)
   out_tracers = [pe.JaxprTracer(self, pe.PartialVal.unknown(a), None)
                  for a in out_avals]
-  eqn = pe.new_eqn_recipe((*const_tracers, *env_tracers, *unknown_arg_tracers),  # type: ignore[arg-type]
-                          out_tracers, shard_map_p, unknown_params,
+  eqn = pe.new_eqn_recipe((*const_tracers, *env_tracers, *unk_arg_tracers),  # type: ignore[arg-type]
+                          out_tracers, shard_map_p, unk_params,
                           jaxpr.effects, source_info_util.current())
   for t in out_tracers: t.recipe = eqn
   return pe.merge_lists(out_knowns, out_tracers, out_consts)
@@ -760,15 +774,6 @@ if __name__ == '__main__':
   sharding = jax.sharding.NamedSharding(mesh, P('x', 'y'))
   x = jax.device_put(jnp.arange(8 * 8.).reshape(8, 8), sharding)
 
-  ## eager repr
-
-  # print(x)
-  # @partial(shard_map, mesh=mesh, in_specs=P('x', 'y'), out_specs=P('x', 'y'))
-  # def f(x):
-  #   print(x)
-  #   return x
-  # f(x)
-
   ## nesting
 
   # @partial(shard_map, mesh=mesh, in_specs=P('x'), out_specs=P('x'))
@@ -779,16 +784,6 @@ if __name__ == '__main__':
   #   #   return x
   #   # return g(x)
   # f(np.arange(5.))
-
-  # # autodiff tests
-
-  # def g(x):
-  #   return shard_map(f, mesh, in_specs=(P('x', 'y'),), out_specs=P('x', 'y'))(x)
-  # print(jax.jvp(g, [x], [x]))
-
-  # from jax._src.test_util import check_grads
-
-  # check_grads(g, [x], 2, ['fwd'])
 
   # y, y_dot = jax.jvp(g, [x], [x])
 
