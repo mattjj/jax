@@ -459,8 +459,8 @@ def _match_spec(mesh: Mesh, rep: Set[AxisName], dst: AxisNames, x: JaxType
   return jax.jit(_get_matcher(mesh, tuple(dst.items())))(x)
 
 def _check_names(names: Sequence[AxisNames], avals: core.ShapedArray) -> None:
-  # fail = [a if not max(n) < a.ndim - 1 else False for n, a in zip(names, avals)]
-  fail = [a if not max(n) < a.ndim else False for n, a in zip(names, avals)]
+  fail = [a if not max(n, default=0) < a.ndim else False
+          for n, a in zip(names, avals)]
   if any(fail): raise _SpecError(fail)
 class _SpecError(Exception): pass
 
@@ -603,8 +603,8 @@ def _reduce_scatter_rule(in_rep, *, scatter_dimension, axis_name, axis_size,
   return in_rep - {axis_name}  # removes replication
 
 @register_rule(lax_parallel.all_to_all_p)
-def _reduce_scatter_rule(in_rep, *, split_axis, concat_axis, axis_name,
-                         axis_index_groups):
+def _all_to_all_rule(in_rep, *, split_axis, concat_axis, axis_name,
+                     axis_index_groups):
   if axis_index_groups is not None: raise NotImplementedError
   return in_rep - {axis_name}  # removes replication
 
