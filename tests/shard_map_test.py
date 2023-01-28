@@ -206,6 +206,70 @@ class ShardMapTest(jtu.JaxTestCase):
     self.assertAllClose(y, y_, check_dtypes=False)
     self.assertAllClose(y_dot, y_dot_, check_dtypes=False)
 
+  def test_linearize_basic_repres(self):
+    mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ('x', 'y'))
+    g = shard_map(lambda x: jax.lax.sin(jax.lax.cos(x)), mesh,
+                  in_specs=(P('x',),), out_specs=P('x',))
+    x = np.arange(4.)
+
+    y, y_dot = jax.jvp(g, [x], [x])
+
+    y_, g_lin = jax.linearize(g, x)
+    y_dot_ = g_lin(x)
+
+    self.assertAllClose(y, y_, check_dtypes=False)
+    self.assertAllClose(y_dot, y_dot_, check_dtypes=False)
+
+  def test_linearize_basic_repres_jit(self):
+    mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ('x', 'y'))
+    g = shard_map(lambda x: jnp.sin(jnp.cos(x)), mesh,
+                  in_specs=(P('x',),), out_specs=P('x',))
+    x = np.arange(4.)
+
+    y, y_dot = jax.jvp(g, [x], [x])
+
+    y_, g_lin = jax.linearize(g, x)
+    y_dot_ = g_lin(x)
+
+    self.assertAllClose(y, y_, check_dtypes=False)
+    self.assertAllClose(y_dot, y_dot_, check_dtypes=False)
+
+  def test_replication_checker_eager(self):
+    mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ('x', 'y'))
+    x = np.arange(8 * 8.).reshape(8, 8)
+
+    def f(x):
+      return 2 * x
+    def g(x):
+      return shard_map(f, mesh, in_specs=(P('x', 'y'),), out_specs=P(None, 'y'))(x)
+
+    with self.assertRaisesRegex(ValueError, 'statically inferred'):
+      g(x)
+
+    def f(x):
+      return jax.lax.psum(x, 'x')
+    def g(x):
+      return shard_map(f, mesh, in_specs=(P('x', 'y'),), out_specs=P(None, 'y'))(x)
+    _ = g(x)  # doesn't crash
+
+  def test_replication_checker_jit(self):
+    mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ('x', 'y'))
+    x = np.arange(8 * 8.).reshape(8, 8)
+
+    def f(x):
+      return 2 * x
+    def g(x):
+      return shard_map(f, mesh, in_specs=(P('x', 'y'),), out_specs=P(None, 'y'))(x)
+
+    with self.assertRaisesRegex(ValueError, 'statically inferred'):
+      jax.jit(g)(x)
+
+    def f(x):
+      return jax.lax.psum(x, 'x')
+    def g(x):
+      return shard_map(f, mesh, in_specs=(P('x', 'y'),), out_specs=P(None, 'y'))(x)
+    _ = jax.jit(g)(x)  # doesn't crash
+
 
 if __name__ == '__main__':
   absltest.main(testLoader=jtu.JaxTestLoader())

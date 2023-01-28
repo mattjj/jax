@@ -403,20 +403,21 @@ def tuple_delete(t, idx):
 class HashableFunction:
   """Decouples function equality and hash from its identity.
 
-  Local lambdas and functiond defs are reallocated on each function call, making
+  Local lambdas and function defs are reallocated on each function call, making
   the functions created on different calls compare as unequal. This breaks our
   caching logic, which should really only care about comparing the semantics and
   not actual identity.
 
   This class makes it possible to compare different functions based on their
-  semantics. The parts that are taken into account are: the bytecode of
-  the wrapped function (which is cached by the CPython interpreter and is stable
-  across the invocations of the surrounding function), and `closure` which should
-  contain all values in scope that affect the function semantics. In particular
-  `closure` should contain all elements of the function closure, or it should be
-  possible to derive the relevant elements of the true function closure based
-  solely on the contents of the `closure` argument (e.g. in case some closed-over
-  values are not hashable, but are entirely determined by hashable locals).
+  semantics. The parts that are taken into account are: the bytecode of the
+  wrapped function (which is cached by the CPython interpreter and is stable
+  across the invocations of the surrounding function), and `closure` which
+  should contain all values in scope that affect the function semantics. In
+  particular `closure` should contain all elements of the function closure, or
+  it should be possible to derive the relevant elements of the true function
+  closure based solely on the contents of the `closure` argument (e.g. in case
+  some closed-over values are not hashable, but are entirely determined by
+  hashable locals).
   """
 
   def __init__(self, f, closure):
@@ -439,6 +440,23 @@ class HashableFunction:
 
 def as_hashable_function(closure):
   return lambda f: HashableFunction(f, closure)
+
+class HashablePartial:
+  def __init__(self, f, *args, **kwargs):
+    self.f = f
+    self.args = args
+    self.kwargs = kwargs
+
+  def __eq__(self, other):
+    return (type(other) is HashablePartial and
+            self.f.__code__ == other.f.__code__ and
+            self.args == other.args and self.kwargs == other.kwargs)
+
+  def __hash__(self):
+    return hash((self.f.__code__, self.args, tuple(self.kwargs.items())))
+
+  def __call__(self, *args, **kwargs):
+    return self.f(*self.args, *args, **self.kwargs, **kwargs)
 
 def maybe_named_axis(axis, if_pos, if_named):
   try:
