@@ -364,7 +364,8 @@ class CustomJVPCallPrimitive(core.Primitive):
     return [fun, jvp], new_params
 
 @lu.transformation_with_aux
-def process_env_traces(primitive, level: int, jvp_was_run: bool, *args):
+def process_env_traces(primitive, level: Optional[int], jvp_was_run: bool,
+                       *args):
   outs = yield args, {}
   todo = []
   while True:

@@ -16,6 +16,7 @@ from __future__ import annotations
 import enum
 from functools import partial, lru_cache
 import inspect
+import operator as op
 from typing import (Any, Callable, Optional, Tuple, List, Set, Sequence, Dict,
                     Hashable, Union, TypeVar)
 
@@ -321,13 +322,22 @@ class ShardMapPrimitive(core.Primitive):
            out_names_thunk: Callable[[], Tuple[AxisNames, ...]],
            check_rep: bool) -> Sequence[MaybeTracer]:
     top_trace = core.find_top_trace(args)
-    fun, env_trace_todo = process_env_traces(
-        fun, top_trace and top_trace.level, mesh)
+    fun, env_todo = process_env_traces(fun, top_trace and top_trace.level)
+
+    @as_hashable_function(closure=out_names_thunk)
+    def new_out_names_thunk():
+      out_names = out_names_thunk()
+      _, xforms = env_todo()
+      for t in xforms:
+        out_names = t(out_names)
+      return out_names
+
     tracers = map(top_trace.full_raise, args)
     outs = top_trace.process_shard_map(  # pytype: disable=attribute-error
         shard_map_p, fun, tracers, mesh=mesh, in_names=in_names,
-        out_names_thunk=out_names_thunk, check_rep=check_rep)
-    return map(core.full_lower, core.apply_todos(env_trace_todo(), outs))
+        out_names_thunk=new_out_names_thunk, check_rep=check_rep)
+    todos, _ = env_todo()
+    return map(core.full_lower, core.apply_todos(todos, outs))
 
   def get_bind_params(self, params):
     """Goes from jaxpr form to python traceable form."""
@@ -340,8 +350,23 @@ class ShardMapPrimitive(core.Primitive):
 
 shard_map_p = ShardMapPrimitive('shard_map')
 
-def process_env_traces(fun, top_trace, mesh):
-  return fun, lambda: []  # TODO needed for closing over tracers
+@lu.transformation_with_aux
+def process_env_traces(level: Optional[int], *args: Any):
+  outs = yield args, {}
+  todos, out_names_transforms = [], []
+  while True:
+    tracers = [x for x in outs if isinstance(x, core.Tracer)
+               and (level is None or x._trace.level > level)]
+    if tracers:
+      ans = max(tracers, key=op.attrgetter('_trace.level'))
+    else:
+      break
+    trace = ans._trace.main.with_cur_sublevel()
+    outs = map(trace.full_raise, outs)
+    outs, (todo, xform) = trace.post_process_shard_map(trace, outs)
+    todos.append(todo)
+    out_names_transforms.append(xform)
+  yield outs, (tuple(todos), tuple(out_names_transforms))
 
 # Staging
 
@@ -561,7 +586,7 @@ class ShardMapTrace(core.Trace):
 
   def process_primitive(self, prim, tracers, params):
     in_vals, in_rep = unzip2((t.val, t.rep) for t in tracers)
-    f = _primitive_applier(prim, params, self.mesh)
+    f = HashablePartial(_prim_applier, prim, tuple(params.items()), self.mesh)
     with core.eval_context(), jax.disable_jit(False):
       out_vals = jax.jit(f)(*in_vals)
     out_rep = _rep_rules.get(prim, partial(_rep_rule, prim))(*in_rep, **params)
@@ -620,19 +645,11 @@ class ShardMapTracer(core.Tracer):
         f"On {device} at mesh coordinates {axis_names} = {idx}:\n{block}\n"
         for (idx, device), block in zip(np.ndenumerate(mesh.devices), blocks))
 
-def _primitive_applier(prim: core.Primitive, params: core.ParamDict, mesh: Mesh,
-                       ) -> Callable:
-  return _prim_applier(prim, tuple(params.items()), mesh)
-
-@lru_cache()
-def _prim_applier(prim, params_tup, mesh):
-  spec = P(mesh.axis_names)
-
-  @partial(shard_map, mesh=mesh, in_specs=spec, out_specs=spec)
+def _prim_applier(prim, params_tup, mesh, *args):
   def apply(*args):
     outs = prim.bind(*map(_rem_singleton, args), **dict(params_tup))
     return tree_map(_add_singleton, outs)
-  return apply
+  return shard_map(apply, mesh, P(mesh.axis_names), P(mesh.axis_names))(*args)
 
 # Static replication checking
 
@@ -735,6 +752,19 @@ def _shard_map_jvp(self, shard_map_p, f, tracers, mesh, in_names,
   return [ad.JVPTracer(self, p, t) for p, t in zip(primal_out, tangent_out)]
 ad.JVPTrace.process_shard_map = _shard_map_jvp
 
+def _shard_map_jvp_post_process(trace, shard_map_p, out_tracers):
+  primals, tangents = unzip2((t.primal, t.tangent) for t in out_tracers)
+  out, treedef = tree_flatten((primals, tangents))
+  tangents_nz = [type(t) is not ad.Zero for t in tangents]
+  m = trace.main
+  def todo(x):
+    primals, tangents = tree_unflatten(treedef, x)
+    return map(partial(ad.JVPTracer, m.with_cur_sublevel()), primals, tangents)
+  def out_names_transform(out_names):
+    return (*out_names, *(n for n, nz in zip(out_names, tangents_nz) if nz))
+  return out, (todo, out_names_transform)
+ad.JVPTrace.post_process_shard_map = _shard_map_jvp_post_process
+
 def _shard_map_partial_eval(self, shard_map_p, f, tracers, mesh, in_names,
                             out_names_thunk, check_rep):
   in_pvals = [t.pval for t in tracers]
@@ -797,12 +827,8 @@ def _promote_scalar_residuals(*args, **kwargs):
   jaxpr, _, out_consts  = pe.trace_to_jaxpr_dynamic(fun, in_avals)
   yield jaxpr, (out_pvals, out_consts, env)
 
-# TODO do we really need axis substitution? (only for used_axis_names...)
-def _shard_map_axis_subst(params, subst, traverse):
-  if 'jaxpr' not in params:
-    return params
-  if not traverse:
-    return params
+def _shard_map_axis_subst(params, subst, traverse):  # only for used_axis_names
+  if not traverse: return params
   def shadowed_subst(name):
     return (name,) if name in params['mesh'].shape else subst(name)
   with core.extend_axis_env_nd(params['mesh'].shape.items()):

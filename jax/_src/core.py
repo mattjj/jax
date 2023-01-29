@@ -1128,7 +1128,7 @@ def full_lower(val):
   else:
     return val
 
-def find_top_trace(xs) -> Trace:
+def find_top_trace(xs) -> Optional[Trace]:
   top_tracer = max((x for x in xs if isinstance(x, Tracer)),
                     default=None, key=attrgetter('_trace.level'))
   if top_tracer is not None:
@@ -2214,7 +2214,7 @@ def map_bind(primitive: MapPrimitive, fun, *args, **params):
       primitive.process(top_trace, fun, tracers, params))
 
 @lu.transformation_with_aux
-def process_env_traces_map(primitive: MapPrimitive, level: int,
+def process_env_traces_map(primitive: MapPrimitive, level: Optional[int],
                            params_tuple: tuple, *args):
   outs = yield args, {}
   params = dict(params_tuple)

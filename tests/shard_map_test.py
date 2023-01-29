@@ -270,6 +270,18 @@ class ShardMapTest(jtu.JaxTestCase):
       return shard_map(f, mesh, in_specs=(P('x', 'y'),), out_specs=P(None, 'y'))(x)
     _ = jax.jit(g)(x)  # doesn't crash
 
+  def test_process_env_traces(self):
+    mesh = Mesh(np.array(jax.devices()[:4]), ('x',))
+    x = np.arange(8.)
+
+    def g(x):
+      y = (3. * x).sum()
+      z = shard_map(lambda x: 2 * x * y, mesh,
+                    in_specs=(P('x'),), out_specs=P('x'))(np.arange(8.))
+      return z
+
+    jtu.check_grads(g, (x,), modes=['fwd'], order=2)
+
 
 if __name__ == '__main__':
   absltest.main(testLoader=jtu.JaxTestLoader())
