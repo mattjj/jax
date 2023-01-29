@@ -503,7 +503,7 @@ def _shard_map_impl(trace, prim, fun, args, *, mesh, in_names, out_names_thunk,
       del main, t, in_tracers, ans, out_tracers
   out_avals = [core.mapped_aval(x.shape[0], 0, core.get_aval(x)) for x in outs_]
   _check_names(out_names_thunk(), out_avals)
-  _check_reps(mesh, out_names_thunk(), out_rep)
+  if check_rep: _check_reps(mesh, out_names_thunk(), out_rep)
   return map(partial(_match_spec, mesh), out_rep, out_names_thunk(), outs_)
 core.EvalTrace.process_shard_map = _shard_map_impl
 
