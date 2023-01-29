@@ -282,6 +282,66 @@ class ShardMapTest(jtu.JaxTestCase):
 
     jtu.check_grads(g, (x,), modes=['fwd'], order=2)
 
+  def test_eager_control_flow(self):
+    mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ('x', 'y'))
+    x = jnp.arange(2 * 2.).reshape(2, 2)
+
+    def f(x):
+      y = jax.lax.psum(x, ('x', 'y'))
+      if y < 0:
+        return x
+      else:
+        return -x
+
+    def g(x):
+      return shard_map(f, mesh, in_specs=(P('x', 'y'),), out_specs=P('x', 'y'))(x)
+    y = g(x)
+    self.assertAllClose(y, -x, check_dtypes=False)
+
+  def test_outer_jit_detects_shard_map_mesh(self):
+    mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ('x', 'y'))
+    f = shard_map(lambda x: x.reshape(1, *x.shape), mesh, P(), P('x'))
+    _ = jax.jit(f)(jnp.array(2.0))  # doesnt crash
+
+  def test_vmap_basic(self):
+    mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ('x', 'y'))
+    x = jnp.arange(8 * 8.).reshape(8, 8)
+
+    def g(x):
+      return shard_map(lambda x: 2. * x, mesh,
+                       in_specs=P('y'), out_specs=P('y'))(x)
+    y = jax.vmap(g, axis_name='x')(x)
+    self.assertAllClose(y, 2 * x, check_dtypes=False)
+
+  def test_tree_prefix_error(self):
+    mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ('x', 'y'))
+
+    @partial(shard_map, mesh=mesh, in_specs=([P('x', 'y')],), out_specs=P('x', 'y'))
+    def f(x):
+      return x
+
+    x = jnp.arange(8 * 8.).reshape(8, 8)
+    with self.assertRaisesRegex(ValueError, 'shard_map in_specs\[0\]'):
+       f([x, x])
+
+  def test_rank_errors(self):
+    mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ('x', 'y'))
+    x = jnp.arange(8 * 8.).reshape(8, 8)
+
+    def foo():
+      return {'hi': [3.]}
+
+    with self.assertRaisesRegex(ValueError, 'which has length 1'):
+      shard_map(foo, mesh=mesh, in_specs=(), out_specs={'hi': P('x')})()
+
+    with self.assertRaisesRegex(ValueError, 'which has length 1'):
+      jax.jit(lambda: shard_map(foo, mesh=mesh,
+                                in_specs=(), out_specs={'hi': P('x')})())()
+
+    with self.assertRaisesRegex(ValueError, 'which has rank 0'):
+      shard_map(foo, mesh=mesh, in_specs=({'hi': P('x')},), out_specs=())(
+          {'hi': [jnp.array(3.)]})
+
 
 if __name__ == '__main__':
   absltest.main(testLoader=jtu.JaxTestLoader())
