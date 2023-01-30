@@ -835,3 +835,26 @@ def _shard_map_axis_subst(params, subst, traverse):  # only for used_axis_names
     new_jaxpr = core.subst_axis_names_jaxpr(params['jaxpr'], shadowed_subst)
   return dict(params, jaxpr=new_jaxpr)
 core.axis_substitution_rules[shard_map_p] = _shard_map_axis_subst
+
+
+if __name__ == '__main__':
+  import os
+  import jax
+  import jax.numpy as jnp
+
+  jax.config.update('jax_platform_name', 'cpu')
+  os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=32"
+  mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ('x', 'y'))
+
+  ## Nesting testing...
+
+  @partial(shard_map, mesh=mesh, in_specs=P('x', None), out_specs=P('x', None))
+  def f(x):
+
+    @partial(shard_map, mesh=mesh, in_specs=P('x', 'y'), out_specs=P('x', 'y'))
+    def g(x):
+      return x
+
+    return g(x)
+
+  f(np.arange(4. * 4).reshape(4, 4))
