@@ -63,10 +63,10 @@ sys.excepthook = info
 jax.config.update('jax_platform_name', 'cpu')
 jax.config.update('jax_enable_checks', True)
 
-# TODO [-] autodiff w/ sholto@
+# TODO [x] autodiff w/ sholto@
 #        [x] jvp
 #        [x] partial eval
-#        [ ] transpose
+#        [x] transpose
 # TODO [x] better eager repr
 # TODO [x] fix scalar residual problem
 # TODO [-] better errors
@@ -74,11 +74,15 @@ jax.config.update('jax_enable_checks', True)
 #        [x] if output rank doesn't match out spec for concatenation
 #        [x] validate that in_specs / out_specs are indeed pytrees of pspecs
 #        [x] axis isn't evenly divisible
-#        [ ] "shard_map can't prove", and add option to opt out of this check
+#        [x] "shard_map can't prove", and add option to opt out of this check
 #        [ ] maybe switch from 'exhaustive' errors to 'statistics' errors, like
 #            https://github.com/google/jax/pull/12800
 # TODO [x] remove default rep rule behavior in favor of convenience wrappers,
 #          and add good rule coverage
+# TODO [-] post_process_*
+#        [x] JVPTrace.post_process_shard_map
+#        [ ] JaxprTrace.post_process_shard_map
+#        [ ] BatchTrace.post_process_shard_map
 # TODO [ ] actually write thorough tests...
 # TODO [ ] try nesting
 #        [ ] eager
