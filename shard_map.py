@@ -54,14 +54,15 @@ map, unsafe_map = util.safe_map, map
 zip, unsafe_zip = util.safe_zip, zip
 traceback_util.register_exclusion(__file__)
 
-import ipdb, sys, traceback
-def info(type, value, tb):
-    traceback.print_exception(type, value, tb)
-    ipdb.pm()
-sys.excepthook = info
+# import ipdb, sys, traceback
+# def info(type, value, tb):
+#     traceback.print_exception(type, value, tb)
+#     ipdb.pm()
+# sys.excepthook = info
 
 jax.config.update('jax_platform_name', 'cpu')
 jax.config.update('jax_enable_checks', True)
+jax.config.update('jax_traceback_filtering', 'auto')
 
 # TODO [x] autodiff w/ sholto@
 #        [x] jvp
@@ -255,7 +256,7 @@ def _spec_divisibility_error(
          + '\n\n'.join(msgs) + '\n\n' +
          f"Array arguments' axis sizes must be evenly divisible by the mesh "
          f"axis or axes indicated by the corresponding elements of the "
-         f"argument's in_specs entry. Consider checking that in_pspecs are "
+         f"argument's in_specs entry. Consider checking that in_specs are "
          f"correct, and if so consider changing the mesh axis sizes or else "
          f"padding the input and adapting '{f.__name__}' appropriately.")
   return msg
