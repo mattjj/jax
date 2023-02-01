@@ -642,7 +642,7 @@ class ShardMapTracer(core.Tracer):
     with core.eval_context():
       blocks = list(self.val)
     mesh = self._trace.mesh
-    axis_names = f"({', '.join(map(str, mesh.axis_names))})"
+    axis_names = f"({', '.join(map(str, mesh.axis_names))},)"
     return '\n'.join(
         f"On {device} at mesh coordinates {axis_names} = {idx}:\n{block}\n"
         for (idx, device), block in zip(np.ndenumerate(mesh.devices), blocks))
