@@ -826,9 +826,85 @@ def _promote_scalar_residuals(*args, **kwargs):
   in_avals = [v.aval for v in jaxpr.invars]
   jaxpr, _, out_consts  = pe.trace_to_jaxpr_dynamic(fun, in_avals)
   yield jaxpr, (out_pvals, out_consts, env)
+  
+def _shard_map_transpose(out_cts, *args, jaxpr, mesh, in_names, out_names, check_rep):
+  """
+  def shard_map_transpose(f_orig, y_bar, orig_in_spec, orig_out_spec):
+    def f_transposed(y_bar_shard):
+      if orig_out_spec == P(None):
+        y_bar_shard = y_bar_shard / psum(1, 'x')
 
-def _shard_map_axis_subst(params, subst, traverse):  # only for used_axis_names
-  if not traverse: return params
+      x_bar_shard = backward_pass(f_orig, y_bar_shard)
+
+      if orig_in_spec == P(None):
+        x_bar_shard = psum(x_bar_shard, 'x')
+
+      return x_bar_shard
+
+    return shmap(f_transposed, y_bar, in_spec=orig_out_spec, out_spec=orig_in_spec)
+"""
+  out_cts: Sequence[Union[ad.Zero, MaybeTracer]]  # let's ignore Zero for now
+  args: Sequence[Union[ad.UndefinedPrimal, MaybeTracer]]
+
+  out_cts = [x / prod(mesh.shape[n] for n in set(mesh.axis_names) - {n for ns in in_name.values() for n in ns})
+             if type(x) is not ad.Zero else x
+             for x, in_name in zip(out_cts, out_names)]
+
+  all_args, in_tree = tree_flatten((out_cts, args))
+  all_args: Sequence[MaybeTracer]
+
+  def handle_inputs(arg, in_name: Dict[int, Tuple[AxisName, ...]]):
+    if type(arg) is ad.Zero:
+      return ad.Zero(_shard_aval(mesh, in_name, arg.aval))
+    return arg
+
+  def handle_outputs(arg, out_name: Dict[int, Tuple[AxisName, ...]]):
+    if type(arg) is ad.Zero:
+      return ad.Zero(_unshard_aval(mesh, out_name, arg.aval))
+    
+    unmentioned = set(mesh.axis_names) - {n for ns in out_name.values() for n in ns}
+    if not unmentioned:
+      return arg
+    else:
+      return jax.lax.psum(arg, tuple(unmentioned))
+
+  @lu.wrap_init
+  def fun_transposed(out_cts_sharded, args_sharded):   
+    out_cts_sharded = map(handle_inputs, out_cts_sharded, out_names)
+    args_sharded = [ad.UndefinedPrimal(_shard_aval(mesh, names, x.aval))
+                    if type(x) is ad.UndefinedPrimal
+                    else x for x, names in zip(args_sharded, in_names)]
+                    
+    out_flat = ad.backward_pass(jaxpr, set(), False, (), args_sharded, out_cts_sharded)
+    out_cts_unsharded = map(handle_outputs, out_flat, in_names)
+    return out_cts_unsharded
+
+  fun_transposed, nz_arg_cts = ad.nonzero_outputs(fun_transposed)
+  fun_transposed_flattened, out_tree = flatten_fun_nokwargs(fun_transposed, in_tree)
+
+  new_in_names = (*[names for names, x in zip(out_names, out_cts)
+                   if type(x) is not ad.Zero],
+                  *[names for names, x in zip(in_names, args)
+                    if not ad.is_undefined_primal(x)])
+  @as_hashable_function(closure=(in_names, tuple(type(c) is ad.Zero for c in out_cts)))
+  def new_out_names_thunk():
+    return tuple(names or 0 for names, nz in zip(in_names, nz_arg_cts()) if nz)
+  
+  out_flat = shard_map_p.bind(fun_transposed_flattened,
+   *all_args,
+   mesh=mesh,
+   in_names=new_in_names,
+   out_names_thunk=new_out_names_thunk,
+   check_rep=check_rep)
+  out = tree_unflatten(out_tree(), out_flat)
+  return out
+ad.primitive_transposes[shard_map_p] = _shard_map_transpose
+
+def _shard_map_axis_subst(params, subst, traverse):
+  if 'jaxpr' not in params:
+    return params
+  if not traverse:
+    return params
   def shadowed_subst(name):
     return (name,) if name in params['mesh'].shape else subst(name)
   with core.extend_axis_env_nd(params['mesh'].shape.items()):
@@ -836,6 +912,7 @@ def _shard_map_axis_subst(params, subst, traverse):  # only for used_axis_names
   return dict(params, jaxpr=new_jaxpr)
 core.axis_substitution_rules[shard_map_p] = _shard_map_axis_subst
 
+# Crappy in-line tests, to be deleted.
 
 if __name__ == '__main__':
   import os
@@ -848,13 +925,34 @@ if __name__ == '__main__':
 
   ## Nesting testing...
 
-  @partial(shard_map, mesh=mesh, in_specs=P('x', None), out_specs=P('x', None))
-  def f(x):
+  # @partial(shard_map, mesh=mesh, in_specs=P('x', None), out_specs=P('x', None))
+  # def f(x):
 
-    @partial(shard_map, mesh=mesh, in_specs=P('x', 'y'), out_specs=P('x', 'y'))
-    def g(x):
-      return x
+  #   @partial(shard_map, mesh=mesh, in_specs=P('x', 'y'), out_specs=P('x', 'y'))
+  #   def g(x):
+  #     return x
 
-    return g(x)
+  #   return g(x)
 
-  f(np.arange(4. * 4).reshape(4, 4))
+  # f(np.arange(4. * 4).reshape(4, 4))
+
+  @jax.jit
+  @partial(shard_map, mesh=mesh, in_specs=(P('x',), P(None)), out_specs=P('x',))
+  def f(x, y):
+   return jnp.sin(x) + 3 + jnp.cos(x) + y
+
+  x = jnp.arange(8.)
+  y = jnp.arange(4.)
+  z = f(x, y)
+  print(z)
+
+  g = jax.grad(lambda x, y: f(x, y).sum())(x, y)
+
+  print(g)
+  
+  # primals, f_vjp = jax.vjp(f, x, y)
+  # breakpoint()
+  # x_bar, = f_vjp(primals)
+
+  # from jax._src import test_util as jtu
+  # jtu.check_grads(f, (x, y), modes=['fwd', 'rev'], order=1)
