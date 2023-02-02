@@ -33,7 +33,8 @@ from jax._src import util
 from jax._src.lax import lax, parallel as lax_parallel
 from jax._src.sharding import NamedSharding, PartitionSpec
 from jax._src.util import (prod, HashableFunction, HashablePartial, unzip2,
-                           as_hashable_function, memoize, partition_list)
+                           as_hashable_function, memoize, partition_list,
+                           merge_lists)
 from jax.api_util import flatten_fun_nokwargs
 from jax.experimental import maps
 from jax.interpreters import batching
@@ -53,16 +54,6 @@ P = PartitionSpec
 map, unsafe_map = util.safe_map, map
 zip, unsafe_zip = util.safe_zip, zip
 traceback_util.register_exclusion(__file__)
-
-# import ipdb, sys, traceback
-# def info(type, value, tb):
-#     traceback.print_exception(type, value, tb)
-#     ipdb.pm()
-# sys.excepthook = info
-
-jax.config.update('jax_platform_name', 'cpu')
-jax.config.update('jax_enable_checks', True)
-jax.config.update('jax_traceback_filtering', 'auto')
 
 # TODO [x] autodiff w/ sholto@
 #        [x] jvp
@@ -330,7 +321,8 @@ class ShardMapPrimitive(core.Primitive):
            out_names_thunk: Callable[[], Tuple[AxisNames, ...]],
            check_rep: bool) -> Sequence[MaybeTracer]:
     top_trace = core.find_top_trace(args)
-    fun, env_todo = process_env_traces(fun, top_trace and top_trace.level)
+    fun, env_todo = process_env_traces(fun, top_trace and top_trace.level, mesh,
+                                       in_names, out_names_thunk, check_rep)
 
     @as_hashable_function(closure=out_names_thunk)
     def new_out_names_thunk():
@@ -359,7 +351,8 @@ class ShardMapPrimitive(core.Primitive):
 shard_map_p = ShardMapPrimitive('shard_map')
 
 @lu.transformation_with_aux
-def process_env_traces(level: Optional[int], *args: Any):
+def process_env_traces(level: Optional[int], mesh, in_names, out_names_thunk,
+                       check_rep, *args: Any):
   outs = yield args, {}
   todos, out_names_transforms = [], []
   while True:
@@ -371,7 +364,8 @@ def process_env_traces(level: Optional[int], *args: Any):
       break
     trace = ans._trace.main.with_cur_sublevel()
     outs = map(trace.full_raise, outs)
-    outs, (todo, xform) = trace.post_process_shard_map(trace, outs)
+    outs, (todo, xform) = trace.post_process_shard_map(
+        outs, mesh, in_names, out_names_thunk, check_rep)
     todos.append(todo)
     out_names_transforms.append(xform)
   yield outs, (tuple(todos), tuple(out_names_transforms))
@@ -735,13 +729,13 @@ batching.BatchTrace.process_shard_map = _shard_map_batch
 
 # Autodiff
 
-def _shard_map_jvp(self, shard_map_p, f, tracers, mesh, in_names,
+def _shard_map_jvp(trace, shard_map_p, f, tracers, mesh, in_names,
                    out_names_thunk, check_rep):
   primals, tangents = unzip2((t.primal, t.tangent) for t in tracers)
   which_nz = [     type(t) is not ad.Zero           for t in tangents]
   tangents = [t if type(t) is not ad.Zero else None for t in tangents]
   args, in_tree = tree_flatten((primals, tangents))
-  f_jvp = ad.jvp_subtrace(f, self.main)
+  f_jvp = ad.jvp_subtrace(f, trace.main)
   f_jvp, which_nz_out = ad.nonzero_tangent_outputs(f_jvp)
   tangent_in_names = [ax for ax, nz in zip(in_names, which_nz) if nz]
 
@@ -756,10 +750,12 @@ def _shard_map_jvp(self, shard_map_p, f, tracers, mesh, in_names,
   primal_out, tangent_out = tree_unflatten(out_tree(), result)
   tangent_out = [ad.Zero(ad.get_aval(p).at_least_vspace()) if t is None else t
               for p, t in zip(primal_out, tangent_out)]
-  return [ad.JVPTracer(self, p, t) for p, t in zip(primal_out, tangent_out)]
+  return [ad.JVPTracer(trace, p, t) for p, t in zip(primal_out, tangent_out)]
 ad.JVPTrace.process_shard_map = _shard_map_jvp
 
-def _shard_map_jvp_post_process(trace, shard_map_p, out_tracers):
+def _shard_map_jvp_post_process(trace, out_tracers, mesh, in_names,
+                                out_names_thunk, check_rep):
+  del mesh, in_names, out_names_thunk, check_rep
   primals, tangents = unzip2((t.primal, t.tangent) for t in out_tracers)
   out, treedef = tree_flatten((primals, tangents))
   tangents_nz = [type(t) is not ad.Zero for t in tangents]
@@ -772,13 +768,13 @@ def _shard_map_jvp_post_process(trace, shard_map_p, out_tracers):
   return out, (todo, out_names_transform)
 ad.JVPTrace.post_process_shard_map = _shard_map_jvp_post_process
 
-def _shard_map_partial_eval(self, shard_map_p, f, tracers, mesh, in_names,
+def _shard_map_partial_eval(trace, shard_map_p, f, tracers, mesh, in_names,
                             out_names_thunk, check_rep):
   in_pvals = [t.pval for t in tracers]
   in_knowns, in_avals, in_consts = pe.partition_pvals(in_pvals)
   unk_in_names, known_in_names = pe.partition_list(in_knowns, in_names)
   in_avals_sharded = map(partial(_shard_aval, mesh), unk_in_names, in_avals)
-  f = pe.trace_to_subjaxpr_nounits(f, self.main, False)
+  f = pe.trace_to_subjaxpr_nounits(f, trace.main, False)
   f = _promote_scalar_residuals(f)
   f_known, aux = pe.partial_eval_wrapper_nounits(
       f, (*in_knowns,), (*in_avals_sharded,))
@@ -802,13 +798,13 @@ def _shard_map_partial_eval(self, shard_map_p, f, tracers, mesh, in_names,
   unk_out_names, _ = pe.partition_list(out_knowns, out_names_thunk())
   unk_in_names = (({0: (*mesh.axis_names,)},) * len(res) + ({},) * len(env)
                       + (*unk_in_names,))
-  const_tracers = map(self.new_instantiated_const, res)
-  env_tracers = map(self.full_raise, env)
+  const_tracers = map(trace.new_instantiated_const, res)
+  env_tracers = map(trace.full_raise, env)
   unk_arg_tracers = [t for t in tracers if not t.is_known()]
   unk_params = dict(mesh=mesh, in_names=unk_in_names,
                     out_names=unk_out_names, jaxpr=jaxpr, check_rep=False)
   out_avals = map(partial(_unshard_aval, mesh), unk_out_names, out_avals_sharded)
-  out_tracers = [pe.JaxprTracer(self, pe.PartialVal.unknown(a), None)
+  out_tracers = [pe.JaxprTracer(trace, pe.PartialVal.unknown(a), None)
                  for a in out_avals]
   eqn = pe.new_eqn_recipe((*const_tracers, *env_tracers, *unk_arg_tracers),  # type: ignore[arg-type]
                           out_tracers, shard_map_p, unk_params,
@@ -816,6 +812,46 @@ def _shard_map_partial_eval(self, shard_map_p, f, tracers, mesh, in_names,
   for t in out_tracers: t.recipe = eqn
   return pe.merge_lists(out_knowns, out_tracers, out_consts)
 pe.JaxprTrace.process_shard_map = _shard_map_partial_eval
+
+def _shard_map_partial_eval_post_process(
+    trace, tracers, mesh, in_names, out_names_thunk, check_rep):
+  del check_rep
+  unk_tracers = [t for t in tracers if not t.is_known()]
+  jaxpr, res, env = pe.tracers_to_jaxpr([], unk_tracers)
+  out_knowns, out_avals_, consts = pe.partition_pvals([t.pval for t in tracers])
+  out = [*consts, *res]
+  main = trace.main
+  with core.extend_axis_env_nd(mesh.shape.items()):
+    jaxpr_ = pe.convert_constvars_jaxpr(jaxpr)
+
+  def todo(out):
+    trace = main.with_cur_sublevel()
+    out_consts, res = pe.split_list(out, [len(out) - len(jaxpr.constvars)])
+    const_tracers = map(trace.new_instantiated_const, res)
+    env_tracers = map(trace.full_raise, env)
+
+    staged_in_names = ({0: (*mesh.axis_names,)},) * len(res) + ({},) * len(env)
+    staged_params = dict(jaxpr=jaxpr_, mesh=mesh, in_names=staged_in_names,
+                         out_names=(*out_names_unknown,), check_rep=False)
+
+    out_avals = map(partial(_unshard_aval, mesh), out_names_unknown, out_avals_)
+    out_tracers = [pe.JaxprTracer(trace, pe.PartialVal.unknown(a), None)
+                   for a in out_avals]
+    name_stack = trace._current_truncated_name_stack()
+    source = source_info_util.current().replace(name_stack=name_stack)
+    eqn = pe.new_eqn_recipe((*const_tracers, *env_tracers), out_tracers,
+                            shard_map_p, staged_params, jaxpr.effects, source)
+    for t in out_tracers: t.recipe = eqn
+    return merge_lists(out_knowns, out_tracers, out_consts)
+
+  def out_names_transform(out_names):
+    nonlocal out_names_unknown
+    out_names_unknown, out_names_known = partition_list(out_knowns, out_names)
+    return (*out_names_known,) + ({0: (*mesh.axis_names,)},) * len(jaxpr.constvars)
+  out_names_unknown: Optional[list] = None
+
+  return out, (todo, out_names_transform)
+pe.JaxprTrace.post_process_shard_map = _shard_map_partial_eval_post_process
 
 @lu.transformation
 def _promote_scalar_residuals(*args, **kwargs):
@@ -889,44 +925,55 @@ core.axis_substitution_rules[shard_map_p] = _shard_map_axis_subst
 
 if __name__ == '__main__':
   import os
+  import sys
+  import traceback
+
+  import ipdb
+
   import jax
   import jax.numpy as jnp
+
+  def info(type, value, tb):
+      traceback.print_exception(type, value, tb)
+      ipdb.pm()
+  sys.excepthook = info
+
+  jax.config.update('jax_platform_name', 'cpu')
+  jax.config.update('jax_enable_checks', True)
+  jax.config.update('jax_traceback_filtering', 'off')
 
   jax.config.update('jax_platform_name', 'cpu')
   os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=32"
   mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ('x', 'y'))
 
-  ## Nesting testing...
+#   @jax.jit
+#   @partial(shard_map, mesh=mesh, in_specs=(P('x',), P(None)), out_specs=P('x',))
+#   def f(x, y):
+#     return jnp.sin(x) + 3 + jnp.tan(2.) * jnp.cos(x) + y
 
-  # @partial(shard_map, mesh=mesh, in_specs=P('x', None), out_specs=P('x', None))
-  # def f(x):
+#   jax.config.update('jax_enable_x64', True)
+#   x = jnp.arange(8.) / 3.
+#   y = jnp.arange(4.) / 3.
+#   z = f(x, y)
+#   print(z)
 
-  #   @partial(shard_map, mesh=mesh, in_specs=P('x', 'y'), out_specs=P('x', 'y'))
-  #   def g(x):
-  #     return x
+#   g = jax.grad(lambda x, y: f(x, y).sum())(x, y)
 
-  #   return g(x)
+#   print(g)
 
-  # f(np.arange(4. * 4).reshape(4, 4))
+#   # primals, f_vjp = jax.vjp(f, x, y)
+#   # breakpoint()
+#   # x_bar, = f_vjp(primals)
 
-  @jax.jit
-  @partial(shard_map, mesh=mesh, in_specs=(P('x',), P(None)), out_specs=P('x',))
-  def f(x, y):
-    return jnp.sin(x) + 3 + jnp.tan(2.) * jnp.cos(x) + y
+#   from jax._src import test_util as jtu
+#   jtu.check_grads(f, (x, y), modes=['fwd', 'rev'], order=2)
 
-  jax.config.update('jax_enable_x64', True)
-  x = jnp.arange(8.) / 3.
-  y = jnp.arange(4.) / 3.
-  z = f(x, y)
-  print(z)
+  def f(x):
+    @partial(shard_map, mesh=mesh, in_specs=P('x'), out_specs=P('x'))
+    def g(y):
+      return jnp.sin(y) * jnp.sin(x).sum()
+    return g(jnp.arange(8.))
 
-  g = jax.grad(lambda x, y: f(x, y).sum())(x, y)
-
-  print(g)
-
-  # primals, f_vjp = jax.vjp(f, x, y)
-  # breakpoint()
-  # x_bar, = f_vjp(primals)
-
-  from jax._src import test_util as jtu
-  jtu.check_grads(f, (x, y), modes=['fwd', 'rev'], order=2)
+  x = jnp.arange(8.)
+  y, f_lin = jax.linearize(f, x)
+  y_dot = f_lin(x)
