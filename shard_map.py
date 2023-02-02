@@ -17,8 +17,8 @@ import enum
 from functools import partial, lru_cache
 import inspect
 import operator as op
-from typing import (Any, Callable, Optional, Tuple, List, Set, Sequence, Dict,
-                    Hashable, Union, TypeVar)
+from typing import (Any, Callable, Dict, Hashable, List, Optional, Sequence,
+                    Set, Tuple, TypeVar, Union, Protocol)
 
 import numpy as np
 
@@ -32,9 +32,8 @@ from jax._src import traceback_util
 from jax._src import util
 from jax._src.lax import lax, parallel as lax_parallel
 from jax._src.sharding import NamedSharding, PartitionSpec
-from jax._src.util import (prod, HashableFunction, HashablePartial, unzip2,
-                           as_hashable_function, memoize, partition_list,
-                           merge_lists)
+from jax._src.util import (prod, HashableFunction, unzip2, as_hashable_function,
+                           memoize, partition_list, merge_lists)
 from jax.api_util import flatten_fun_nokwargs
 from jax.experimental import maps
 from jax.interpreters import batching
@@ -54,34 +53,6 @@ P = PartitionSpec
 map, unsafe_map = util.safe_map, map
 zip, unsafe_zip = util.safe_zip, zip
 traceback_util.register_exclusion(__file__)
-
-# TODO [x] autodiff w/ sholto@
-#        [x] jvp
-#        [x] partial eval
-#        [x] transpose
-# TODO [x] better eager repr
-# TODO [x] fix scalar residual problem
-# TODO [-] better errors
-#        [x] broadcast_prefix errors
-#        [x] if output rank doesn't match out spec for concatenation
-#        [x] validate that in_specs / out_specs are indeed pytrees of pspecs
-#        [x] axis isn't evenly divisible
-#        [x] "shard_map can't prove", and add option to opt out of this check
-#        [ ] maybe switch from 'exhaustive' errors to 'statistics' errors, like
-#            https://github.com/google/jax/pull/12800
-# TODO [x] remove default rep rule behavior in favor of convenience wrappers,
-#          and add good rule coverage
-# TODO [-] post_process_*
-#        [x] JVPTrace.post_process_shard_map
-#        [ ] JaxprTrace.post_process_shard_map
-#        [ ] BatchTrace.post_process_shard_map
-# TODO [ ] actually write thorough tests...
-# TODO [ ] try nesting
-#        [ ] eager
-#        [ ] staged: convert out and then back into manual in lowering rule?
-# TODO [ ] try to implement (nested) pmap in terms of shard_map
-# TODO [ ] custom_jvp / custom_vjp eager handling
-# TODO [ ] name stack
 
 # API
 
@@ -168,7 +139,7 @@ class NoFail: pass
 no_fail = NoFail()
 
 def _check_specs_vs_args(
-    f: Callble, mesh: Mesh, in_tree: PyTreeDef, in_specs: Specs,
+    f: Callable, mesh: Mesh, in_tree: PyTreeDef, in_specs: Specs,
     in_specs_flat: List[P], xs: List) -> None:
   in_avals = [core.raise_to_shaped(core.get_aval(x)) for x in xs]
   fail = [a if not len(p) <= a.ndim else no_fail
@@ -268,11 +239,11 @@ def _rep_error(f: Callable, mesh: Mesh, tree: PyTreeDef, specs: Specs,
           f"{{{need_rep}}}, but could only infer replication over {{{got_rep}}}, "
           f"which is missing the required axes {diff}")
     else:
-      need_rep, = unmentioned
+      need_rep_, = unmentioned
       msgs.append(
           f"out_specs{spec_key.pprint()} is {spec} which implies that the "
           f"corresponding output value is replicated across mesh axis "
-          f"'{need_rep}', but could not infer replication over any axes")
+          f"'{need_rep_}', but could not infer replication over any axes")
   assert msgs
   msg = (f"shard_map applied to the function '{f.__name__}' was given "
          f"out_specs which require replication which can't be statically "
@@ -321,7 +292,7 @@ class ShardMapPrimitive(core.Primitive):
            out_names_thunk: Callable[[], Tuple[AxisNames, ...]],
            check_rep: bool) -> Sequence[MaybeTracer]:
     top_trace = core.find_top_trace(args)
-    fun, env_todo = process_env_traces(fun, top_trace and top_trace.level, mesh,
+    fun, env_todo = process_env_traces(fun, top_trace.level, mesh,
                                        in_names, out_names_thunk, check_rep)
 
     @as_hashable_function(closure=out_names_thunk)
@@ -351,8 +322,8 @@ class ShardMapPrimitive(core.Primitive):
 shard_map_p = ShardMapPrimitive('shard_map')
 
 @lu.transformation_with_aux
-def process_env_traces(level: Optional[int], mesh, in_names, out_names_thunk,
-                       check_rep, *args: Any):
+def process_env_traces(level: int, mesh, in_names, out_names_thunk, check_rep,
+                       *args: Any):
   outs = yield args, {}
   todos, out_names_transforms = [], []
   while True:
@@ -395,11 +366,11 @@ def _shard_map_staging(
   invars = map(trace.getvar, in_tracers)
   constvars = map(trace.getvar, map(trace.instantiate_const, consts))
   outvars = map(trace.makevar, out_tracers)
-  in_names= ({},) * len(consts) + tuple(in_names)
+  in_names_staged = ({},) * len(consts) + tuple(in_names)  # type: ignore
   with core.extend_axis_env_nd(mesh.shape.items()):
     jaxpr = pe.convert_constvars_jaxpr(jaxpr)
-  params = dict(mesh=mesh, in_names=in_names, out_names=out_names_thunk(),
-                jaxpr=jaxpr, check_rep=check_rep)
+  params = dict(mesh=mesh, in_names=in_names_staged,
+                out_names=out_names_thunk(), jaxpr=jaxpr, check_rep=check_rep)
   eqn = pe.new_jaxpr_eqn([*constvars, *invars], outvars, prim, params,
                          jaxpr.effects, source_info)
   trace.frame.add_eqn(eqn)
@@ -546,7 +517,8 @@ def _unmatch(mesh, src_tup, x):
   dst = P(mesh.axis_names)
   return shard_map(_add_singleton, mesh, (src,), dst)(x)
 
-def _check_names(names: Sequence[AxisNames], avals: core.ShapedArray) -> None:
+def _check_names(names: Sequence[AxisNames], avals: Sequence[core.ShapedArray]
+                 ) -> None:
   fail = [a if not max(n, default=0) < a.ndim else no_fail
           for n, a in zip(names, avals)]
   if any(f is not no_fail for f in fail): raise _SpecError(fail)
@@ -657,7 +629,7 @@ def _prim_applier(prim, params_tup, mesh, *args):
 def _rep_rule(prim, *in_rep, **params):
   raise NotImplementedError(f"no replication rule for {prim}")
 
-_rep_rules = {}
+_rep_rules: Dict[core.Primitive, Callable] = {}
 register_rule = lambda prim: lambda rule: _rep_rules.setdefault(prim, rule)
 register_standard = lambda prim: _rep_rules.setdefault(prim, _standard_rep_rule)
 
@@ -711,8 +683,10 @@ def _shard_map_batch(
                      out_names_thunk=out_names_thunk, check_rep=check_rep)
   if trace.spmd_axis_name is not None:
     raise NotImplementedError  # TODO add named axis to specs
+  if any(isinstance(d, batching.ConcatAxis) for d in in_dims):
+    raise NotImplementedError
   fun, out_dims = batching.batch_subtrace(fun, trace.main, tuple(in_dims))
-  new_in_names = [{ax + (d is not batching.not_mapped and ax <= d): names[ax]
+  new_in_names = [{ax + (d is not batching.not_mapped and ax <= d): names[ax]  # type: ignore
                    for ax in names} for names, d in zip(in_names, in_dims)]
   @as_hashable_function(closure=out_names_thunk)
   def new_out_names_thunk():
@@ -921,59 +895,20 @@ def _shard_map_axis_subst(params, subst, traverse):
   return dict(params, jaxpr=new_jaxpr)
 core.axis_substitution_rules[shard_map_p] = _shard_map_axis_subst
 
-# Crappy in-line tests, to be deleted.
+# TODO move this to _src/util.py
+class HashablePartial:
+  def __init__(self, f, *args, **kwargs):
+    self.f = f
+    self.args = args
+    self.kwargs = kwargs
 
-if __name__ == '__main__':
-  import os
-  import sys
-  import traceback
+  def __eq__(self, other):
+    return (type(other) is HashablePartial and
+            self.f.__code__ == other.f.__code__ and
+            self.args == other.args and self.kwargs == other.kwargs)
 
-  import ipdb
+  def __hash__(self):
+    return hash((self.f.__code__, self.args, tuple(self.kwargs.items())))
 
-  import jax
-  import jax.numpy as jnp
-
-  def info(type, value, tb):
-      traceback.print_exception(type, value, tb)
-      ipdb.pm()
-  sys.excepthook = info
-
-  jax.config.update('jax_platform_name', 'cpu')
-  jax.config.update('jax_enable_checks', True)
-  jax.config.update('jax_traceback_filtering', 'off')
-
-  jax.config.update('jax_platform_name', 'cpu')
-  os.environ["XLA_FLAGS"] = "--xla_force_host_platform_device_count=32"
-  mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ('x', 'y'))
-
-#   @jax.jit
-#   @partial(shard_map, mesh=mesh, in_specs=(P('x',), P(None)), out_specs=P('x',))
-#   def f(x, y):
-#     return jnp.sin(x) + 3 + jnp.tan(2.) * jnp.cos(x) + y
-
-#   jax.config.update('jax_enable_x64', True)
-#   x = jnp.arange(8.) / 3.
-#   y = jnp.arange(4.) / 3.
-#   z = f(x, y)
-#   print(z)
-
-#   g = jax.grad(lambda x, y: f(x, y).sum())(x, y)
-
-#   print(g)
-
-#   # primals, f_vjp = jax.vjp(f, x, y)
-#   # breakpoint()
-#   # x_bar, = f_vjp(primals)
-
-#   from jax._src import test_util as jtu
-#   jtu.check_grads(f, (x, y), modes=['fwd', 'rev'], order=2)
-
-  def f(x):
-    @partial(shard_map, mesh=mesh, in_specs=P('x'), out_specs=P('x'))
-    def g(y):
-      return jnp.sin(y) * jnp.sin(x).sum()
-    return g(jnp.arange(8.))
-
-  x = jnp.arange(8.)
-  y, f_lin = jax.linearize(f, x)
-  y_dot = f_lin(x)
+  def __call__(self, *args, **kwargs):
+    return self.f(*self.args, *args, **self.kwargs, **kwargs)

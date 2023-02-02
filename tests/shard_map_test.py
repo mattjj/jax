@@ -342,6 +342,36 @@ class ShardMapTest(jtu.JaxTestCase):
       shard_map(foo, mesh=mesh, in_specs=({'hi': P('x')},), out_specs=())(
           {'hi': [jnp.array(3.)]})
 
+  def test_reverse_mode_ad(self):
+    mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ('x', 'y'))
+
+    @jax.jit
+    @partial(shard_map, mesh=mesh,
+             in_specs=(P('x',), P(None)), out_specs=P('x',))
+    def f(x, y):
+      return jnp.sin(x) + 3 + jnp.tan(2.) * jnp.cos(x) + y
+
+    x = jnp.arange(8.) / 10.
+    y = jnp.arange(4.) / 10.
+    jtu.check_grads(f, (x, y), modes=['fwd', 'rev'], order=2)
+
+  def test_post_process(self):
+    # JVPTrace.post_process_shard_map and JaxprTrace.post_process_shard_map
+    mesh = Mesh(np.array(jax.devices()[:4]).reshape(2, 2), ('x', 'y'))
+
+    def f(x):
+      @partial(shard_map, mesh=mesh, in_specs=P('x'), out_specs=P('x'))
+      def g(y):
+        return jnp.sin(y) * jnp.sin(x).sum()
+      return g(jnp.arange(8.))
+
+    x = jnp.arange(8.)
+    _, f_lin = jax.linearize(f, x)
+    y_dot = f_lin(x)
+
+    y_dot_expected = jnp.sin(jnp.arange(8.)) * (jnp.cos(x) * x).sum()
+    self.assertAllClose(y_dot, y_dot_expected, check_dtypes=False)
+
 
 if __name__ == '__main__':
   absltest.main(testLoader=jtu.JaxTestLoader())
