@@ -916,3 +916,26 @@ class HashablePartial:
 
   def __call__(self, *args, **kwargs):
     return self.f(*self.args, *args, **self.kwargs, **kwargs)
+
+
+# Implement pmap!
+
+def pmap(f, axis_name, devices=None):
+  def f_singles(x):
+    x_ = x.reshape(*x.shape[1:])
+    y_ = f(x_)
+    y = y_.reshape(1, *y_.shape)
+    return y
+
+  def f_pmapped(x):
+    axis_size = x.shape[0]
+    if devices is not None:
+      assert axis_size == len(devices)
+      devices_ = devices
+    else:
+      devices_ = jax.devices()[:axis_size]
+
+    mesh = Mesh(devices_, (axis_name,))
+    return shard_map(f_singles, mesh, P(axis_name), P(axis_name))(x)
+
+  return f_pmapped

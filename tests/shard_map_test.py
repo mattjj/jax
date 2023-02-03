@@ -27,6 +27,7 @@ from jax._src import test_util as jtu
 from jax._src.lib import xla_bridge
 import jax.numpy as jnp
 
+from jax.experimental.shard_map import pmap as fake_pmap
 from jax.experimental.shard_map import shard_map
 
 config.parse_flags_with_absl()
@@ -376,6 +377,14 @@ class ShardMapTest(jtu.JaxTestCase):
 
     y_dot_expected = jnp.sin(jnp.arange(8.)) * (jnp.cos(x) * x).sum()
     self.assertAllClose(y_dot, y_dot_expected, check_dtypes=False)
+
+  def test_pmap(self):
+    def f(x):
+      return x / jax.lax.psum(x, 'i')
+
+    xs = jnp.arange(3.)
+    ys = fake_pmap(f, axis_name='i')(xs)
+    self.assertAllClose(ys, xs / xs.sum(), check_dtypes=False)
 
 
 if __name__ == '__main__':
