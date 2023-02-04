@@ -378,7 +378,7 @@ class ShardMapTest(jtu.JaxTestCase):
     y_dot_expected = jnp.sin(jnp.arange(8.)) * (jnp.cos(x) * x).sum()
     self.assertAllClose(y_dot, y_dot_expected, check_dtypes=False)
 
-  def test_pmap(self):
+  def test_pmap_basic(self):
     def f(x):
       return x / jax.lax.psum(x, 'i')
 

@@ -920,7 +920,14 @@ class HashablePartial:
 
 # Implement pmap!
 
-def pmap(f, axis_name, devices=None):
+# TODO:
+#  [ ] args / kwargs
+#  [ ] in_axes / out_axes
+#  [ ] other pmap arguments like donate_argnums
+#  [ ] add in jit
+#  [ ] nesting (at least to some extent... not eager? not weird shapes?)
+
+def pmap(f, axis_name):
   def f_singles(x):
     x_ = x.reshape(*x.shape[1:])
     y_ = f(x_)
@@ -929,13 +936,7 @@ def pmap(f, axis_name, devices=None):
 
   def f_pmapped(x):
     axis_size = x.shape[0]
-    if devices is not None:
-      assert axis_size == len(devices)
-      devices_ = devices
-    else:
-      devices_ = jax.devices()[:axis_size]
-
-    mesh = Mesh(devices_, (axis_name,))
+    mesh = Mesh(jax.devices()[:axis_size], (axis_name,))
     return shard_map(f_singles, mesh, P(axis_name), P(axis_name))(x)
 
   return f_pmapped
