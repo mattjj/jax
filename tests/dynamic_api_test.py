@@ -37,6 +37,20 @@ FLAGS = config.FLAGS
 
 python_version = (sys.version_info[0], sys.version_info[1])
 
+
+@jtu.with_config(jax_dynamic_shapes=True)
+class DynamicShapeTestNew(jtu.JaxTestCase):
+  def test_bint_basic(self):
+    d = lax.convert_element_type(3, core.bint(5))
+    self.assertEqual(str(d), '3{≤5}')
+
+    @jax.jit
+    def f(d):
+      jnp.sin(3.)  # don't have an empty jaxpr
+      return d
+    f(d)  # doesn't crash
+
+
 @unittest.skip("Test does not work with jax.Array")
 @jtu.with_config(jax_dynamic_shapes=True, jax_numpy_rank_promotion="allow")
 class DynamicShapeTest(jtu.JaxTestCase):
@@ -1164,16 +1178,6 @@ class DynamicShapeTest(jtu.JaxTestCase):
     g2_expected = jax.grad(loss_ref)(params, batch)
     self.assertAllClose(g2, g2_expected, check_dtypes=False,
                         atol=1e-3, rtol=1e-3)
-
-  def test_bint_basic(self):
-    d = lax.convert_element_type(3, core.bint(5))
-    self.assertEqual(str(d), '3{≤5}')
-
-    @jax.jit
-    def f(d):
-      jnp.sin(3.)  # don't have an empty jaxpr
-      return d
-    f(d)  # doesn't crash
 
   def test_bint_broadcast(self):
     d = lax.convert_element_type(3, core.bint(5))

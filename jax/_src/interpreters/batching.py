@@ -48,7 +48,7 @@ zip, unsafe_zip = safe_zip, zip
 @dataclasses.dataclass(frozen=True)
 class PileTy:
   binder: core.Var
-  length: Union[int, Tracer, core.Var]
+  length: Union[int, Array, Tracer, core.Var]
   elt_ty: core.DShapedArray
   def __repr__(self) -> str:
     return f'Var{id(self.binder)}:{self.length} => {self.elt_ty}'

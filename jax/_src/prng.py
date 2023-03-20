@@ -367,12 +367,8 @@ class KeyTyRules:
                                     is_out_sharding_from_xla):
     phys_aval, = KeyTyRules.physical_avals(aval)
 
-    # TODO(yashkatariya,frostig): remove this conditional and inline it when
-    # the transient config ever settles
-    output_type = pxla.OutputType.Array
-
     phys_handler_maker = pxla.global_result_handlers[
-        (core.ShapedArray, output_type)]
+        (core.ShapedArray, pxla.OutputType.Array)]
 
     phys_sharding = make_key_array_phys_sharding(
         aval, out_sharding, is_out_sharding_from_xla)
