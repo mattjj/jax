@@ -2382,6 +2382,7 @@ def lower_sharding_computation(
     always_lower: bool,
     devices_from_context: Optional[Sequence[xc.Device]] = None,
     lowering_platform: Optional[str],
+    partir: bool,
 ) -> MeshComputation:
   """Lowers a computation to XLA. It can take arbitrary shardings as input.
 
@@ -2563,7 +2564,8 @@ def lower_sharding_computation(
       arg_shardings=in_op_shardings,
       result_shardings=out_op_shardings,
       arg_names=jaxpr.debug_info and jaxpr.debug_info.arg_names,
-      result_names=jaxpr.debug_info and jaxpr.debug_info.result_paths)
+      result_names=jaxpr.debug_info and jaxpr.debug_info.result_paths,
+      partir=partir)
 
   module, keepalive, host_callbacks = (
       lowering_result.module, lowering_result.keepalive,

@@ -356,6 +356,7 @@ def post_infer_params(fun, infer_params_fn, static_argnums, static_argnames,
 
   @api_boundary
   def lower(*args, _experimental_lowering_platform: Optional[str] = None,
+            partir: bool = False,
             **kwargs):
     (args_flat, flat_global_in_avals, params, in_tree, out_tree,
      donate_argnums) = infer_params_fn(*args, **kwargs)
@@ -367,7 +368,8 @@ def post_infer_params(fun, infer_params_fn, static_argnums, static_argnames,
         params['jaxpr'], in_shardings, params['out_shardings'],
         params['resource_env'], params['donated_invars'], params['name'],
         params['keep_unused'], always_lower=True,
-        lowering_platform=_experimental_lowering_platform)
+        lowering_platform=_experimental_lowering_platform,
+        partir=partir)
 
     if kwargs:
       args_kwargs_in_tree = in_tree
@@ -1326,7 +1328,8 @@ def _pjit_lower_cached(
     keep_unused: bool,
     always_lower: bool,
     *,
-    lowering_platform: Optional[str]):
+    lowering_platform: Optional[str],
+    partir: bool):
   in_shardings: Tuple[PjitShardingMinusUnspecified, ...] = cast(
       Tuple[PjitShardingMinusUnspecified, ...], sdat_in_shardings.shardings)
   out_shardings: Tuple[PjitSharding, ...] = sdat_out_shardings.shardings
@@ -1377,7 +1380,8 @@ def _pjit_lower_cached(
         always_lower=always_lower,
         devices_from_context=(
             None if mesh is None or mesh.empty else list(mesh.devices.flat)),
-        lowering_platform=lowering_platform)
+        lowering_platform=lowering_platform,
+        partir=partir)
 
 
 def pjit_staging_rule(trace, *args, **params):
@@ -1942,6 +1946,9 @@ ad.deflinear2(sharding_constraint_p,
 
 def _sharding_constraint_hlo_lowering(ctx, x_node, *, sharding,
                                       resource_env, unconstrained_dims):
+  if ctx.module_context.special_parallel_context:
+    return ctx.module_context.special_parallel_context.sharding_constraint_rule(
+        ...)
   aval, = ctx.avals_in
   axis_ctx = ctx.module_context.axis_context
   # axis_ctx and manual_axes is *only used with xmap* and xmap only works with

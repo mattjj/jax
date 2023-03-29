@@ -434,6 +434,8 @@ class ModuleContext:
   cached_primitive_lowerings: Dict[Any, func_dialect.FuncOp]
   cached_call_jaxpr_lowerings: Dict[Any, func_dialect.FuncOp]
 
+  # Are we in partir.jit
+  partir: bool  # TODO enum. also how do we set it? can we use 'platform'
 
   @property
   def axis_env(self) -> xla.AxisEnv:
@@ -456,7 +458,8 @@ class ModuleContext:
                                                 func_dialect.FuncOp]] = None,
       cached_call_jaxpr_lowerings: Optional[Dict[Any,
                                                  func_dialect.FuncOp]] = None,
-      dim_vars: Sequence[str] = ()):
+      dim_vars: Sequence[str] = (),
+      partir: bool = False):
     assert platform is not None
     self.context = context or make_ir_context()
     self.module = module or ir.Module.create(loc=ir.Location.unknown(self.context))
@@ -475,6 +478,7 @@ class ModuleContext:
                                         if cached_call_jaxpr_lowerings is None
                                         else cached_call_jaxpr_lowerings)
     self.dim_vars = dim_vars
+    self.partir = partir
 
   @property
   def backend(self) -> xb.XlaBackend:
@@ -669,6 +673,7 @@ def lower_jaxpr_to_module(
     result_shardings: Optional[Sequence[Optional[xc.OpSharding]]] = None,
     arg_names: Optional[Sequence[Optional[str]]] = None,
     result_names: Optional[Sequence[Optional[str]]] = None,
+    partir: bool = False,
 ) -> LoweringResult:
   """Lowers a top-level jaxpr to an MLIR module.
 
@@ -728,7 +733,8 @@ def lower_jaxpr_to_module(
     dim_vars = ()
 
   ctx = ModuleContext(backend_or_name, platform, axis_context, name_stack,
-                      keepalives, channel_iter, host_callbacks, dim_vars=dim_vars)
+                      keepalives, channel_iter, host_callbacks, dim_vars=dim_vars,
+                      partir=partir)
   with ctx.context, ir.Location.unknown(ctx.context):
     # Remove module name characters that XLA would alter. This ensures that
     # XLA computation preserves the module name.
