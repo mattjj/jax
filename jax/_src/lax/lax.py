@@ -2228,10 +2228,12 @@ def _convert_element_type_shape_rule(operand, *, new_dtype, weak_type):
 
 def _convert_element_type_dtype_rule(operand, *, new_dtype, weak_type):
   if operand.dtype != new_dtype:
-    if core.is_opaque_dtype(operand.dtype):
+    if (core.is_opaque_dtype(operand.dtype) and
+        not isinstance(operand.dtype, core.bint)):
       raise ValueError(
           f"Cannot call convert_element_type on dtype {dtype_to_string(operand.dtype)}")
-    if core.is_opaque_dtype(new_dtype):
+    if (core.is_opaque_dtype(new_dtype) and
+        not isinstance(new_dtype, core.bint)):
       raise ValueError(
           f"Cannot convert_element_type to dtype={dtype_to_string(new_dtype)}")
   return new_dtype
@@ -2725,7 +2727,7 @@ def _broadcast_in_dim_batch_rule(batched_args, batch_dims, shape,
     idx, = (i for i, s in enumerate(shape) if s is None)
     return out, batching.RaggedAxis(0, idx+1, d)
   else:
-    raise NotImplementedError  # TODO(mattjj)
+    raise NotImplementedError  # TODO(mattjj,axch)
 
 def _broadcast_in_dim_fwd_rule(eqn):
   v, *dyn = eqn.invars
