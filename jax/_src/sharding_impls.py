@@ -161,7 +161,7 @@ def device_replica_id_map(sharding, global_shape: Shape) -> Mapping[Device, int]
   return out
 
 
-@use_cpp_class(xc.NamedSharding)
+# @use_cpp_class(xc.NamedSharding)
 class NamedSharding(XLACompatibleSharding):
   r"""NamedSharding is a way to express ``Sharding``\s using named axes.
 
@@ -200,17 +200,21 @@ class NamedSharding(XLACompatibleSharding):
   spec: PartitionSpec
   memory_kind: str | None
   _parsed_pspec: ParsedPartitionSpec
+  _manual_axes: frozenset
 
-  @use_cpp_method()
+  # @use_cpp_method()
   def __init__(
       self, mesh: mesh_lib.Mesh, spec: PartitionSpec, *,
-      memory_kind: str | None = None, _parsed_pspec = None):
-
+      memory_kind: str | None = None, _parsed_pspec = None,
+      manual_axes = frozenset()):
     self.mesh = mesh
     self.spec = spec
-    self.memory_kind = memory_kind
+    self._memory_kind = memory_kind
     self._parsed_pspec = _parsed_pspec
+    self._manual_axes = manual_axes
     self._preprocess()
+
+  memory_kind = property(op.attrgetter('_memory_kind'))
 
   def __reduce__(self):
     if xla_extension_version >= 168:
@@ -261,17 +265,19 @@ class NamedSharding(XLACompatibleSharding):
       return False
     if id(self) == id(other):
       return True
-    parsed_pspec_equal = self._parsed_pspec == other._parsed_pspec
+    if self._manual_axes != other._manual_axes:
+      return False
+    if self._parsed_pspec != other._parsed_pspec:
+      return False
     if xla_extension_version >= 168:
       if (id(self.mesh) == id(other.mesh) and
-          self.memory_kind == other.memory_kind and parsed_pspec_equal):
+          self.memory_kind == other.memory_kind):
         return True
-      return (self.mesh == other.mesh and self.memory_kind == other.memory_kind
-              and parsed_pspec_equal)
+      return self.mesh == other.mesh and self.memory_kind == other.memory_kind
     else:
-      if id(self.mesh) == id(other.mesh) and parsed_pspec_equal:
+      if id(self.mesh) == id(other.mesh):
         return True
-      return self.mesh == other.mesh and parsed_pspec_equal
+      return self.mesh == other.mesh
 
   def is_compatible_aval(self, aval_shape: Shape):
     assert self._parsed_pspec is not None
@@ -284,13 +290,15 @@ class NamedSharding(XLACompatibleSharding):
           f"{len(aval_shape)}.{extra_msg}")
 
   @classmethod
-  def _from_parsed_pspec(cls, mesh, parsed_pspec, *, memory_kind=None):
+  def _from_parsed_pspec(cls, mesh, parsed_pspec, *, memory_kind=None,
+                         manual_axes=frozenset()):
     if xla_extension_version >= 168:
       return cls(mesh, parsed_pspec.get_partition_spec(),
-                 memory_kind=memory_kind, _parsed_pspec=parsed_pspec)
+                 memory_kind=memory_kind, _parsed_pspec=parsed_pspec,
+                 manual_axes=manual_axes)
     else:
       return cls(mesh, parsed_pspec.get_partition_spec(),
-                 _parsed_pspec=parsed_pspec)
+                 _parsed_pspec=parsed_pspec, manual_axes=manual_axes)
 
   @property
   def device_set(self) -> set[Device]:
@@ -332,11 +340,10 @@ class NamedSharding(XLACompatibleSharding):
         self.mesh.shape, self.mesh.axis_names)(num_dimensions, array_mapping)
     # Used in `with_sharding_constraint`.
     special_axes = {}
-    # Manual axes is only used with xmap.
-    if axis_ctx is not None and isinstance(axis_ctx, SPMDAxisContext):
+    if self._manual_axes:
       axis_names = self.mesh.axis_names
       # Ignore type because mypy doesn't recognize the `hasattr` check above.
-      for manual_axis in axis_ctx.manual_axes:  # type: ignore
+      for manual_axis in self._manual_axes:  # type: ignore
         special_axes[axis_names.index(manual_axis)] = xc.OpSharding.Type.MANUAL
     return sharding_spec, special_axes
 
@@ -1270,18 +1277,19 @@ def explode_superdims(sizes, dims):
     final_dims += reversed(new_dims)
   return final_dims
 
-def parse_flatten_op_sharding(op_sharding: xc.OpSharding | xc.HloSharding,
-                              mesh: mesh_lib.Mesh) -> Sequence[ParsedPartitionSpec]:
+def parse_flatten_op_sharding(
+    op_sharding: xc.OpSharding | xc.HloSharding, mesh: mesh_lib.Mesh
+) -> Sequence[tuple[ParsedPartitionSpec, FrozenSet]]:
   if isinstance(op_sharding, xc.HloSharding):
     op_sharding = op_sharding.to_proto()  # type: ignore
   if op_sharding.type == xc.OpSharding.Type.TUPLE:
-    out: list[ParsedPartitionSpec] = []
+    out: list[tuple[ParsedPartitionSpec, FrozenSet]] = []
     for s in op_sharding.tuple_shardings:
       out.extend(parse_flatten_op_sharding(s, mesh))
     return out
   elif op_sharding.type == xc.OpSharding.Type.REPLICATED:
-    return [CanonicalizedParsedPartitionSpec(
-        ParsedPartitionSpec(PartitionSpec(), ()))]
+    return [(CanonicalizedParsedPartitionSpec(ParsedPartitionSpec(PartitionSpec(), ())),
+             frozenset())]
   elif op_sharding.type == xc.OpSharding.Type.OTHER:
     mesh_shape = mesh.shape
     mesh_axis_order = unflatten_array(mesh.shape, op_sharding.tile_assignment_devices)
@@ -1298,14 +1306,18 @@ def parse_flatten_op_sharding(op_sharding: xc.OpSharding | xc.HloSharding,
         dim_partitions.append(axis)
       partitions.append(tuple(dim_partitions))
     if op_sharding.last_tile_dims == [xc.OpSharding.Type.REPLICATED]:
-      replicate_on_last_tile_dim = True
-    else:
-      replicate_on_last_tile_dim = op_sharding.replicate_on_last_tile_dim
+      partitions = partitions[:-1]
+      return [(CanonicalizedParsedPartitionSpec(ParsedPartitionSpec(
+          '<internally generated spec>', partitions)), frozenset())]
+    elif op_sharding.last_tile_dims == [xc.OpSharding.Type.MANUAL]:
+      manual_axes = frozenset(partitions[-1])
+      return [(CanonicalizedParsedPartitionSpec(ParsedPartitionSpec(
+          '<internally generated spec>', partitions[:-1])), manual_axes)]
+    elif op_sharding.replicate_on_last_tile_dim:
       if op_sharding.last_tile_dims:
         raise NotImplementedError("Unhandled OpSharding type. Please open a bug report!")
-    if replicate_on_last_tile_dim:
       partitions = partitions[:-1]
-    return [CanonicalizedParsedPartitionSpec(
-        ParsedPartitionSpec('<internally generated spec>', partitions))]
+      return [(CanonicalizedParsedPartitionSpec(ParsedPartitionSpec(
+          '<internally generated spec>', partitions)), frozenset())]
   else:
     raise AssertionError("Unhandled OpSharding type. Please open a bug report!")

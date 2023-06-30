@@ -14,6 +14,8 @@
 from __future__ import annotations
 
 from collections.abc import Hashable, Sequence
+from contextlib import contextmanager
+import dataclasses
 import enum
 from functools import partial
 import inspect
@@ -21,6 +23,7 @@ import itertools as it
 import math
 import operator as op
 from typing import Any, Callable, Optional, TypeVar, Union
+import threading
 
 import numpy as np
 
@@ -72,16 +75,17 @@ traceback_util.register_exclusion(__file__)
 # API
 
 Specs = Any  # PyTree[PartitionSpec]
+AxisName = Hashable
 
 
 @traceback_util.api_boundary
 def shard_map(f: Callable, mesh: Mesh, in_specs: Specs, out_specs: Specs,
-              check_rep: bool = True):
-  return _shard_map(f, mesh, in_specs, out_specs, check_rep)
+              check_rep: bool = True, auto: FrozenSet[AxisName] = frozenset()):
+  return _shard_map(f, mesh, in_specs, out_specs, check_rep, auto)
 
 def _shard_map(f: Callable, mesh: Mesh, in_specs: Specs,
                out_specs: Specs | Callable[[], Specs],
-               check_rep: bool = True):
+               check_rep: bool, auto: FrozenSet[AxisName]):
   if not callable(f):
     raise TypeError("shard_map requires a callable for its first argument, "
                     f"but got {f} of type {type(f)}.")
@@ -121,7 +125,7 @@ def _shard_map(f: Callable, mesh: Mesh, in_specs: Specs,
     try:
       out_flat = shard_map_p.bind(
           flat_fun, *args_flat, mesh=mesh, in_names=in_names_flat,
-          out_names_thunk=out_names_thunk, check_rep=check_rep)
+          out_names_thunk=out_names_thunk, check_rep=check_rep, auto=auto)
     except _SpecError as e:
       fails, = e.args
       if not callable(out_specs):
@@ -140,7 +144,6 @@ def _shard_map(f: Callable, mesh: Mesh, in_specs: Specs,
   return wrapped
 
 # Internally use AxisNames = Dict[int, Tuple[AxisName, ...]], not PartitionSpecs
-AxisName = Hashable
 AxisNames = dict[int, tuple[AxisName, ...]]  # TODO(mattjj): make it hashable
 def _canonicalize_spec(spec: PartitionSpec) -> AxisNames:
   if isinstance(spec, PartitionSpec):
@@ -332,10 +335,10 @@ class ShardMapPrimitive(core.Primitive):
   def bind(self, fun: lu.WrappedFun, *args: MaybeTracer, mesh: Mesh,
            in_names: tuple[AxisNames, ...],
            out_names_thunk: Callable[[], tuple[AxisNames, ...]],
-           check_rep: bool) -> Sequence[MaybeTracer]:
+           check_rep: bool, auto: frozenset[AxisName]) -> Sequence[MaybeTracer]:
     top_trace = core.find_top_trace(args)
-    fun, env_todo = process_env_traces(fun, top_trace.level, mesh,
-                                       in_names, out_names_thunk, check_rep)
+    fun, env_todo = process_env_traces(fun, top_trace.level, mesh, in_names,
+                                       out_names_thunk, check_rep, auto)
 
     @as_hashable_function(closure=out_names_thunk)
     def new_out_names_thunk():
@@ -348,7 +351,7 @@ class ShardMapPrimitive(core.Primitive):
     tracers = map(top_trace.full_raise, args)
     outs = top_trace.process_shard_map(  # pytype: disable=attribute-error
         shard_map_p, fun, tracers, mesh=mesh, in_names=in_names,
-        out_names_thunk=new_out_names_thunk, check_rep=check_rep)
+        out_names_thunk=new_out_names_thunk, check_rep=check_rep, auto=auto)
     todos, _ = env_todo()
     return map(core.full_lower, core.apply_todos(todos, outs))
 
@@ -364,7 +367,7 @@ shard_map_p = ShardMapPrimitive('shard_map')
 
 @lu.transformation_with_aux
 def process_env_traces(level: int, mesh, in_names, out_names_thunk, check_rep,
-                       *args: Any):
+                       auto, *args: Any):
   outs = yield args, {}
   todos, out_names_transforms = [], []
   while True:
@@ -377,7 +380,7 @@ def process_env_traces(level: int, mesh, in_names, out_names_thunk, check_rep,
     trace = ans._trace.main.with_cur_sublevel()
     outs = map(trace.full_raise, outs)
     outs, (todo, xform) = trace.post_process_shard_map(
-        outs, mesh, in_names, out_names_thunk, check_rep)
+        outs, mesh, in_names, out_names_thunk, check_rep, auto)
     todos.append(todo)
     out_names_transforms.append(xform)
   yield outs, (tuple(todos), tuple(out_names_transforms))
@@ -390,13 +393,15 @@ def _shard_map_staging(
     in_names: tuple[AxisNames, ...],
     out_names_thunk: Callable[[], tuple[AxisNames, ...]],
     check_rep: bool,
+    auto: FrozenSet,
   ) -> Sequence[pe.DynamicJaxprTracer]:
   in_avals = [t.aval for t in in_tracers]
   in_avals_ = map(partial(_shard_aval, mesh), in_names, in_avals)
   main = trace.main
   with core.new_sublevel(), core.extend_axis_env_nd(mesh.shape.items()):
-    jaxpr, out_avals_generic, consts = pe.trace_to_subjaxpr_dynamic(
-        f, main, in_avals_)
+    with new_cur_devices(mesh, auto):
+      jaxpr, out_avals_generic, consts = pe.trace_to_subjaxpr_dynamic(
+          f, main, in_avals_)
   out_avals_ = map(_check_shapedarray, out_avals_generic)
   _check_names(out_names_thunk(), out_avals_)
   if check_rep:
@@ -414,7 +419,7 @@ def _shard_map_staging(
     jaxpr = pe.convert_constvars_jaxpr(jaxpr)
   params = dict(mesh=mesh, in_names=in_names_staged,
                 out_names=tuple(out_names_thunk()), jaxpr=jaxpr,
-                check_rep=check_rep)
+                check_rep=check_rep, auto=auto)
   eqn = pe.new_jaxpr_eqn([*constvars, *invars], outvars, prim, params,
                          jaxpr.effects, source_info)
   trace.frame.add_eqn(eqn)
@@ -498,11 +503,11 @@ def _valid_repeats(mesh: Mesh, rep: set[AxisName], dst: AxisNames) -> bool:
 # Lowering
 
 def _shard_map_lowering(ctx, *in_nodes, jaxpr, mesh, in_names, out_names,
-                        check_rep):
+                        check_rep, auto):
   del check_rep
   in_avals_ = [v.aval for v in jaxpr.invars]
   out_avals_ = [x.aval for x in jaxpr.outvars]
-  in_nodes_ = map(partial(_xla_shard, ctx, mesh), in_names, ctx.avals_in,
+  in_nodes_ = map(partial(_xla_shard, ctx, mesh, auto), in_names, ctx.avals_in,
                   in_avals_, in_nodes)
   new_axis_context = sharding_impls.SPMDAxisContext(
       mesh, frozenset(mesh.axis_names)
@@ -514,13 +519,13 @@ def _shard_map_lowering(ctx, *in_nodes, jaxpr, mesh, in_names, out_names,
         mlir.TokenSet(), *in_nodes_, dim_var_values=ctx.dim_var_values,
         arg_names=map(_pspec_mhlo_attrs, in_names, in_avals_),
         result_names=map(_pspec_mhlo_attrs, out_names, out_avals_))
-  return map(partial(_xla_unshard, ctx, mesh), out_names, out_avals_,
+  return map(partial(_xla_unshard, ctx, mesh, auto), out_names, out_avals_,
              ctx.avals_out, out_nodes_)
 mlir.register_lowering(shard_map_p, _shard_map_lowering)
 
-def _xla_shard(ctx: mlir.LoweringRuleContext,
-               mesh, names, aval_in, aval_out, x):
-  manual_proto = pxla.manual_proto(aval_in, frozenset(mesh.axis_names), mesh)
+def _xla_shard(ctx: mlir.LoweringRuleContext, mesh, auto, names,
+               aval_in, aval_out, x):
+  manual_proto = pxla.manual_proto(aval_in, frozenset(mesh.axis_names) - auto, mesh)
   axes = {name: i for i, ns in names.items() for name in ns}
   shard_proto = NamedSharding(
       mesh, sharding_impls.array_mapping_to_axis_resources(axes)  # type: ignore
@@ -528,13 +533,13 @@ def _xla_shard(ctx: mlir.LoweringRuleContext,
   if dtypes.issubdtype(aval_in.dtype, dtypes.extended):
     shard_proto = aval_in.dtype._rules.physical_hlo_sharding(aval_in, shard_proto)
   sx = mlir.wrap_with_sharding_op(ctx, x, aval_in, shard_proto.to_proto(),  # type: ignore
-                                  unspecified_dims=set())
+                                  unspecified_dims=set(range(aval_in.ndim)))
   return [mlir.wrap_with_full_to_shard_op(ctx, sx, aval_out, manual_proto, set())]
 
-def _xla_unshard(ctx: mlir.LoweringRuleContext,
-                 mesh, names, aval_in, aval_out, xs):
+def _xla_unshard(ctx: mlir.LoweringRuleContext, mesh, auto, names,
+                 aval_in, aval_out, xs):
   x, = xs
-  manual_proto = pxla.manual_proto(aval_in, frozenset(mesh.axis_names), mesh)
+  manual_proto = pxla.manual_proto(aval_in, frozenset(mesh.axis_names) - auto, mesh)
   sx = mlir.wrap_with_sharding_op(ctx, x, aval_in, manual_proto, unspecified_dims=set())
   axes = {name: i for i, ns in names.items() for name in ns}
   shard_proto = NamedSharding(
@@ -542,8 +547,8 @@ def _xla_unshard(ctx: mlir.LoweringRuleContext,
   )._to_xla_hlo_sharding(aval_out.ndim)
   if dtypes.issubdtype(aval_out.dtype, dtypes.extended):
     shard_proto = aval_out.dtype._rules.physical_hlo_sharding(aval_out, shard_proto)
-  return mlir.wrap_with_shard_to_full_op(ctx, sx, aval_out,
-                                         shard_proto.to_proto(), set())  # type: ignore
+  return mlir.wrap_with_shard_to_full_op(ctx, sx, aval_out, shard_proto.to_proto(),
+                                         set(range(aval_out.ndim)))  # type: ignore
 
 def _pspec_mhlo_attrs(names: AxisNames, aval: core.AbstractValue) -> str:
   if isinstance(aval, core.ShapedArray):
@@ -553,8 +558,9 @@ def _pspec_mhlo_attrs(names: AxisNames, aval: core.AbstractValue) -> str:
 # Eager evaluation
 
 def _shard_map_impl(trace, prim, fun, args, *, mesh, in_names, out_names_thunk,
-                    check_rep):
-  del prim
+                    check_rep, auto):
+  if auto: raise NotImplementedError
+  del prim, auto
   args = map(partial(_unmatch_spec, mesh), in_names, args)
   in_rep = map(partial(_in_names_to_rep, mesh), in_names)
   with core.new_base_main(ShardMapTrace, mesh=mesh, check=check_rep) as main:
@@ -1264,3 +1270,53 @@ def _get_devices(p, backend):
   if jax.process_count() > 1:
     return devs[:p.global_axis_size]
   return devs[:p.local_axis_size]
+
+
+class State(threading.local):
+  current_devices = None
+thread_state = State()
+
+@contextmanager
+def new_cur_devices(mesh: Mesh, auto: frozenset[AxisName]):
+  N = math.prod(mesh.shape[i] for i in auto)
+  devices = [VirtualDevice(i, mesh, auto) for i in range(N)]
+  try:
+    prev, thread_state.current_devices = thread_state.current_devices, devices
+    yield
+  finally:
+    thread_state.current_devices = prev
+
+@dataclasses.dataclass(frozen=True)
+class VirtualDevice:
+  id: int
+  mesh: Mesh
+  auto: frozenset[AxisName]
+
+  @property
+  def platform(self):
+    return self.mesh.devices.flat[0].platform
+
+def current_devices() -> list[VirtualDevice]:
+  devices = thread_state.current_devices
+  return devices if devices is not None else jax.devices()
+
+# TODO this is an abstract method on Sharding (?), one impl per subclass
+# TODO worry about shadowing of names
+def resolve_virtual(sharding: NamedSharding) -> NamedSharding:
+  mesh1 = sharding.mesh.devices[0].mesh
+  auto1 = sharding.mesh.devices[0].auto
+  devices1, names1 = mesh1.devices, mesh1.axis_names
+  manual_names = [n for n in names1 if n not in auto1]
+
+  # ensure manual axes are in the front, flatten manual
+  auto_idxs = [i for i, n in enumerate(names1) if n not in auto1]
+  devices1 = np.moveaxis(devices1, auto_idxs, list(range(len(auto_idxs))))
+  devices1 = devices1.reshape(*devices1.shape[:len(auto_idxs)], -1)
+
+  resolved_devices = devices1[..., sharding.mesh.device_ids]
+  resolved_names = (*manual_names, *sharding.mesh.axis_names)
+  resolved_mesh = Mesh(resolved_devices, resolved_names)
+
+  parsed_pspec = sharding._parsed_pspec
+  return NamedSharding._from_parsed_pspec(resolved_mesh, parsed_pspec,
+                                          manual_axes=frozenset(manual_names))

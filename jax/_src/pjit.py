@@ -1857,9 +1857,10 @@ def with_sharding_constraint(x, shardings):
                         for s in shardings_flat]
   del user_shardings_flat
 
-  pjit_check_aval_sharding(
-      shardings_flat, x_flat, None, "with_sharding_constraint arguments",
-      allow_uneven_sharding=True)
+  # TODO(yashkatariya)
+  # pjit_check_aval_sharding(
+  #     shardings_flat, x_flat, None, "with_sharding_constraint arguments",
+  #     allow_uneven_sharding=True)
 
   outs = [sharding_constraint_p.bind(xf, sharding=to_gspmd_sharding(i, xf.ndim),
                                      resource_env=resource_env,
@@ -1892,8 +1893,8 @@ def _sharding_constraint_hlo_lowering(ctx, x_node, *, sharding,
   # and then convert it back with the added special axes.
   if isinstance(axis_ctx, sharding_impls.SPMDAxisContext):
     mesh = resource_env.physical_mesh
-    parsed_pspec = parse_flatten_op_sharding(sharding._hlo_sharding, mesh)[0]
-    mps = NamedSharding._from_parsed_pspec(mesh, parsed_pspec)
+    parsed_pspec, manual_axes = parse_flatten_op_sharding(sharding._hlo_sharding, mesh)[0]
+    mps = NamedSharding._from_parsed_pspec(mesh, parsed_pspec, manual_axes=manual_axes)
     sharding = GSPMDSharding(
         mps._device_assignment, mps._to_xla_hlo_sharding(aval.ndim, axis_ctx=axis_ctx))
   return [
