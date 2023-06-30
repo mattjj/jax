@@ -1496,6 +1496,12 @@ class PileTest(jtu.JaxTestCase):
     xs = jax.vmap(lambda n: jax.lax.iota('int32', n).sum())(ins)
     self.assertAllClose(xs, jnp.array([3, 0, 6]), check_dtypes=False)
 
+  def test_pile_escapes(self):
+    ins = lax.convert_element_type(jnp.array([3, 1, 4]), core.bint(5))
+    xs = jax.vmap(jax.jit(lambda n: jax.lax.iota('int32', n)),
+                  out_axes=batching.pile_axis)(ins)
+    breakpoint()
+
   def test_make_pile_from_dynamic_shape(self):
     # We may not want to support returning piles from vmapped functions (instead
     # preferring to have a separate API which allows piles). But for now it
