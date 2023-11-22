@@ -120,22 +120,22 @@ def _shard_map(f: Callable, mesh: Mesh, in_specs: Specs,
         raise e('shard_map out_specs') from None
       return tuple(map(_canonicalize_spec, out_specs_flat))
 
-    if rewrite := check_rep:
+    if check_rep:
       fun = _efficient_transpose_rewrite(fun, mesh, in_names_flat, out_names_thunk)
 
     try:
       out_flat = shard_map_p.bind(
           fun, *args_flat, mesh=mesh, in_names=in_names_flat,
-          out_names_thunk=out_names_thunk, check_rep=check_rep, rewrite=rewrite,
-          auto=auto)
+          out_names_thunk=out_names_thunk, rewrite=check_rep, auto=auto)
     except _SpecError as e:
       fails, = e.args
       if not callable(out_specs):
         msg = _spec_rank_error(SpecErrorType.out, f, out_tree(), out_specs, fails)
         if any(fail is not no_fail and not fail.shape for fail in fails):
           msg += (" In particular, for rank 0 outputs which are not constant "
-                  "over the mesh, add at least one (singleton) axis to them so "
-                  "that they can be concatenated using out_specs.")
+                  "over the mesh, add at least one (singleton) axis to them "
+                  "(e.g. using `jnp.expand_dims`) so that they can be "
+                  "concatenated using out_specs.")
         raise ValueError(msg) from None
     except _RepError as e:
       fails, = e.args
@@ -337,11 +337,11 @@ class ShardMapPrimitive(core.Primitive):
   def bind(self, fun: lu.WrappedFun, *args: MaybeTracer, mesh: Mesh,
            in_names: tuple[AxisNames, ...],
            out_names_thunk: Callable[[], tuple[AxisNames, ...]],
-           check_rep: bool, rewrite: bool, auto: frozenset[AxisName]
+           rewrite: bool, auto: frozenset[AxisName]
            ) -> Sequence[MaybeTracer]:
     top_trace = core.find_top_trace(args)
     fun, env_todo = process_env_traces(fun, top_trace.level, mesh, in_names,
-                                       out_names_thunk, check_rep, rewrite, auto)
+                                       out_names_thunk, rewrite, auto)
 
     @as_hashable_function(closure=out_names_thunk)
     def new_out_names_thunk():
@@ -354,8 +354,7 @@ class ShardMapPrimitive(core.Primitive):
     tracers = map(top_trace.full_raise, args)
     outs = top_trace.process_shard_map(  # pytype: disable=attribute-error
         shard_map_p, fun, tracers, mesh=mesh, in_names=in_names,
-        out_names_thunk=new_out_names_thunk, check_rep=check_rep,
-        rewrite=rewrite, auto=auto)
+        out_names_thunk=new_out_names_thunk, rewrite=rewrite, auto=auto)
     todos, _ = env_todo()
     return map(core.full_lower, core.apply_todos(todos, outs))
 
@@ -370,8 +369,8 @@ class ShardMapPrimitive(core.Primitive):
 shard_map_p = ShardMapPrimitive('shard_map')
 
 @lu.transformation_with_aux
-def process_env_traces(level: int, mesh, in_names, out_names_thunk, check_rep,
-                       rewrite, auto, *args: Any):
+def process_env_traces(level: int, mesh, in_names, out_names_thunk, rewrite,
+                       auto, *args: Any):
   outs = yield args, {}
   todos, out_names_transforms = [], []
   while True:
@@ -384,7 +383,7 @@ def process_env_traces(level: int, mesh, in_names, out_names_thunk, check_rep,
     trace = ans._trace.main.with_cur_sublevel()
     outs = map(trace.full_raise, outs)
     outs, (todo, xform) = trace.post_process_shard_map(
-        outs, mesh, in_names, out_names_thunk, check_rep, rewrite, auto)
+        outs, mesh, in_names, out_names_thunk, rewrite, auto)
     todos.append(todo)
     out_names_transforms.append(xform)
   yield outs, (tuple(todos), tuple(out_names_transforms))
@@ -396,7 +395,6 @@ def _shard_map_staging(
     in_tracers: Sequence[pe.DynamicJaxprTracer], *, mesh: Mesh,
     in_names: tuple[AxisNames, ...],
     out_names_thunk: Callable[[], tuple[AxisNames, ...]],
-    check_rep: bool,
     rewrite: bool,
     auto: frozenset,
   ) -> Sequence[pe.DynamicJaxprTracer]:
@@ -408,9 +406,6 @@ def _shard_map_staging(
   out_avals_ = map(_check_shapedarray, genavals)
   _check_names(out_names_thunk(), out_avals_)
   in_rep = map(partial(_in_names_to_rep, mesh), in_names)
-  if check_rep:
-    out_rep = _check_rep(mesh, jaxpr, in_rep)
-    _check_reps(mesh, out_names_thunk(), out_rep)
   out_avals = map(partial(_unshard_aval, mesh), out_names_thunk(), out_avals_)
   source_info = source_info_util.current()
   out_tracers = [pe.DynamicJaxprTracer(trace, a, source_info) for a in out_avals]
@@ -422,78 +417,12 @@ def _shard_map_staging(
     jaxpr = pe.convert_constvars_jaxpr(jaxpr)
   params = dict(mesh=mesh, in_names=in_names_staged,
                 out_names=tuple(out_names_thunk()), jaxpr=jaxpr,
-                check_rep=check_rep, rewrite=rewrite, auto=auto)
+                rewrite=rewrite, auto=auto)
   eqn = pe.new_jaxpr_eqn([*constvars, *invars], outvars, prim, params,
                          jaxpr.effects, source_info)
   trace.frame.add_eqn(eqn)
   return out_tracers
 pe.DynamicJaxprTrace.process_shard_map = _shard_map_staging
-
-
-Val = Any
-
-# TODO(mattjj): caching
-def _replication_rewrite_match(
-    mesh: Mesh, jaxpr: core.ClosedJaxpr, in_rep: Sequence[set[AxisName]],
-    out_rep_dst: Sequence[set[AxisName]],
-  ) -> core.ClosedJaxpr:
-  f = lu.wrap_init(partial(_rep_rewrite, mesh, jaxpr, in_rep))
-  f = _match_rep(f, mesh, out_rep_dst)
-  with core.extend_axis_env_nd(mesh.shape.items()):
-    jaxpr_, _, consts = pe.trace_to_jaxpr_dynamic(f, jaxpr.in_avals)
-  return core.ClosedJaxpr(jaxpr_, consts)
-
-@lu.transformation
-def _match_rep(mesh: Mesh, out_rep_dst: Sequence[set[AxisName]], *args):
-  out_vals, out_reps = yield args, {}
-  _check_reps2(mesh, out_rep_dst, out_reps)
-  out_vals = [pbroadcast(x, tuple(n for n in src if n not in dst)) if src - dst
-              else x for x, src, dst in zip(out_vals, out_reps, out_rep_dst)]
-  yield out_vals
-
-
-def _rep_rewrite(
-    mesh: Mesh, jaxpr_: core.ClosedJaxpr,
-    in_rep: Sequence[set[AxisName]], *args: Val,
-  ) -> tuple[tuple[Val], tuple[set[AxisName]]]:
-  jaxpr, consts = jaxpr_.jaxpr, jaxpr_.consts
-
-  env: dict[core.Var, tuple[Val, set[AxisName]]] = {}
-
-  def read(x: core.Atom) -> tuple[Val, set[AxisName]]:
-    return env[x] if isinstance(x, core.Var) else (x.val, set(mesh.axis_names))
-
-  def write(v: core.Var, val: Val, rep: set[AxisName]) -> None:
-    env[v] = (val, rep)
-
-  map(write, jaxpr.constvars, consts, [set(mesh.axis_names)] * len(consts))
-  map(write, jaxpr.invars, args, in_rep)
-  for e in jaxpr.eqns:
-    rule = _rewrite_rules.get(e.primitive, partial(_rule_missing, e.primitive))
-    in_vals, in_reps = unzip2(map(read, e.invars))
-    out_vals, out_reps = rule(mesh, in_reps, *in_vals, **e.params)
-    map(write, e.outvars, out_vals, out_reps)
-  out_vals, out_reps = unzip2(map(read, jaxpr.outvars))
-  return out_vals, out_reps
-
-def _rule_missing(prim: core.Primitive, *_, **__):
-  raise NotImplementedError(
-      f"No replication rule for {prim}. As a workaround, pass the "
-      "`check_rep=False` argument to `shard_map`. To get this fixed, open an "
-      "issue at https://github.com/google/jax/issues")
-
-def _replication_rewrite_nomatch(
-    mesh: Mesh, jaxpr: core.ClosedJaxpr, in_rep: Sequence[set[AxisName]],
-  ) -> tuple[core.ClosedJaxpr, list[set[AxisName]]]:
-  f = lu.wrap_init(partial(_rep_rewrite, mesh, jaxpr, in_rep))
-  f, out_rep = _grab_out_rep(f)
-  with core.extend_axis_env_nd(mesh.shape.items()):
-    jaxpr_, _, consts = pe.trace_to_jaxpr_dynamic(f, jaxpr.in_avals)
-  return core.ClosedJaxpr(jaxpr_, consts), list(out_rep())
-
-@lu.transformation_with_aux
-def _grab_out_rep(*args):
-  yield (yield args, {})
 
 
 def _check_shapedarray(aval: core.AbstractValue) -> core.ShapedArray:
@@ -521,7 +450,7 @@ def _unshard_aval(mesh: Mesh, names: AxisNames, aval: core.AbstractValue
 # Type-checking
 
 def _shard_map_typecheck(_, *in_atoms, jaxpr, mesh, in_names, out_names,
-                         check_rep, rewrite, auto):
+                         rewrite, auto):
   del auto  # TODO(mattjj,parkers): check
   for v, x, in_name in zip(jaxpr.invars, in_atoms, in_names):
     if not core.typecompat(v.aval, _shard_aval(mesh, in_name, x.aval)):
@@ -529,13 +458,6 @@ def _shard_map_typecheck(_, *in_atoms, jaxpr, mesh, in_names, out_names,
                                 "jaxpr binder avals and in_names")
   with core.extend_axis_env_nd(tuple(mesh.shape.items())):
     core.check_jaxpr(jaxpr)
-  if check_rep:
-    in_rep = map(partial(_in_names_to_rep, mesh), in_names)
-    out_rep = _check_rep(mesh, jaxpr, in_rep)
-    for rep, dst in zip(out_rep, out_names):
-      if not _valid_repeats(mesh, rep, dst):
-        raise core.JaxprTypeError("shard_map can't prove output is "
-                                  "sufficiently replicated")
   out_avals_sharded = [x.aval for x in jaxpr.outvars]
   out_avals = map(partial(_unshard_aval, mesh), out_names, out_avals_sharded)
   return out_avals, jaxpr.effects
@@ -544,38 +466,11 @@ core.custom_typechecks[shard_map_p] = _shard_map_typecheck
 def _in_names_to_rep(mesh: Mesh, names: AxisNames) -> set[AxisName]:
   return set(mesh.axis_names) - {n for ns in names.values() for n in ns}
 
-def _check_rep(mesh: Mesh, jaxpr: core.Jaxpr, in_rep: Sequence[set[AxisName]],
-                ) -> Sequence[set[AxisName]]:
-  env: dict[core.Var, set[AxisName]] = {}
-
-  def read(x: core.Atom) -> set[AxisName]:
-    return env[x] if type(x) is core.Var else set(mesh.axis_names)
-
-  def write(v: core.Var, val: set[AxisName]) -> None:
-    env[v] = val
-
-  map(write, jaxpr.constvars, [set(mesh.axis_names)] * len(jaxpr.constvars))
-  map(write, jaxpr.invars, in_rep)
-  last_used = core.last_used(jaxpr)
-  for e in jaxpr.eqns:
-    rule = _check_rules.get(e.primitive, partial(_rule_missing, e.primitive))
-    out_rep = rule(mesh, *map(read, e.invars), **e.params)
-    if e.primitive.multiple_results:
-      out_rep = [out_rep] * len(e.outvars) if type(out_rep) is set else out_rep
-      map(write, e.outvars, out_rep)
-    else:
-      write(e.outvars[0], out_rep)
-    core.clean_up_dead_vars(e, env, last_used)
-  return map(read, jaxpr.outvars)
-
-def _valid_repeats(mesh: Mesh, rep: set[AxisName], dst: AxisNames) -> bool:
-  return set(_unmentioned(mesh, dst)).issubset(rep)
-
 # Lowering
 
 def _shard_map_lowering(ctx, *in_nodes, jaxpr, mesh, in_names, out_names,
-                        check_rep, rewrite, auto):
-  del check_rep, rewrite
+                        rewrite, auto):
+  del rewrite
   in_avals_ = [v.aval for v in jaxpr.invars]
   out_avals_ = [x.aval for x in jaxpr.outvars]
   in_nodes_ = map(partial(_xla_shard, ctx, mesh, auto), in_names, ctx.avals_in,
@@ -632,12 +527,12 @@ def _pspec_mhlo_attrs(names: AxisNames, aval: core.AbstractValue) -> str:
 # Eager evaluation
 
 def _shard_map_impl(trace, prim, fun, args, *, mesh, in_names, out_names_thunk,
-                    check_rep, rewrite, auto):
+                    rewrite, auto):
   if auto: raise NotImplementedError
   del prim, auto
   args = map(partial(_unmatch_spec, mesh), in_names, args)
   in_rep = map(partial(_in_names_to_rep, mesh), in_names)
-  with core.new_base_main(ShardMapTrace, mesh=mesh, check=check_rep) as main:
+  with core.new_base_main(ShardMapTrace, mesh=mesh) as main:
     with core.new_sublevel(), core.extend_axis_env_nd(mesh.shape.items(), main):
       t = main.with_cur_sublevel()
       in_tracers = map(partial(ShardMapTracer, t), in_rep, args)
@@ -647,10 +542,7 @@ def _shard_map_impl(trace, prim, fun, args, *, mesh, in_names, out_names_thunk,
       del main, t, in_tracers, ans, out_tracers
   out_avals = [core.mapped_aval(x.shape[0], 0, core.get_aval(x)) for x in outs_]
   _check_names(out_names_thunk(), out_avals)  # pytype: disable=wrong-arg-types
-  if check_rep:
-    _check_reps(mesh, out_names_thunk(), out_rep)
-  return map(partial(_match_spec, mesh, check_rep), out_rep, out_names_thunk(),
-             outs_)
+  return map(partial(_match_spec, mesh), out_rep, out_names_thunk(), outs_)
 core.EvalTrace.process_shard_map = _shard_map_impl
 
 def _names_to_pspec(names: AxisNames) -> PartitionSpec:
@@ -673,24 +565,13 @@ def _check_names(names: Sequence[AxisNames], avals: Sequence[core.ShapedArray]
   if any(f is not no_fail for f in fail): raise _SpecError(fail)
 class _SpecError(Exception): pass
 
-def _check_reps(mesh, names, reps):
-  fail = [r if not _valid_repeats(mesh, r, n) else no_fail
-          for n, r in zip(names, reps)]
-  if any(f is not no_fail for f in fail): raise _RepError(fail)
-class _RepError(Exception): pass
-
-def _check_reps2(mesh, reps_dest, reps):
-  fail = [src if not dst.issubset(src) else no_fail
-          for dst, src in zip(reps_dest, reps)]
-  if any(f is not no_fail for f in fail): raise _RepError(fail)
-
-def _match_spec(mesh: Mesh, check_rep: bool,
-                rep: set[AxisName], dst: AxisNames, x: JaxType) -> JaxType:
-  fn = HashablePartial(_match, mesh, check_rep, tuple(dst.items()))
+def _match_spec(mesh: Mesh, rep: set[AxisName], dst: AxisNames, x: JaxType
+                ) -> JaxType:
+  fn = HashablePartial(_match, mesh, tuple(dst.items()))
   with core.eval_context():
     return jax.jit(fn)(x)
 
-def _match(mesh, check_rep, dst_tup, x):
+def _match(mesh, dst_tup, x):
   src = P(mesh.axis_names)
   dst = _names_to_pspec(dict(dst_tup))
   # TODO put back (?) needed for rep checking in eager? for now test rewrite
@@ -703,10 +584,9 @@ class ShardMapTrace(core.Trace):
   mesh: Mesh
   check: bool
 
-  def __init__(self, *args, mesh, check):
+  def __init__(self, *args, mesh):
     super().__init__(*args)
     self.mesh = mesh
-    self.check = check
 
   def pure(self, val):
     val_ = _unmatch_spec(self.mesh, {}, val)
@@ -724,8 +604,8 @@ class ShardMapTrace(core.Trace):
       f = HashablePartial(_prim_applier, prim, tuple(params.items()), self.mesh)
       with core.eval_context(), jax.disable_jit(False):
         out_vals = jax.jit(f)(*in_vals)
-    rep_rule = _check_rules.get(prim, partial(_rule_missing, prim))
-    out_rep = rep_rule(self.mesh, *in_rep, **params) if self.check else set()
+    try: out_rep = _check_rules[prim](self.mesh, *in_rep, **params)
+    except: out_rep = set()
     if prim.multiple_results:
       out_rep = [out_rep] * len(out_vals) if type(out_rep) is set else out_rep
       return map(partial(ShardMapTracer, self), out_rep, out_vals)
@@ -886,7 +766,123 @@ ad.deflinear2(pbroadcast_p,
               lambda cts, *_, axes, axis_index_groups:
               psum2_p.bind(*cts, axes=axes, axis_index_groups=axis_index_groups))
 
-# Rewrite rules and static replication checking for efficient transposition
+# Propagating replication types, used in eager and efficient transpose rewrite
+
+def _check_rep(mesh: Mesh, jaxpr: core.Jaxpr, in_rep: Sequence[set[AxisName]],
+                ) -> Sequence[set[AxisName]]:
+  env: dict[core.Var, set[AxisName]] = {}
+
+  def read(x: core.Atom) -> set[AxisName]:
+    return env[x] if type(x) is core.Var else set(mesh.axis_names)
+
+  def write(v: core.Var, val: set[AxisName]) -> None:
+    env[v] = val
+
+  map(write, jaxpr.constvars, [set(mesh.axis_names)] * len(jaxpr.constvars))
+  map(write, jaxpr.invars, in_rep)
+  last_used = core.last_used(jaxpr)
+  for e in jaxpr.eqns:
+    rule = _check_rules.get(e.primitive, partial(_rule_missing, e.primitive))
+    out_rep = rule(mesh, *map(read, e.invars), **e.params)
+    if e.primitive.multiple_results:
+      out_rep = [out_rep] * len(e.outvars) if type(out_rep) is set else out_rep
+      map(write, e.outvars, out_rep)
+    else:
+      write(e.outvars[0], out_rep)
+    core.clean_up_dead_vars(e, env, last_used)
+  return map(read, jaxpr.outvars)
+
+_check_rules: dict[core.Primitive, Callable] = {}
+register_check = lambda prim: lambda rule: _check_rules.setdefault(prim, rule)
+register_standard_check = \
+    lambda prim: _check_rules.setdefault(prim, partial(_standard_check, prim))
+
+def _rule_missing(prim: core.Primitive, *_, **__):
+  raise NotImplementedError(
+      f"No replication rule for {prim}. As a workaround, pass the "
+      "`check_rep=False` argument to `shard_map`. To get this fixed, open an "
+      "issue at https://github.com/google/jax/issues")
+
+def _standard_check(prim, mesh, *in_rep, **__):
+  # The standard check require args' and outputs' replications to be the same.
+  if in_rep and not in_rep[:-1] == in_rep[1:]:
+    raise Exception(f"Primitive {prim} requires argument replication types "
+                    f"to match, but got {in_rep}. Please open an issue at "
+                    "https://github.com/google/jax/issues")
+  return in_rep[0] if in_rep else set(mesh.axis_names)
+
+def _standard_collective_check(prim, mesh, x_rep, *, axis_name, **params):
+  # The standard collective check is varying -> varying over axis_name.
+  del mesh, params
+  if axis_name in x_rep:
+    raise Exception(f"Collective {prim} must be applied to a device-varying "
+                    f"replication type, but got {x_rep} for collective acting "
+                    f"over axis name {axis_name}. Please open an issue at "
+                    "https://github.com/google/jax/issues")
+  return x_rep
+
+# Rewriting (and static replication checking) for efficient transposition
+
+Val = Any
+
+def _rep_rewrite(
+    mesh: Mesh, jaxpr_: core.ClosedJaxpr,
+    in_rep: Sequence[set[AxisName]], *args: Val,
+  ) -> tuple[tuple[Val], tuple[set[AxisName]]]:
+  jaxpr, consts = jaxpr_.jaxpr, jaxpr_.consts
+
+  env: dict[core.Var, tuple[Val, set[AxisName]]] = {}
+
+  def read(x: core.Atom) -> tuple[Val, set[AxisName]]:
+    return env[x] if isinstance(x, core.Var) else (x.val, set(mesh.axis_names))
+
+  def write(v: core.Var, val: Val, rep: set[AxisName]) -> None:
+    env[v] = (val, rep)
+
+  map(write, jaxpr.constvars, consts, [set(mesh.axis_names)] * len(consts))
+  map(write, jaxpr.invars, args, in_rep)
+  for e in jaxpr.eqns:
+    rule = _rewrite_rules.get(e.primitive, partial(_rule_missing, e.primitive))
+    in_vals, in_reps = unzip2(map(read, e.invars))
+    out_vals, out_reps = rule(mesh, in_reps, *in_vals, **e.params)
+    map(write, e.outvars, out_vals, out_reps)
+  out_vals, out_reps = unzip2(map(read, jaxpr.outvars))
+  return out_vals, out_reps
+
+def _valid_repeats(mesh: Mesh, rep: set[AxisName], dst: AxisNames) -> bool:
+  return set(_unmentioned(mesh, dst)).issubset(rep)
+
+def _replication_rewrite_nomatch(
+    mesh: Mesh, jaxpr: core.ClosedJaxpr, in_rep: Sequence[set[AxisName]],
+  ) -> tuple[core.ClosedJaxpr, list[set[AxisName]]]:
+  f = lu.wrap_init(partial(_rep_rewrite, mesh, jaxpr, in_rep))
+  f, out_rep = _grab_out_rep(f)
+  with core.extend_axis_env_nd(mesh.shape.items()):
+    jaxpr_, _, consts = pe.trace_to_jaxpr_dynamic(f, jaxpr.in_avals)
+  return core.ClosedJaxpr(jaxpr_, consts), list(out_rep())
+
+@lu.transformation_with_aux
+def _grab_out_rep(*args):
+  yield (yield args, {})
+
+# TODO(mattjj): caching
+def _replication_rewrite_match(
+    mesh: Mesh, jaxpr: core.ClosedJaxpr, in_rep: Sequence[set[AxisName]],
+    out_rep_dst: Sequence[set[AxisName]],
+  ) -> core.ClosedJaxpr:
+  f = lu.wrap_init(partial(_rep_rewrite, mesh, jaxpr, in_rep))
+  f = _match_rep(f, mesh, out_rep_dst)
+  with core.extend_axis_env_nd(mesh.shape.items()):
+    jaxpr_, _, consts = pe.trace_to_jaxpr_dynamic(f, jaxpr.in_avals)
+  return core.ClosedJaxpr(jaxpr_, consts)
+
+@lu.transformation
+def _match_rep(mesh: Mesh, out_rep_dst: Sequence[set[AxisName]], *args):
+  out_vals, out_reps = yield args, {}
+  out_vals = [pbroadcast(x, tuple(n for n in src if n not in dst)) if src - dst
+              else x for x, src, dst in zip(out_vals, out_reps, out_rep_dst)]
+  yield out_vals
+
 
 _rewrite_rules: dict[core.Primitive, Callable] = {}
 register_rewrite = lambda prim: lambda r: _rewrite_rules.setdefault(prim, r)
@@ -894,11 +890,6 @@ register_standard_rewrite = lambda prim: \
     _rewrite_rules.setdefault(prim, partial(_standard_rewrite_rule, prim))
 register_norewrite = lambda p: \
     _rewrite_rules.setdefault(p, partial(_no_rewrite, p, _check_rules[p]))
-
-_check_rules: dict[core.Primitive, Callable] = {}
-register_check = lambda prim: lambda rule: _check_rules.setdefault(prim, rule)
-register_standard_check = \
-    lambda prim: _check_rules.setdefault(prim, partial(_standard_check, prim))
 
 def _no_rewrite(prim, rule, mesh, in_rep, *args, **params):
   out_vals = prim.bind(*args,**params)
@@ -919,27 +910,9 @@ def _standard_rewrite_rule(prim, mesh, in_rep, *args, **params):
   out_vals = [out_vals_] if not prim.multiple_results else out_vals_
   return out_vals, out_rep
 
-def _standard_check(prim, mesh, *in_rep, **__):
-  # The standard check require args' and outputs' replications to be the same.
-  if in_rep and not in_rep[:-1] == in_rep[1:]:
-    raise Exception(f"Primitive {prim} requires argument replication types "
-                    f"to match, but got {in_rep}. Please open an issue at "
-                    "https://github.com/google/jax/issues")
-  return in_rep[0] if in_rep else set(mesh.axis_names)
-
 def register_standard_collective(prim):
   register_check(prim)(partial(_standard_collective_check, prim))
   register_rewrite(prim)(partial(_standard_collective_rewrite, prim))
-
-def _standard_collective_check(prim, mesh, x_rep, *, axis_name, **params):
-  # The standard collective check is varying -> varying over axis_name.
-  del mesh, params
-  if axis_name in x_rep:
-    raise Exception(f"Collective {prim} must be applied to a device-varying "
-                    f"replication type, but got {x_rep} for collective acting "
-                    f"over axis name {axis_name}. Please open an issue at "
-                    "https://github.com/google/jax/issues")
-  return x_rep
 
 def _standard_collective_rewrite(prim, mesh, in_rep, x, axis_name, **params):
   # The standard collective rewrite may insert a pbroadcast on the input.
@@ -951,6 +924,7 @@ def _standard_collective_rewrite(prim, mesh, in_rep, x, axis_name, **params):
   out_val = prim.bind(x, axis_name=axis_name, **params)
   return [out_val], [x_rep - {axis_name}]
 
+# Rules for replication checking and rewriting.
 
 for o in it.chain(lax.__dict__.values(), slicing.__dict__.values(),
                   windowed_reductions.__dict__.values(), fft.__dict__.values(),
@@ -1160,14 +1134,12 @@ def _shard_map_batch(
     in_tracers: Sequence[batching.BatchTracer], mesh: Mesh,
     in_names: tuple[AxisNames, ...],
     out_names_thunk: Callable[[], tuple[AxisNames, ...]],
-    check_rep: bool,
     rewrite: bool,
     auto: frozenset) -> Sequence[batching.BatchTracer]:
   in_vals, in_dims = unzip2((t.val, t.batch_dim) for t in in_tracers)
   if all(bdim is batching.not_mapped for bdim in in_dims):
     return prim.bind(fun, *in_vals, mesh=mesh, in_names=in_names,
-                     out_names_thunk=out_names_thunk, check_rep=check_rep,
-                     rewrite=rewrite, auto=auto)
+                     out_names_thunk=out_names_thunk, rewrite=rewrite, auto=auto)
   if any(isinstance(d, batching.RaggedAxis) for d in in_dims):
     raise NotImplementedError
   fun, out_dims = batching.batch_subtrace(fun, trace.main, tuple(in_dims))
@@ -1182,8 +1154,8 @@ def _shard_map_batch(
     return _batch_out_names(spmd_axis_name, out_dims(), out_names_thunk())
 
   new_params = dict(mesh=mesh, in_names=new_in_names,
-                    out_names_thunk=new_out_names_thunk, check_rep=check_rep,
-                    rewrite=rewrite, auto=auto)
+                    out_names_thunk=new_out_names_thunk, rewrite=rewrite,
+                    auto=auto)
   out_vals = prim.bind(fun, *in_vals, **new_params)
   make_tracer = partial(batching.BatchTracer, trace,
                         source_info=source_info_util.current())
@@ -1191,8 +1163,8 @@ def _shard_map_batch(
 batching.BatchTrace.process_shard_map = _shard_map_batch
 
 def _shard_map_batch_post_process(trace, out_tracers, mesh, in_names,
-                                  out_names_thunk, check_rep, rewrite, auto):
-  del mesh, in_names, out_names_thunk, check_rep, rewrite, auto
+                                  out_names_thunk, rewrite, auto):
+  del mesh, in_names, out_names_thunk, rewrite, auto
   vals, dims, srcs = unzip3((t.val, t.batch_dim, t.source_info)
                             for t in out_tracers)
   m = trace.main
@@ -1215,7 +1187,7 @@ def _batch_out_names(spmd_axis_name, dims, out_names):
 # Autodiff
 
 def _shard_map_jvp(trace, shard_map_p, f, tracers, mesh, in_names,
-                   out_names_thunk, check_rep, rewrite, auto):
+                   out_names_thunk, rewrite, auto):
   primals, tangents = unzip2((t.primal, t.tangent) for t in tracers)
   which_nz = [     type(t) is not ad.Zero           for t in tangents]
   tangents = [t if type(t) is not ad.Zero else None for t in tangents]
@@ -1229,8 +1201,7 @@ def _shard_map_jvp(trace, shard_map_p, f, tracers, mesh, in_names,
     out_ax = out_names_thunk()
     return (*out_ax, *(ax for ax, nz in zip(out_ax, which_nz_out()) if nz))
   params = dict(mesh=mesh, in_names=(*in_names, *tangent_in_names),
-                out_names_thunk=new_out_names_thunk, check_rep=check_rep,
-                rewrite=rewrite, auto=auto)
+                out_names_thunk=new_out_names_thunk, rewrite=rewrite, auto=auto)
   f_jvp, out_tree = ad.traceable(f_jvp, in_tree)
   result = shard_map_p.bind(f_jvp, *args, **params)
   primal_out, tangent_out = tree_unflatten(out_tree(), result)
@@ -1240,8 +1211,8 @@ def _shard_map_jvp(trace, shard_map_p, f, tracers, mesh, in_names,
 ad.JVPTrace.process_shard_map = _shard_map_jvp
 
 def _shard_map_jvp_post_process(trace, out_tracers, mesh, in_names,
-                                out_names_thunk, check_rep, rewrite, auto):
-  del mesh, in_names, out_names_thunk, check_rep, rewrite, auto
+                                out_names_thunk, rewrite, auto):
+  del mesh, in_names, out_names_thunk, rewrite, auto
   primals, tangents = unzip2((t.primal, t.tangent) for t in out_tracers)
   out, treedef = tree_flatten((primals, tangents))
   tangents_nz = [type(t) is not ad.Zero for t in tangents]
@@ -1255,7 +1226,7 @@ def _shard_map_jvp_post_process(trace, out_tracers, mesh, in_names,
 ad.JVPTrace.post_process_shard_map = _shard_map_jvp_post_process
 
 def _shard_map_partial_eval(trace, shard_map_p, f, tracers, mesh, in_names,
-                            out_names_thunk, check_rep, rewrite, auto):
+                            out_names_thunk, rewrite, auto):
   in_pvals = [t.pval for t in tracers]
   in_knowns, in_avals, in_consts = pe.partition_pvals(in_pvals)
   unk_in_names, known_in_names = pe.partition_list(in_knowns, in_names)
@@ -1273,8 +1244,7 @@ def _shard_map_partial_eval(trace, shard_map_p, f, tracers, mesh, in_names,
     return (*out_known_names, *({0: (*mesh.axis_names,)},) * num_res)
 
   known_params = dict(mesh=mesh, in_names=(*known_in_names,),
-                      out_names_thunk=known_out_names, check_rep=check_rep,
-                      rewrite=rewrite, auto=auto)
+                      out_names_thunk=known_out_names, rewrite=rewrite, auto=auto)
   out = shard_map_p.bind(f_known, *in_consts, **known_params)
   in_fwd, out_fwd, out_knowns, out_avals_sharded, jaxpr, env = aux()
   num_res = sum(f1 is None and f2 is None for f1, f2 in zip(in_fwd, out_fwd))
@@ -1291,8 +1261,7 @@ def _shard_map_partial_eval(trace, shard_map_p, f, tracers, mesh, in_names,
   env_tracers = map(trace.full_raise, env)
   unk_arg_tracers = [t for t in tracers if not t.is_known()]
   unk_params = dict(mesh=mesh, in_names=unk_in_names,
-                    out_names=unk_out_names, jaxpr=jaxpr, check_rep=False,
-                    rewrite=rewrite, auto=auto)
+                    out_names=unk_out_names, jaxpr=jaxpr, rewrite=rewrite, auto=auto)
   out_avals = map(partial(_unshard_aval, mesh), unk_out_names, out_avals_sharded)
   out_tracers = [pe.JaxprTracer(trace, pe.PartialVal.unknown(a), None)
                  for a in out_avals]
@@ -1304,8 +1273,7 @@ def _shard_map_partial_eval(trace, shard_map_p, f, tracers, mesh, in_names,
 pe.JaxprTrace.process_shard_map = _shard_map_partial_eval
 
 def _shard_map_partial_eval_post_process(
-    trace, tracers, mesh, in_names, out_names_thunk, check_rep, rewrite, auto):
-  del check_rep
+    trace, tracers, mesh, in_names, out_names_thunk, rewrite, auto):
   unk_tracers = [t for t in tracers if not t.is_known()]
   jaxpr, res, env = pe.tracers_to_jaxpr([], unk_tracers)
   # TODO(mattjj): output forwarding optimization
@@ -1328,8 +1296,8 @@ def _shard_map_partial_eval_post_process(
 
     staged_in_names = ({0: (*mesh.axis_names,)},) * len(res_) + ({},) * len(env)
     staged_params = dict(jaxpr=jaxpr_, mesh=mesh, in_names=staged_in_names,
-                         out_names=(*out_names_unknown,), check_rep=False,
-                         rewrite=rewrite, auto=auto)
+                         out_names=(*out_names_unknown,), rewrite=rewrite,
+                         auto=auto)
 
     out_avals = map(partial(_unshard_aval, mesh), out_names_unknown, out_avals_)
     out_tracers = [pe.JaxprTracer(trace, pe.PartialVal.unknown(a), None)
@@ -1373,7 +1341,7 @@ def _promote_scalar_residuals_jaxpr(jaxpr, which):
   return jaxpr
 
 def _shard_map_transpose(out_cts, *args, jaxpr, mesh, in_names, out_names,
-                         check_rep, rewrite, auto):
+                         rewrite, auto):
   mb_div = lambda x, y: x / y if y != 1 else x
   out_cts = [ad.Zero(_shard_aval(mesh, ns, x.aval)) if type(x) is ad.Zero
              else x if rewrite
@@ -1410,8 +1378,7 @@ def _shard_map_transpose(out_cts, *args, jaxpr, mesh, in_names, out_names,
 
   out_flat = shard_map_p.bind(
       fun_trans_flat, *all_args, mesh=mesh, in_names=tuple(new_in_names),
-      out_names_thunk=new_out_names_thunk, check_rep=check_rep, rewrite=rewrite,
-      auto=auto)
+      out_names_thunk=new_out_names_thunk, rewrite=rewrite, auto=auto)
   return tree_unflatten(out_tree(), out_flat)
 ad.primitive_transposes[shard_map_p] = _shard_map_transpose
 
@@ -1518,7 +1485,7 @@ def _pe_custom_params(unks_in, inst_in, kept_outs_known, kept_outs_staged,
   in_names_staged = res_names + in_names_staged
   _, out_names_staged = partition_list(kept_outs_staged, params_staged['out_names'])
   new_params_staged = dict(params_staged, in_names=tuple(in_names_staged),
-                           out_names=tuple(out_names_staged), check_rep=False)
+                           out_names=tuple(out_names_staged))
   return new_params_known, new_params_staged
 
 # DCE
@@ -1589,7 +1556,7 @@ def _cached_shard_map(flat_fun, mesh, in_axes_flat, out_axes_thunk, axis_name):
   out_specs = lambda: map(partial(_axis_to_spec, axis_name), out_axes_thunk())
   fun = _handle_reshapes(flat_fun, in_axes_flat, out_axes_thunk)
   return (_shard_map(fun.call_wrapped, mesh, in_specs, out_specs,
-                     check_rep=False, auto=frozenset()),
+                     auto=frozenset()),
           in_specs, out_specs)
 
 @lu.transformation
@@ -1717,8 +1684,6 @@ class RewriteTrace(core.Trace):
   def post_process_custom_vjp_call(self, out_tracers, _):
     assert False  # unreachable
 
-  # TODO process_axis_index
-
 @lu.transformation
 def _efficient_transpose_rewrite(mesh, in_names, out_names_thunk, *args):
   in_reps = map(partial(_in_names_to_rep, mesh), in_names)
@@ -1730,6 +1695,7 @@ def _efficient_transpose_rewrite(mesh, in_names, out_names_thunk, *args):
     out_tracers = map(t.full_raise, ans)
     out_vals, out_reps = unzip2((t.val, t.rep) for t in out_tracers)
     del main, t, in_tracers, out_tracers, ans
+  _check_reps(mesh, out_names_thunk(), out_reps)
   out_rep_dst = [frozenset(_unmentioned(mesh, n)) for n in out_names_thunk()]
   out_vals = [pbroadcast(x, tuple(n for n in src if n not in dst)) if src - dst
               else x for x, src, dst in zip(out_vals, out_reps, out_rep_dst)]
@@ -1745,6 +1711,12 @@ def _rewrite_subtrace(main, in_reps, *in_vals):
   out_tracers = map(t.full_raise, outs)
   out_vals, out_reps = unzip2((t.val, t.rep) for t in out_tracers)
   yield out_vals, out_reps
+
+def _check_reps(mesh, names, reps):
+  fail = [r if not _valid_repeats(mesh, r, n) else no_fail
+          for n, r in zip(names, reps)]
+  if any(f is not no_fail for f in fail): raise _RepError(fail)
+class _RepError(Exception): pass
 
 def _rewrite_bwd(bwd, mesh, in_reps, reps_dst):
   def new_bwd(*args):
