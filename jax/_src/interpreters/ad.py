@@ -40,6 +40,7 @@ from jax._src.dtypes import dtype, float0
 from jax._src.util import (unzip2, safe_map, safe_zip, split_list, wrap_name,
                            as_hashable_function, weakref_lru_cache,
                            partition_list)
+import jax._src.pretty_printer as pp
 
 
 zip = safe_zip
@@ -476,6 +477,12 @@ class JVPTracer(Tracer):
       return core.full_lower(self.primal)
     else:
       return self
+
+  def _pretty_print(self):
+    if isinstance(self.tangent, jax._src.interpreters.partial_eval.JaxprTracer):
+      return pp.text(f'GradTracer({repr(self.primal)})')
+    else:
+      breakpoint()
 
 def _primal_tangent_shapes_match(primal, tangent):
   if type(tangent) is not Zero:
