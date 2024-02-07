@@ -51,6 +51,7 @@ from jax._src.tree_util import (PyTreeDef, treedef_tuple, tree_unflatten,
 from jax._src.util import (unzip2, safe_zip, safe_map, toposort, split_list,
                            merge_lists, partition_list, OrderedSet,
                            as_hashable_function, weakref_lru_cache, subs_list)
+import jax._src.pretty_printer as pp
 
 
 map, unsafe_map = safe_map, map
@@ -523,6 +524,9 @@ class JaxprTracer(Tracer):
 
   def __repr__(self):
     return f'Traced<{self.aval}:{self._trace}>'
+
+  def _pretty_print(self):
+    return pp.text(f'GradTracer({self.aval.str_short()})')
 
   @property
   def aval(self) -> AbstractValue:
@@ -1522,6 +1526,9 @@ class DynamicJaxprTracer(core.Tracer):
     val = self._trace.frame.constvar_to_val.get(var)
     if val is None: return self
     return core.full_lower(val)
+
+  def _pretty_print(self):
+    return pp.text(f'JitTracer({self.aval.str_short()})')
 
   def _contents(self):
     return ()
