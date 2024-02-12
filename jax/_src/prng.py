@@ -152,12 +152,14 @@ class PRNGKeyArray(jax.Array):
 
   _impl: PRNGImpl
   _base_array: typing.Array
+  _consumed: bool
 
   def __init__(self, impl, key_data: Any):
     assert not isinstance(key_data, core.Tracer)
     _check_prng_key_data(impl, key_data)
     self._impl = impl
     self._base_array = key_data
+    self._consumed = False
 
   def block_until_ready(self):
     _ = self._base_array.block_until_ready()

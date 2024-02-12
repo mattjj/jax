@@ -190,7 +190,9 @@ def _get_fastpath_data(executable, out_tree, args_flat, out_flat, attrs_tracked,
       not executable.unsafe_call.has_host_callbacks and
       all(isinstance(x, xc.ArrayImpl) for x in out_flat) and
       # no attr state effects
-      not attrs_tracked
+      not attrs_tracked and
+      # no prng reuse checking
+      not config.enable_key_reuse_checks.value
   )
 
   if use_fastpath:
@@ -1372,6 +1374,14 @@ def _get_jaxpr_as_fun(jaxpr, in_shardings, out_shardings, resource_env,
 def _pjit_call_impl(*args, jaxpr,
                     in_shardings, out_shardings, resource_env,
                     donated_invars, name, keep_unused, inline):
+  if config.enable_key_reuse_checks.value:
+    from jax.experimental.key_reuse._core import get_jaxpr_type_signature
+    ty = get_jaxpr_type_signature(jaxpr.jaxpr)
+    sinks = [s.idx for s in ty.sinks]
+    for i in sinks:
+      if args[i]._consumed:
+        raise Exception('jaaaake!')
+      args[i]._consumed = True
   def call_impl_cache_miss(*args_, **kwargs_):
     out_flat, compiled = _pjit_call_impl_python(
         *args, jaxpr=jaxpr, in_shardings=in_shardings,
