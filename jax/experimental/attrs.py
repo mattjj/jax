@@ -16,6 +16,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import jax.numpy as jnp
+
 from jax._src import core
 from jax._src import api_util
 from jax._src import linear_util as lu
@@ -216,3 +218,12 @@ def _vjp_wrap(jaxpr, consts, out_pvals, attr_avals, io_tree, in_attrs, out_attrs
     args_ct = tree_unflatten(in_tree, map(ad.instantiate_zeros, arg_cts))
     return args_ct, dict(zip(in_attrs, in_attr_bars))
   return f_vjp
+
+
+def grad(f, *, attrs: list[tuple[Any, str]] = []):
+  def f_grad(*args):
+    y, f_vjp = vjp(lambda: f(*args), attrs=attrs)
+    (), attrs_bar = f_vjp(jnp.ones_like(y))
+    return attrs_bar
+  return f_grad
+

@@ -533,5 +533,17 @@ class AttrsVJPTest(jtu.JaxTestCase):
     self.assertAllClose(attr_cotangents[(thing2, 'x')], attr_cotangents_ref[1],
                         check_dtypes=False)
 
+  def test_grad(self):
+    thing = Thing(1.0)
+
+    def f(y):
+      x = jax_getattr(thing, 'x')
+      return jnp.sum((y - x) ** 2)
+
+    attrs_grads = attrs.grad(f, attrs=[(thing, 'x')])(3.0)
+    self.assertLen(attrs_grads, 1)
+    self.assertAllClose(attrs_grads[(thing, 'x')], -4.0, check_dtypes=False)
+
+
 if __name__ == '__main__':
   absltest.main(testLoader=jtu.JaxTestLoader())
