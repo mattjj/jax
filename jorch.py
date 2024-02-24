@@ -78,17 +78,42 @@ class FFResBlock(Model):
   def __call__(self, x):
     return x + self.dense_out(jax.nn.relu(self.dense_in(x)))
 
+### losses
+
+@dataclass
+class Loss:
+  model: Model
+  grads: None | dict[tuple[Any, str], jax.Array] = None
+
+  def __call__(self, inputs, targets) -> float:
+    return self.loss_fn(self.model(inputs), targets)
+
+  def grad(self, inputs, targets):
+    gradfun = attrs.grad(self, attrs=self.model.trainable_params)
+    self.grads = gradfun(inputs, targets)
+
+  def loss_fn(self, inputs, targets):
+    assert False  # override
+
+@dataclass
+class SquaredError(Loss):
+  def loss_fn(self, predictions, targets):
+    return jnp.mean((predictions - targets) ** 2)
+
 ### optimizer library
 
+@dataclass
 class Optimizer:
-  def step(self, grads):
-    for (o, a), g in grads.items():
+  loss: Loss
+  def step(self):
+    for (o, a), g in loss.grads.items():
       x = attrs.jax_getattr(o, a)
       new_x = self.step_fn(x, g)
       attrs.jax_setattr(o, a, new_x)
 
 @dataclass
 class SGD(Optimizer):
+  loss: Loss
   lr: float
   def step_fn(self, x, g):
     return x - self.lr * g
@@ -98,25 +123,19 @@ class SGD(Optimizer):
 model = FFResBlock(3, 4)
 
 model.init_params(random.key(0))
-print(model)
 
 x = jnp.ones(3)
-y = model(x)
-print(y)
-
-@jax.jit
-def loss(inputs, targets):
-  predictions = model(x)
-  return jnp.mean((predictions - targets) ** 2)
-
 y = jnp.ones(3)
-optimizer = SGD(1e-2)
+
+loss = SquaredError(model)
+optimizer = SGD(loss, 1e-2)
 
 @jax.jit
 def step(inputs, targets):
-  grads = attrs.grad(loss, attrs=model.trainable_params)(inputs, targets)
-  optimizer.step(grads)
+  loss.grad(inputs, targets)
+  optimizer.step()
 
 for _ in range(10):
   step(x, y)
   print(loss(x, y))
+
