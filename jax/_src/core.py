@@ -423,7 +423,8 @@ class Primitive:
     return self.bind_with_trace(find_top_trace(args), args, params)
 
   def bind_with_trace(self, trace, args, params):
-    out = trace.process_primitive(self, map(trace.full_raise, args), params)
+    with pop_level(trace.level):
+      out = trace.process_primitive(self, map(trace.full_raise, args), params)
     return map(full_lower, out) if self.multiple_results else full_lower(out)
 
   def def_impl(self, impl):
@@ -453,11 +454,20 @@ class Primitive:
   def get_bind_params(self, params):
     return [], params
 
-
 def _effect_free_abstract_eval(abstract_eval):
   def abstract_eval_(*args, **kwargs):
     return abstract_eval(*args, **kwargs), no_effects
   return abstract_eval_
+
+def effectful_bind(prim, *args, **params):
+  main = thread_local_state.trace_state.trace_stack.stack.pop()
+  trace = main.with_cur_sublevel()
+  try:
+    out = trace.process_primitive(prim, map(trace.full_raise, args), params)
+  finally:
+    thread_local_state.trace_state.trace_stack.push(main)
+  return map(full_lower, out) if prim.multiple_results else full_lower(out)
+
 
 # -------------------- lifting --------------------
 
@@ -1244,6 +1254,17 @@ def new_base_main(trace_type: type[Trace],
     if t() is not None:
       leaked_tracers = maybe_find_leaked_tracers(t())
       if leaked_tracers: raise leaked_tracer_error("trace", t(), leaked_tracers)
+
+@contextmanager
+def pop_level(level: int) -> None:
+  level = max(level, 1)  # don't pop the base
+  prev, thread_local_state.trace_state.trace_stack.stack = \
+      thread_local_state.trace_state.trace_stack.stack, \
+      thread_local_state.trace_state.trace_stack.stack[:level]
+  try:
+    yield
+  finally:
+    thread_local_state.trace_state.trace_stack.stack = prev
 
 @contextmanager
 def ensure_compile_time_eval():
