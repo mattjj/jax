@@ -184,6 +184,7 @@ def recast_to_float0(primal, tangent):
 # errors if you will)
 def backward_pass(jaxpr: core.Jaxpr, transform_stack,
                   consts, primals_in, cotangents_in):
+  breakpoint()
   if all(type(ct) is Zero for ct in cotangents_in) and not jaxpr.effects:
     return map(lambda v: Zero(v.aval), jaxpr.invars)
 

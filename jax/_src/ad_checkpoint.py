@@ -537,30 +537,66 @@ def remat_partial_eval(trace, *tracers, jaxpr, **params):
 
   # DCE jaxpr_staged, keeping only instantiated outputs which are unknown
   _, out_inst_unknown = partition_list(out_inst, out_unknowns)
-  jaxpr_unknown, in_used_staged = pe.dce_jaxpr(jaxpr_staged, out_inst_unknown)
+  jaxpr_staged, in_used_staged = pe.dce_jaxpr(jaxpr_staged, out_inst_unknown)
   used_res, in_used_staged = split_list(in_used_staged, [num_res])
+
+  # Split jaxpr_staged into primal-ish and tangent-ish parts
+  _, in_unknowns_kept = pe.partition_list(in_used_staged, in_unknowns)
+  jaxpr_jacs_, jaxpr_tan_, _, res_avals = pe.partial_eval_jaxpr_nounits(
+      pe.close_jaxpr(jaxpr_staged), [False] * sum(used_res) + in_unknowns_kept, False)
+  jaxpr_jacs, () = jaxpr_jacs_.jaxpr, jaxpr_jacs_.consts
+  jaxpr_tan, () = jaxpr_tan_.jaxpr, jaxpr_tan_.consts
+  assert len(res_avals) == len(jaxpr_jacs.outvars)
+  del jaxpr_staged, jaxpr_jacs_, jaxpr_tan_
+  # TODO could assert the out_unknowns were unchanged
+  # TODO should jaxpr_jacs aka box2 depend on residuals?
+  # TODO what does differentiated=True mean? where is it read? do we need it?
+
+  # TODO we want opt barriers between box1 and box2, but not box2 and box3? can
+  #      we just insert opt_barrier here manually, and not in lowering rule?
+  #      specifically on all the inputs to box2?
 
   # DCE jaxpr_known, keeping all known outputs but discarding dce'd res
   out_used_known = [True] * (len(out_unknowns) - sum(out_unknowns)) + used_res
   jaxpr_known, in_used_known = pe.dce_jaxpr(jaxpr_known, out_used_known)
   num_res = sum(used_res)
 
-  # compute known outputs and residuals (hoisted out of remat primitive)
+  # box 1: compute known outputs and residuals (hoisted out of remat primitive)
   _, in_consts_ = unzip2(t.pval for t in tracers if t.pval.is_known())
   _, in_consts = partition_list(in_used_known, in_consts_)
-  out_consts = core.eval_jaxpr(jaxpr_known, (), *in_consts)
+  out_consts = remat_p.bind(*in_consts, jaxpr=jaxpr_known, **params)
   out_knowns, residuals = split_list(out_consts, [len(out_consts)-num_res])
 
-  # set up unknown outputs with a recipe to call remat
-  res_tracers = map(trace.new_instantiated_const, residuals)
+  # box 2: stage out computation of jacobian coefficients
+  # _, in_consts = partition_list(in_used_known, [t for t in tracers if t.pval.is_known()])
+  in_jac_tracers = map(trace.new_instantiated_const, residuals + in_consts)
+  out_jac_tracers = [pe.JaxprTracer(trace, pe.PartialVal.unknown(x.aval), None)
+                     for x in jaxpr_jacs.outvars]
+  jac_recipe = pe.new_eqn_recipe(in_jac_tracers, out_jac_tracers, remat_p,
+                                 dict(params, jaxpr=jaxpr_jacs),
+                                 jaxpr_jacs.effects, source_info_util.current())
+  for t in out_jac_tracers: t.recipe = jac_recipe
+
+  # box 3: run tangent computation, don't put it in a remat
   _, tracers_staged = partition_list(in_used_staged, tracers)
-  in_jaxpr_tracers = res_tracers + map(trace.instantiate_const, tracers_staged)
-  out_jaxpr_tracers = [pe.JaxprTracer(trace, pe.PartialVal.unknown(x.aval), None)
-                       for x in jaxpr_unknown.outvars]
-  new_params = dict(params, jaxpr=jaxpr_unknown, differentiated=True)
-  recipe = pe.new_eqn_recipe(in_jaxpr_tracers, out_jaxpr_tracers, remat_p,
-                             new_params, jaxpr_unknown.effects,
-                             source_info_util.current())
+  _, tracers_staged = partition_list(in_unknowns_kept, tracers_staged)
+  in_jaxpr_tan = out_jac_tracers + map(trace.instantiate_const, tracers_staged)
+  out_jaxpr_tan = core.eval_jaxpr(jaxpr_tan, (), *in_jaxpr_tan)
+
+  return merge_lists(out_unknowns, out_knowns, out_jaxpr_tan)
+
+
+  # # set up unknown outputs with a recipe to call remat
+  # # TODO why do we remat on the tangent computation, rather than just jac coeffs
+  # res_tracers = map(trace.new_instantiated_const, residuals)
+  # _, tracers_staged = partition_list(in_used_staged, tracers)
+  # in_jaxpr_tracers = res_tracers + map(trace.instantiate_const, tracers_staged)
+  # out_jaxpr_tracers = [pe.JaxprTracer(trace, pe.PartialVal.unknown(x.aval), None)
+  #                      for x in jaxpr_staged.outvars]
+  # new_params = dict(params, jaxpr=jaxpr_staged, differentiated=True)
+  # recipe = pe.new_eqn_recipe(in_jaxpr_tracers, out_jaxpr_tracers, remat_p,
+  #                            new_params, jaxpr_staged.effects,
+  #                            source_info_util.current())
 
   # log info about saved residuals
   log_level = logging.WARNING if config.log_checkpoint_residuals.value else logging.DEBUG

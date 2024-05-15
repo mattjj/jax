@@ -1028,7 +1028,7 @@ def convert_envvars_to_constvars(jaxpr: Jaxpr, num_env_vars: int) -> Jaxpr:
   config.enable_checks.value and core.check_jaxpr(converted_jaxpr)
   return converted_jaxpr
 
-
+# TODO remove "_nounits"
 def partial_eval_jaxpr_nounits(
     jaxpr: ClosedJaxpr, unknowns: Sequence[bool],
     instantiate: bool | Sequence[bool],
