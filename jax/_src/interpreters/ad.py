@@ -770,3 +770,12 @@ class CustomVJPException(Exception):
            "closed-over value into the custom_vjp function as an argument, and "
            "adapting the custom_vjp fwd and bwd rules.")
     super().__init__(msg)
+
+
+
+def linearize2(f, *in_primals):
+  in_primals_flat, in_tree = tree_flatten(in_primals)
+  f_, out_tree = flatten_fun(lu.wrap_init(f), in_tree)
+  out_primals_flat, out_pvals, jaxpr, consts = _linearize2(f_, *in_primals_flat)
+  breakpoint()
+
