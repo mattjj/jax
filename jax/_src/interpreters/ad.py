@@ -772,10 +772,137 @@ class CustomVJPException(Exception):
     super().__init__(msg)
 
 
+from collections import namedtuple
 
-def linearize2(f, *in_primals):
-  in_primals_flat, in_tree = tree_flatten(in_primals)
-  f_, out_tree = flatten_fun(lu.wrap_init(f), in_tree)
-  out_primals_flat, out_pvals, jaxpr, consts = _linearize2(f_, *in_primals_flat)
+SubJaxpr = namedtuple('SubJaxpr', ['id', 'invars', 'outvars', 'jaxpr'])
+LambdaBinding = namedtuple('SubJaxpr', [])
+ZeroLike = namedtuple('ZeroLike', ['val'])
+ConstVar = namedtuple('ConstVar', ['val'])
+
+
+def lin(fun: Callable, *primals):
+  primals_flat, in_tree = tree_flatten(primals)
+  f, out_tree = flatten_fun_nokwargs(lu.wrap_init(fun), in_tree)
+  out = _lin(f, *primals)
   breakpoint()
 
+def _lin(fun: lu.WrappedFun, *primals):
+  with core.new_main(LinTrace) as main:
+    trace = LinTrace(main, core.cur_sublevel())
+    in_tracers = [LinTracer(trace, p, LambdaBinding()) for p in primals]
+    out, = fun.call_wrapped(*in_tracers)  # TODO
+    out_tracer = trace.full_raise(out)
+    jaxpr, consts = tracers_to_jaxpr(in_tracers, [out_tracer])
+    breakpoint()
+
+class LinTracer(core.Tracer):
+  __slots__ = ['primal', 'recipe']
+
+  def __init__(self, trace, primal, recipe):
+    self._trace = trace
+    self.primal = primal
+    self.recipe = recipe
+
+  @property
+  def aval(self):
+    return core.get_aval(self.primal)
+
+  @property
+  def parents(self):
+    if isinstance(self.recipe, SubJaxpr):
+      return self.recipe.invars
+    else:
+      return []
+
+  def full_lower(self):
+    return self
+
+class LinTrace(core.Trace):
+  def pure(self, val):
+    breakpoint()
+    return LinTracer(self, val, ZeroLike(val))
+
+  lift = pure
+
+  def sublift(self, tracer):
+    assert False  # TODO
+
+  def instantiate_const(self, val):
+    return LinTracer(self, val, ConstVar(val))
+
+  def process_primitive(self, primitive, tracers, params):
+    assert not primitive.multiple_results  # TODO
+    primal_out, jaxpr, consts = default_rule(
+        primitive_jvps[primitive], [t.primal for t in tracers], params)
+    const_tracers = map(self.instantiate_const, consts)
+    tracer_out = LinTracer(self, primal_out, None)
+    recipe_out = SubJaxpr(object(), [*const_tracers, *tracers], [tracer_out], jaxpr)
+    tracer_out.recipe = recipe_out
+    return tracer_out
+
+def default_rule(jvp_rule, primals_in, params):
+    @lu.wrap_init
+    def linearized(*tangents_in):
+      # TODO special-cased on singleton primal output here
+      primal_out, tangent_out = jvp_rule(primals_in, tangents_in, **params)
+      return primal_out, instantiate_zeros(tangent_out)
+
+    tangent_pvals_in = [pe.PartialVal.unknown(core.get_aval(p).at_least_vspace())
+                        for p in primals_in]
+    jaxpr, pvals_out, consts = pe.trace_to_jaxpr_nounits(linearized, tangent_pvals_in)
+    # TODO special-cased on singleton primal output here
+    primal_pval_out, tangent_pval_out = pvals_out
+    primal_out = primal_pval_out.get_known()
+    return primal_out, jaxpr, consts
+
+def tracers_to_jaxpr(in_tracers, out_tracers):
+  newvar = core.gensym('')
+
+  t_to_var = {}
+  def getvar(t: LinTracer) -> core.Var:
+    var = t_to_var.get(id(t))
+    if var is None:
+      var = t_to_var[id(t)] = newvar(t.aval)
+    return var
+
+  const_to_var = {}
+  def getconstvar(c):
+    var = const_to_var.get(id(c))
+    if var is None:
+      aval = core.raise_to_shaped(core.get_aval(c))
+      var = const_to_var[id(c)] = newvar(aval)
+    return var
+
+  sorted_tracers = pe.toposort([*in_tracers, *out_tracers])
+  invars = map(getvar, in_tracers)
+  eqns = []
+  consts = {}
+  processed_eqn_ids = set()
+  for t in sorted_tracers:
+    recipe = t.recipe
+    if isinstance(recipe, SubJaxpr):
+      if recipe.id not in processed_eqn_ids:
+        subenv = dict(zip([*recipe.jaxpr.constvars, *recipe.jaxpr.invars],
+                          map(getvar, recipe.invars)))
+        for e in recipe.jaxpr.eqns:
+          new_outvars = map(newvar, [v.aval for v in e.outvars])
+          subenv.update(zip(e.outvars, new_outvars))
+          eqns.append(e.replace(invars=map(subenv.get, e.invars),
+                                outvars=new_outvars))
+        for t, v in zip(recipe.outvars, recipe.jaxpr.outvars):
+          t_to_var[id(t)] = subenv[v]
+        processed_eqn_ids.add(recipe.id)
+    elif isinstance(recipe, LambdaBinding):
+      pass
+    elif isinstance(recipe, ZeroLike):
+      breakpoint()  # TODO
+      pass
+    elif isinstance(recipe, ConstVar):
+      v = t_to_var[id(t)] = getconstvar(recipe.val)
+      consts[v] = recipe.val
+    else:
+      raise TypeError(recipe)
+
+  const_vars, const_vals = unzip2(consts.items())
+  jaxpr = core.Jaxpr((), (*const_vars, *invars), map(getvar, out_tracers), eqns)
+  return jaxpr, const_vals
