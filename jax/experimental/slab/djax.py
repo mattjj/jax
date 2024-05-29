@@ -43,15 +43,19 @@ def _check_axis_size_conflicts(all_axes, sizes):
                       for name, sizes in d.items() if len(sizes) > 1])
     raise ValueError(f'abstracted axes resolve to conflicting sizes. {msg}')
 
-@partial(jax.jit, static_argnums=(0, 1, 2, 3))
-def interp(djaxpr, abstracted_axes, dim_index, dtypes, slab, dims, addrs):
+@partial(jax.jit, static_argnums=(0,))
+def interp(djaxpr, slab, sizes, args):
   # TODO(frostig,mattjj): reconstructing slab views seems less than ideal
-  dim_index = dict(dim_index)
   views = []
-  for addr, axes, dtype in zip(addrs, abstracted_axes, dtypes):
-    resolved_shape = tuple(dims[dim_index[name]] for name in axes)
-    views.append(sl.SlabView(addr, resolved_shape, dtype))
-  slab, outs = eval_djaxpr(djaxpr, slab, *dims, *views)
+  in_types = [x.aval for x in djaxpr.invars]
+  _, arg_types = util.split_list(in_types, [len(djaxpr.invars) - len(args)])
+  for ty, x in zip(arg_types, args):
+    if isinstance(ty, core.DShapedArray):
+      resolved_shape = tuple(sizes.get(d, d) for d in ty.shape)
+      views.append(sl.SlabView(x, resolved_shape, ty.dtype))
+    else:
+      views.append(x)
+  slab, outs = eval_djaxpr(djaxpr, slab, *sizes.values(), *views)
   return slab, outs
 
 def djit(f, abstracted_axes, **djit_kwargs):
@@ -59,17 +63,26 @@ def djit(f, abstracted_axes, **djit_kwargs):
   def f_wrapped(slab, *args):  # TODO(frostig,mattjj): kw support
     djaxpr = make_djaxpr(
         f, abstracted_axes=abstracted_axes, **djit_kwargs)(*args).jaxpr
-    slab, views = sl.chain(slab, sl.slab_upload, *args, unary=True)
-    shapes = [x.shape for x in args]
-    all_axes, sizes = util.unzip2(
-        {(name, sz): None for axes, shape in zip(abstracted_axes, shapes)
-         for name, sz in zip(axes, shape)})
-    _check_axis_size_conflicts(all_axes, sizes)
-    dim_index = {n: i for i, n in enumerate(all_axes)}
+    in_types = [x.aval for x in djaxpr.invars]
+    _, arg_types = util.split_list(in_types, [len(djaxpr.invars) - len(args)])
+    def upload(slab, ty, x):
+      if isinstance(ty, core.DShapedArray):
+        return sl.slab_upload(slab, x)
+      elif isinstance(ty, core.ShapedArray):
+        return slab, x
+      else:
+        assert False
+    slab, views = sl.chain(slab, upload, *zip(arg_types, args))
+    sizes: dict[core.Var, int] = {}
+    for ty, x in zip(arg_types, args):
+      for v, d in zip(ty.shape, x.shape):
+        if isinstance(v, core.Var):
+          d_ = sizes.setdefault(v, d)
+          assert d_ == d
 
     slab, out_views = interp(
-        djaxpr, abstracted_axes, tuple(dim_index.items()),
-        tuple(v.dtype for v in views), slab, sizes, [v.addr for v in views])
+        djaxpr, slab, sizes,
+        [v.addr if isinstance(v, sl.SlabView) else v for v in views])
     return slab, tuple(sl.slab_download(slab, v) for v in out_views)
 
   return f_wrapped
@@ -77,7 +90,7 @@ def djit(f, abstracted_axes, **djit_kwargs):
 def eval_djaxpr(jaxpr: core.Jaxpr, slab: sl.Slab, *args: jax.Array | sl.SlabView):
   if jaxpr.constvars: raise NotImplementedError
 
-  env = {}
+  env: dict[core.Var, jax.Array | sl.SlabView] = {}
 
   def read(a):
     return env[a] if type(a) is core.Var else a.val
@@ -99,10 +112,25 @@ def matmul_rule(slab, lhs, rhs, *, dimension_numbers, **_):
   return slab, [out]
 rules[lax.dot_general_p] = matmul_rule
 
-def tanh_rule(slab, x, **_):
+def dynamic_slice_rule(slab, operand, *starts_and_sizes, slice_sizes):
+  breakpoint()
+  return slab, [out]
+rules[lax.dynamic_slice_p] = dynamic_slice_rule
+
+def tanh_rule(slab, x):
   slab, out = sl.tanh(slab, x)
   return slab, [out]
 rules[lax.tanh_p] = tanh_rule
+
+def add_rule(slab, x, y):
+  slab, out = sl.add(slab, x, y)
+  return slab, [out]
+rules[lax.add_p] = add_rule
+
+def mul_rule(slab, x, y):
+  slab, out = sl.mul(slab, x, y)
+  return slab, [out]
+rules[lax.mul_p] = mul_rule
 
 # -------
 
@@ -148,6 +176,33 @@ def test(slab, xs):
 
   check_djit(slab, f, abstracted_axes, a, b)
 
+def test_dslice(slab, xs):
+  x, n = xs
+
+  def f(x, n):
+    x = jnp.tanh(x)
+    # n = jnp.array(2) * n  # TODO rules should handle Array | SlabView
+    y = jax.lax.dynamic_slice(x, [0, 0], [n, n])
+    return y
+
+  print_seg('djaxpr')
+  djaxpr = make_djaxpr(f)(x, n)
+  print(djaxpr)
+
+  print_seg('djax output')
+  f_djit = djit(f, abstracted_axes=(('m', 'n'), ()))
+  slab, [c] = f_djit(slab, x, n)
+  print(c)
+
+  # print_seg('djax -> jax lowering')
+  # big_jaxpr = jax.make_jaxpr(f_djit)(slab, a, b)
+  # print('\n'.join(str(big_jaxpr).split('\n')[:20]))
+  # print('...')
+  # print('\n'.join(str(big_jaxpr).split('\n')[-20:]))
+  # print(len(str(big_jaxpr).split('\n')))
+
+  # check_djit(slab, f, abstracted_axes, a, b)
+
 def parse_arr(i, s):
   shape = eval(s)
   return np.random.RandomState(i).normal(size=shape).astype(np.float32)
@@ -158,7 +213,8 @@ def main(args):
   xs = map(parse_arr, range(len(args[1:])), args[1:])
   assert all(len(x.shape) == 2 for x in xs)
   slab = sl.slab_make(slab_sz)
-  test(slab, xs)
+  # test(slab, xs)
+  test_dslice(slab, (*xs, jnp.array(3)))
 
 
 if __name__ == '__main__':

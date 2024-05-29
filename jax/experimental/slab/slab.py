@@ -223,7 +223,11 @@ def masked_store(mem, addr, update, num_p):
   new_val = jnp.where(jnp.arange(update_p)[:, None] < num_p, update, prev_val)
   return jax.lax.dynamic_update_slice_in_dim(mem, new_val, addr, axis=0)
 
-def _matmul(slab: Slab, ins: Sequence[SlabView], out: SlabView):
+def _dynamic_slice(slab: Slab, operand: SlabView, starts: DShape, shape: DShape
+                   ) -> Slab:
+  breakpoint()
+
+def _matmul(slab: Slab, ins: Sequence[SlabView], out: SlabView) -> Slab:
   lhs, rhs = ins
   dtype = lhs.dtype
   n, k, m = (*lhs.shape, rhs.shape[1])
@@ -251,8 +255,9 @@ def _matmul(slab: Slab, ins: Sequence[SlabView], out: SlabView):
 
 def make_allocating_op(op, ref_op):
   def made_op(slab, *xs: SlabView):
-    out_sds = jax.eval_shape(
-        ref_op, *[jax.ShapeDtypeStruct(x.shape, x.dtype) for x in xs])
+    sds = [jax.ShapeDtypeStruct(x.shape, x.dtype) if isinstance(x, SlabView)
+           else x for x in xs]
+    out_sds = jax.eval_shape(ref_op, *sds)
     slab, out = slab_alloc(slab, out_sds.shape, out_sds.dtype)
     slab = op(slab, xs, out)
     return slab, out
