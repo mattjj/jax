@@ -223,9 +223,19 @@ def masked_store(mem, addr, update, num_p):
   new_val = jnp.where(jnp.arange(update_p)[:, None] < num_p, update, prev_val)
   return jax.lax.dynamic_update_slice_in_dim(mem, new_val, addr, axis=0)
 
-def _dynamic_slice(slab: Slab, operand: SlabView, starts: DShape, shape: DShape
-                   ) -> Slab:
-  breakpoint()
+def _dynamic_slice(slab: Slab, operand: SlabView, starts: DShape, shape: DShape,
+                   out: SlabView) -> Slab:
+  tiled_shape = map(xceil_div, shape, tile_shape(shape, operand.dtype))
+  x_sz_p = xprod(tiled_shape) * tile_phrases(shape, operand.dtype)
+  num_whole_blocks = x_sz_p // compute_tile_p
+  tp = tile_phrases(operand.shape, operand.dtype)
+  def body(i, mem):
+    # TODO i -> 2D -> flat index accounting for strides
+    linear_index_t = xsum(map(xmul, map(xadd, slice_base_t, (
+    off = linear_idx_t * tp
+    sl = jax.lax.dynamic_slice_in_dim(mem, operand.addr + off, compute_tile_p)
+    return jax.lax.dynamic_update_slice_in_dim(mem, sl, out.addr + i_p, axis=0)
+  mem = jax.lax.fori_loop(0, num_whole_blocks, body, slab.data)
 
 def _matmul(slab: Slab, ins: Sequence[SlabView], out: SlabView) -> Slab:
   lhs, rhs = ins
