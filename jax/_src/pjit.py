@@ -180,6 +180,7 @@ def _python_pjit_helper(jit_info, *args, **kwargs):
     init_states = _get_states(attrs_tracked)
     args_flat = [*init_states, *args_flat]
 
+  out_flat = pjit_p.bind(*args_flat, **params)
   try:
     out_flat = pjit_p.bind(*args_flat, **params)
   except pxla.DeviceAssignmentMismatchError as e:
@@ -270,9 +271,8 @@ def _get_fastpath_data(
                        for i in range(len(args_flat))]
     in_shardings = [
         sharding_impls.physical_sharding(a, s)
-        if a is not core.abstract_token and dtypes.issubdtype(a.dtype, dtypes.extended)
-        else s
-        for s, a in zip(executable._in_shardings, executable.in_avals)
+        if isinstance(a, core.ShapedArray) and dtypes.issubdtype(a.dtype, dtypes.extended)
+        else s for s, a in zip(executable._in_shardings, executable.in_avals)
     ]
     fastpath_data = pxla.MeshExecutableFastpathData(
         executable.xla_executable, out_tree, in_shardings,

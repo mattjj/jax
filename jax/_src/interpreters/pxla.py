@@ -110,14 +110,14 @@ def identity(x): return x
 def shard_arg(arg, sharding, canonicalize=True):
   if canonicalize:
     arg = xla.canonicalize_dtype(arg)
-  return shard_arg_handlers[type(arg)](arg, sharding)
-
+  out = shard_arg_handlers[type(arg)](arg, sharding)
+  return [out] if isinstance(out, jax.Array) else out
 
 @profiler.annotate_function
 def shard_args(
     shardings: Sequence[sharding_impls.XLACompatibleSharding], args,
 ) -> Sequence[jax.Array]:
-  return [shard_arg(arg, shardings[i]) for i, arg in enumerate(args)]
+  return [x for i, arg in enumerate(args) for x in shard_arg(arg, shardings[i])]
 
 shard_arg_handlers: dict[Any, Callable[[Any, Any], Any]] = {}
 
@@ -1195,9 +1195,7 @@ class ExecuteReplicated:
       if (self.ordered_effects or self.has_unordered_effects
           or self.has_host_callbacks):
         input_bufs = self._add_tokens_to_inputs(input_bufs)
-        results = self.xla_executable.execute_sharded(
-            input_bufs, with_tokens=True
-        )
+        results = self.xla_executable.execute_sharded(input_bufs, with_tokens=True)
 
         result_token_bufs = results.disassemble_prefix_into_single_device_arrays(
             len(self.ordered_effects))
@@ -2476,7 +2474,6 @@ def get_out_shardings_from_executable(
     all_default_mem_kind: bool,
 ) -> Sequence[sharding_impls.GSPMDSharding] | None:
   from jax._src import pjit
-
   num_out_avals = sum(map(len, map(mlir.representation, out_avals)))
 
   if config.enable_memories.value:
@@ -2527,11 +2524,12 @@ def get_out_shardings_from_executable(
 
 
 def _get_in_shardings_from_xla(
-    xla_executable, device_assignment: Sequence[xc.Device], num_in_avals: int,
-    num_ordered_effects: int
-  ) -> Sequence[GSPMDSharding] | None:
+    xla_executable, device_assignment: Sequence[xc.Device],
+    in_avals: Sequence[core.AbstractValue], num_ordered_effects: int
+) -> Sequence[GSPMDSharding] | None:
   """Returns input shardings from XLA."""
   from jax._src import pjit
+  num_in_avals = sum(map(len, map(mlir.representation, in_avals)))
 
   # When the device assignment only has 1 device, SPMD partitioner will not run.
   # Hence the op shardings will not be set on the `hlo_module`.
@@ -2651,7 +2649,8 @@ def maybe_recover_user_shardings(
 
 
 def _get_layouts_from_executable(
-    xla_executable, in_layouts, out_layouts, out_avals, num_ordered_effects
+    xla_executable, in_layouts, out_layouts, in_avals, out_avals,
+    num_ordered_effects
 ) -> tuple[Sequence[DeviceLocalLayout | list[DeviceLocalLayout] | None],
            Sequence[DeviceLocalLayout | list[DeviceLocalLayout] | None]]:
   try:
@@ -2664,21 +2663,28 @@ def _get_layouts_from_executable(
     in_layouts_xla = in_layouts_xla[num_ordered_effects:]
     out_layouts_xla = out_layouts_xla[num_ordered_effects:]
 
+
+  lens = [len(mlir.representation(a)) for a in in_avals]
+  in_layouts_xla = util.unflatten(in_layouts_xla, lens)
   new_in_layouts = []
-  for x, i in safe_zip(in_layouts_xla, in_layouts):
-    x = DeviceLocalLayout(x)
-    if isinstance(i, DeviceLocalLayout):
-      if i != x:
-        raise AssertionError(
-            f"Unexpected XLA layout override: (XLA) {x} != {i} (User input"
-            " layout)")
-      new_in_layouts.append(i)
+  for xs, i, a in safe_zip(in_layouts_xla, in_layouts, in_avals):
+    if isinstance(a, (core.ShapedArray, core.AbstractToken)):
+      x, = xs
+      x = DeviceLocalLayout(x)
+      if isinstance(i, DeviceLocalLayout):
+        if i != x:
+          raise AssertionError(
+              f"Unexpected XLA layout override: (XLA) {x} != {i} (User input"
+              " layout)")
+        new_in_layouts.append(i)
+      else:
+        new_in_layouts.append(x)
     else:
-      new_in_layouts.append(x)
+      if i is not None: raise NotImplementedError("peter")
+      new_in_layouts.append(xs)
 
   lens = [len(mlir.representation(a)) for a in out_avals]
   out_layouts_xla = util.unflatten(out_layouts_xla, lens)
-
   new_out_layouts = []
   for xs, o, a in safe_zip(out_layouts_xla, out_layouts, out_avals):
     if isinstance(a, (core.ShapedArray, core.AbstractToken)):
@@ -2696,7 +2702,6 @@ def _get_layouts_from_executable(
       if o is not None: raise NotImplementedError("peter")
       new_out_layouts.append(xs)
 
-  assert all(isinstance(i, DeviceLocalLayout) for i in new_in_layouts)
   return new_in_layouts, new_out_layouts
 
 def get_logical_mesh_ids(mesh_shape):
@@ -2792,30 +2797,37 @@ def _maybe_get_and_check_in_shardings(
   If in_sharding is unspecified, then the sharding returned by XLA is returned.
   """
   in_shardings_xla = _get_in_shardings_from_xla(
-      xla_executable, device_assignment, len(global_in_avals),
-      num_ordered_effects)
+      xla_executable, device_assignment, global_in_avals, num_ordered_effects)
   if in_shardings_xla is None:
     return in_shardings
+
+  lens = [len(mlir.representation(a)) for a in global_in_avals]
+  in_shardings_xla = util.unflatten(in_shardings_xla, lens)
 
   new_in_shardings = []
   for xla_s, orig, aval in safe_zip(in_shardings_xla, in_shardings,
                                     global_in_avals):
-    if is_unspecified(orig):
-      if (aval is not core.abstract_token and
-          dtypes.issubdtype(aval.dtype, dtypes.extended)):
-        xla_s = sharding_impls.logical_sharding(aval, xla_s)
-      new_in_shardings.append(xla_s)
+    if isinstance(aval, (core.ShapedArray, core.AbstractToken)):
+      xla_s, = xla_s
+      if is_unspecified(orig):
+        if (aval is not core.abstract_token and
+            dtypes.issubdtype(aval.dtype, dtypes.extended)):
+          xla_s = sharding_impls.logical_sharding(aval, xla_s)
+        new_in_shardings.append(xla_s)
+      else:
+        xla_hlo_s = xla_s._to_xla_hlo_sharding(aval.ndim)
+        orig_hlo_s = orig._to_xla_hlo_sharding(aval.ndim)  # pytype: disable=attribute-error
+        # MANUAL HloSharding comes from other partitioning frameworks.
+        if (not dtypes.issubdtype(aval.dtype, dtypes.extended) and
+            not xla_hlo_s.is_manual() and
+            (not op_shardings.are_op_shardings_equal(xla_hlo_s, orig_hlo_s))):
+          raise AssertionError(
+              f"Unexpected XLA sharding override: (XLA) {xla_s} != {orig} "
+              "(User sharding)")
+        new_in_shardings.append(orig)
     else:
-      xla_hlo_s = xla_s._to_xla_hlo_sharding(aval.ndim)
-      orig_hlo_s = orig._to_xla_hlo_sharding(aval.ndim)  # pytype: disable=attribute-error
-      # MANUAL HloSharding comes from other partitioning frameworks.
-      if (not dtypes.issubdtype(aval.dtype, dtypes.extended) and
-          not xla_hlo_s.is_manual() and
-          (not op_shardings.are_op_shardings_equal(xla_hlo_s, orig_hlo_s))):
-        raise AssertionError(
-            f"Unexpected XLA sharding override: (XLA) {xla_s} != {orig} "
-            "(User sharding)")
-      new_in_shardings.append(orig)
+      if not is_unspecified(orig): raise NotImplementedError("peter")
+      new_in_shardings.append(xla_s)
 
   new_in_shardings = maybe_recover_user_shardings(
       in_shardings, new_in_shardings, global_in_avals, global_in_avals)
@@ -2833,11 +2845,10 @@ def _maybe_get_and_check_out_shardings(
   if out_shardings_xla is None:
     return out_shardings
 
-  new_out_shardings = []
-
   lens = [len(mlir.representation(a)) for a in global_out_avals]
   out_shardings_xla = util.unflatten(out_shardings_xla, lens)
 
+  new_out_shardings = []
   for xla_s, orig, aval in safe_zip(out_shardings_xla, out_shardings,
                                     global_out_avals):
     if isinstance(aval, (core.ShapedArray, core.AbstractToken)):
@@ -2996,7 +3007,8 @@ class UnloadedMeshExecutable:
             xla_executable.local_devices(), len(in_shardings), len(out_shardings))
 
     in_layouts, out_layouts = _get_layouts_from_executable(
-        xla_executable, in_layouts, out_layouts, global_out_avals, len(ordered_effects))
+        xla_executable, in_layouts, out_layouts, global_in_avals,
+        global_out_avals, len(ordered_effects))
 
     out_shardings = maybe_recover_user_shardings(
         in_shardings, out_shardings, global_in_avals, global_out_avals)

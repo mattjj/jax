@@ -1368,15 +1368,18 @@ def lower_jaxpr_to_fun(
       [ir.DictAttr.get(attrs) for attrs in result_attrs])
 
   if arg_names:
-    arg_locs = [ir.Location.unknown()] * (num_dim_vars + num_tokens)
-    for n in arg_names:
-      arg_locs.append(ir.Location.name(n) if n else ir.Location.unknown())
+    n_prefix = num_dim_vars + num_tokens
+    arg_locs = [ir.Location.unknown()] * n_prefix
+    for n, ts in zip(arg_names, input_types[n_prefix:]):
+      names = [ir.Location.name(n) if n else ir.Location.unknown()] * len(ts)
+      arg_locs.extend(names)
     entry_block = func_op.add_entry_block(arg_locs)
   else:
     entry_block = func_op.add_entry_block()
 
   with ir.InsertionPoint(entry_block):
     flat_args = entry_block.arguments
+    flat_input_avals = util.flatten(map(representation, input_avals))
     # We separate out the dimension variable inputs, the token inputs and
     # the regular inputs. The dimension variables and token inputs
     # will be passed to `jaxpr_subcomp` separately from the `args`.
@@ -1390,14 +1393,14 @@ def lower_jaxpr_to_fun(
     if not use_sharding_annotations and ir_arg_shardings is not None:
       flat_args = [
           a if s is None else wrap_with_sharding_op(entry_lowering_ctx, a, a_aval, s)
-          for a, s, a_aval in zip(flat_args, ir_arg_shardings, input_avals)]
+          for a, s, a_aval in zip(flat_args, ir_arg_shardings, flat_input_avals)]
 
     if ir_arg_shardings is not None and name == "main":
       flat_args = [
           replicate_trailing_dims(entry_lowering_ctx, o, a)
           if (a is not core.abstract_token and
               dtypes.issubdtype(a.dtype, dtypes.extended) and s is None) else o  # pytype: disable=attribute-error
-          for o, s, a in zip(flat_args, ir_arg_shardings, input_avals)
+          for o, s, a in zip(flat_args, ir_arg_shardings, flat_input_avals)
       ]
 
     _, token_args, unflattened_args = util.split_list(
