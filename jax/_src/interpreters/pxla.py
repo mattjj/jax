@@ -1122,7 +1122,8 @@ class ExecuteReplicated:
   __slots__ = ['xla_executable', 'name', 'backend', 'in_handler', 'out_handler',
                'has_unordered_effects', 'ordered_effects', 'keepalive',
                'has_host_callbacks', '_local_devices', 'kept_var_idx',
-               'mut', 'pgle_profiler', '__weakref__']
+               'mut', 'pgle_profiler', 'one_buffer_per_result_fastpath',
+               'unflatten_lens', '__weakref__']
 
   def __init__(self, xla_executable, name, backend, in_handler: InputsHandler,
                out_handler: ResultsHandler,
@@ -1144,6 +1145,12 @@ class ExecuteReplicated:
     self.kept_var_idx = kept_var_idx
     self.mut = mut
     self.pgle_profiler = pgle_profiler
+
+    self.one_buffer_per_result_fastpath = \
+        all(isinstance(a, (core.ShapedArray, core.AbstractToken))
+            for a in out_handler.out_avals)
+    if not self.one_buffer_per_result_fastpath:
+      self.unflatten_lens = map(len, map(mlir.representation, out_handler.out_avals))
 
   def _add_tokens_to_inputs(self, input_bufs):
     if self.ordered_effects:
@@ -1199,19 +1206,16 @@ class ExecuteReplicated:
       else:
         results = self.xla_executable.execute_sharded(input_bufs)
 
-      if dispatch.needs_check_special():
-        out_arrays = results.disassemble_into_single_device_arrays()
-        for arrays in out_arrays:
-          dispatch.check_special(self.name, arrays)
-        out = self.out_handler(out_arrays)
-      elif all(isinstance(a, (core.ShapedArray, core.AbstractToken))
-               for a in self.out_handler.out_avals):
+      if not dispatch.needs_check_special() and self.one_buffer_per_result_fastpath:
         out = results.consume_with_handlers(self.out_handler.handlers)
       else:
-        out_arrays_ = iter(results.disassemble_into_single_device_arrays())
-        lens = map(len, map(mlir.representation, self.out_handler.out_avals))
+        out_arrays = results.disassemble_into_single_device_arrays()
+        if dispatch.needs_check_special():
+          for arrays in out_arrays:
+            dispatch.check_special(self.name, arrays)
+        out_arrays_ = iter(out_arrays)
         out_arrays = [[next(out_arrays_)[0] for _ in range(l)]
-                      for l in lens]
+                      for l in self.unflatten_lens]
         out = self.out_handler(out_arrays)
 
       if (self.pgle_profiler is not None and self.pgle_profiler.is_running()
@@ -2648,7 +2652,8 @@ def maybe_recover_user_shardings(
 
 def _get_layouts_from_executable(
     xla_executable, in_layouts, out_layouts, out_avals, num_ordered_effects
-) -> tuple[Sequence[DeviceLocalLayout | None], Sequence[DeviceLocalLayout | None]]:
+) -> tuple[Sequence[DeviceLocalLayout | list[DeviceLocalLayout] | None],
+           Sequence[DeviceLocalLayout | list[DeviceLocalLayout] | None]]:
   try:
     in_layouts_xla = xla_executable.get_parameter_layouts()
     out_layouts_xla = xla_executable.get_output_layouts()
@@ -2689,14 +2694,10 @@ def _get_layouts_from_executable(
         new_out_layouts.append(x)
     else:
       if o is not None: raise NotImplementedError("peter")
-      new_out_layouts.append(CompoundLayout(xs))
+      new_out_layouts.append(xs)
 
   assert all(isinstance(i, DeviceLocalLayout) for i in new_in_layouts)
   return new_in_layouts, new_out_layouts
-
-@dataclasses.dataclass(frozen=True)
-class CompoundLayout:
-  layouts: list[Layout]
 
 def get_logical_mesh_ids(mesh_shape):
   return np.arange(math.prod(mesh_shape)).reshape(mesh_shape)
@@ -2860,13 +2861,8 @@ def _maybe_get_and_check_out_shardings(
         new_out_shardings.append(orig)
     else:
       if not is_unspecified(orig): raise NotImplementedError("peter")
-      new_out_shardings.append(CompoundSharding(xla_s))
+      new_out_shardings.append(xla_s)
   return new_out_shardings
-
-
-@dataclasses.dataclass(frozen=True)
-class CompoundSharding:
-  shardings: list[jax.sharding.Sharding]
 
 
 def finalize_out_shardings(out_shardings, device_assignment):
