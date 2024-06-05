@@ -1204,8 +1204,15 @@ class ExecuteReplicated:
         for arrays in out_arrays:
           dispatch.check_special(self.name, arrays)
         out = self.out_handler(out_arrays)
-      else:
+      elif all(isinstance(a, (core.ShapedArray, core.AbstractToken))
+               for a in self.out_handler.out_avals):
         out = results.consume_with_handlers(self.out_handler.handlers)
+      else:
+        out_arrays_ = iter(results.disassemble_into_single_device_arrays())
+        lens = map(len, map(mlir.representation, self.out_handler.out_avals))
+        out_arrays = [[next(out_arrays_)[0] for _ in range(l)]
+                      for l in lens]
+        out = self.out_handler(out_arrays)
 
       if (self.pgle_profiler is not None and self.pgle_profiler.is_running()
           and len(out) > 0):
@@ -2460,11 +2467,13 @@ class MeshComputation(stages.XlaLowering):
 def get_out_shardings_from_executable(
     xla_executable,
     device_assignment: Sequence[xc.Device],
-    num_out_avals: int,
+    out_avals: list[core.AbstractValue],
     num_ordered_effects: int,
     all_default_mem_kind: bool,
 ) -> Sequence[sharding_impls.GSPMDSharding] | None:
   from jax._src import pjit
+
+  num_out_avals = sum(map(len, map(mlir.representation, out_avals)))
 
   if config.enable_memories.value:
     if all_default_mem_kind:
@@ -2638,7 +2647,7 @@ def maybe_recover_user_shardings(
 
 
 def _get_layouts_from_executable(
-    xla_executable, in_layouts, out_layouts, num_ordered_effects
+    xla_executable, in_layouts, out_layouts, out_avals, num_ordered_effects
 ) -> tuple[Sequence[DeviceLocalLayout | None], Sequence[DeviceLocalLayout | None]]:
   try:
     in_layouts_xla = xla_executable.get_parameter_layouts()
@@ -2662,22 +2671,32 @@ def _get_layouts_from_executable(
     else:
       new_in_layouts.append(x)
 
+  lens = [len(mlir.representation(a)) for a in out_avals]
+  out_layouts_xla = util.unflatten(out_layouts_xla, lens)
+
   new_out_layouts = []
-  for x, o in safe_zip(out_layouts_xla, out_layouts):
-    x = DeviceLocalLayout(x)
-    if isinstance(o, DeviceLocalLayout):
-      if o != x:
-        raise AssertionError(
-            f"Unexpected XLA layout override: (XLA) {x} != {o} (User output"
-            " layout)")
-      new_out_layouts.append(o)
+  for xs, o, a in safe_zip(out_layouts_xla, out_layouts, out_avals):
+    if isinstance(a, (core.ShapedArray, core.AbstractToken)):
+      x, = xs
+      x = DeviceLocalLayout(x)
+      if isinstance(o, DeviceLocalLayout):
+        if o != x:
+          raise AssertionError(
+              f"Unexpected XLA layout override: (XLA) {x} != {o} (User output"
+              " layout)")
+        new_out_layouts.append(o)
+      else:
+        new_out_layouts.append(x)
     else:
-      new_out_layouts.append(x)
+      if o is not None: raise NotImplementedError("peter")
+      new_out_layouts.append(CompoundLayout(xs))
 
   assert all(isinstance(i, DeviceLocalLayout) for i in new_in_layouts)
-  assert all(isinstance(o, DeviceLocalLayout) for o in new_out_layouts)
   return new_in_layouts, new_out_layouts
 
+@dataclasses.dataclass(frozen=True)
+class CompoundLayout:
+  layouts: list[Layout]
 
 def get_logical_mesh_ids(mesh_shape):
   return np.arange(math.prod(mesh_shape)).reshape(mesh_shape)
@@ -2808,32 +2827,46 @@ def _maybe_get_and_check_out_shardings(
     num_ordered_effects, all_default_mem_kind
   ):
   out_shardings_xla = get_out_shardings_from_executable(
-      xla_executable, device_assignment, len(global_out_avals),
+      xla_executable, device_assignment, global_out_avals,
       num_ordered_effects, all_default_mem_kind)
   if out_shardings_xla is None:
     return out_shardings
 
   new_out_shardings = []
+
+  lens = [len(mlir.representation(a)) for a in global_out_avals]
+  out_shardings_xla = util.unflatten(out_shardings_xla, lens)
+
   for xla_s, orig, aval in safe_zip(out_shardings_xla, out_shardings,
                                     global_out_avals):
-    if is_unspecified(orig):
-      if (aval is not core.abstract_token and
-          dtypes.issubdtype(aval.dtype, dtypes.extended)):
-        xla_s = sharding_impls.logical_sharding(aval, xla_s)
-      new_out_shardings.append(xla_s)
+    if isinstance(aval, (core.ShapedArray, core.AbstractToken)):
+      xla_s, = xla_s
+      if is_unspecified(orig):
+        if (aval is not core.abstract_token and
+            dtypes.issubdtype(aval.dtype, dtypes.extended)):
+          xla_s = sharding_impls.logical_sharding(aval, xla_s)
+        new_out_shardings.append(xla_s)
+      else:
+        xla_hlo_s = xla_s._to_xla_hlo_sharding(aval.ndim)
+        orig_hlo_s = orig._to_xla_hlo_sharding(aval.ndim)  # pytype: disable=attribute-error
+        # MANUAL HloSharding comes from other partitioning frameworks.
+        if (not dtypes.issubdtype(aval.dtype, dtypes.extended) and
+            not xla_hlo_s.is_manual() and
+            (not op_shardings.are_op_shardings_equal(xla_hlo_s, orig_hlo_s) or
+            xla_s.memory_kind != orig.memory_kind)):  # pytype: disable=attribute-error
+          raise AssertionError(
+              f"Unexpected XLA sharding override: (XLA) {xla_s} != {orig} "
+              "(User sharding)")
+        new_out_shardings.append(orig)
     else:
-      xla_hlo_s = xla_s._to_xla_hlo_sharding(aval.ndim)
-      orig_hlo_s = orig._to_xla_hlo_sharding(aval.ndim)  # pytype: disable=attribute-error
-      # MANUAL HloSharding comes from other partitioning frameworks.
-      if (not dtypes.issubdtype(aval.dtype, dtypes.extended) and
-          not xla_hlo_s.is_manual() and
-          (not op_shardings.are_op_shardings_equal(xla_hlo_s, orig_hlo_s) or
-           xla_s.memory_kind != orig.memory_kind)):  # pytype: disable=attribute-error
-        raise AssertionError(
-            f"Unexpected XLA sharding override: (XLA) {xla_s} != {orig} "
-            "(User sharding)")
-      new_out_shardings.append(orig)
+      if not is_unspecified(orig): raise NotImplementedError("peter")
+      new_out_shardings.append(CompoundSharding(xla_s))
   return new_out_shardings
+
+
+@dataclasses.dataclass(frozen=True)
+class CompoundSharding:
+  shardings: list[jax.sharding.Sharding]
 
 
 def finalize_out_shardings(out_shardings, device_assignment):
@@ -2967,7 +3000,7 @@ class UnloadedMeshExecutable:
             xla_executable.local_devices(), len(in_shardings), len(out_shardings))
 
     in_layouts, out_layouts = _get_layouts_from_executable(
-        xla_executable, in_layouts, out_layouts, len(ordered_effects))
+        xla_executable, in_layouts, out_layouts, global_out_avals, len(ordered_effects))
 
     out_shardings = maybe_recover_user_shardings(
         in_shardings, out_shardings, global_in_avals, global_out_avals)

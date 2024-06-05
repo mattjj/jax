@@ -221,6 +221,24 @@ def aval_to_ir_type(aval: core.AbstractValue) -> ir.Type:
   return types[0]
 
 
+representation_handlers: dict[type[core.AbstractValue],
+                              Callable[[Any], Sequence[core.AbstractValue]]] = {}
+
+def representation(aval):
+  handler = representation_handlers.get(type(aval))
+  if handler is not None:
+    return handler(aval)
+  return [aval]
+
+def register_representation(cls: Type[core.AbstractValue],
+                            handler: Callable[[Any], Sequence[Core.abstractValue]]):
+  representation_handlers[cls] = handler
+  def to_ir_types(aval):
+    avals = handler(aval)
+    return [mlir_ty for a in avals for mlir_ty in aval_to_ir_types(a)]
+  ir_type_handlers[cls] = to_ir_types
+
+
 # Constants
 
 class ConstantHandler(Protocol):
@@ -1401,11 +1419,12 @@ def lower_jaxpr_to_fun(
     outs.extend(out_vals)
 
     flat_outputs = util.flatten(outs)
+    flat_output_avals = util.flatten(map(representation, output_avals))
 
     if not use_sharding_annotations and ir_result_shardings is not None:
       flat_outputs = [
           o if s is None else wrap_with_sharding_op(entry_lowering_ctx, o, o_aval, s)
-          for o, s, o_aval in zip(flat_outputs, ir_result_shardings, output_avals)]
+          for o, s, o_aval in zip(flat_outputs, ir_result_shardings, flat_output_avals)]
 
     # Insert a custom call if output is on host because XLA needs that to do the
     # transfer.
@@ -1413,14 +1432,14 @@ def lower_jaxpr_to_fun(
       flat_outputs = [
           o if mk is None else wrap_with_memory_kind(o, mk, o_aval)
           for o, mk, o_aval in zip(
-              flat_outputs, custom_call_ir_result_memory_kinds, output_avals)]
+              flat_outputs, custom_call_ir_result_memory_kinds, flat_output_avals)]
 
     if ir_result_shardings is not None and name == "main":
       flat_outputs = [
           replicate_trailing_dims(entry_lowering_ctx, o, a)
           if (a is not core.abstract_token and
               dtypes.issubdtype(a.dtype, dtypes.extended) and s is None) else o  # pytype: disable=attribute-error
-          for o, s, a in zip(flat_outputs, ir_result_shardings, output_avals)
+          for o, s, a in zip(flat_outputs, ir_result_shardings, flat_output_avals)
       ]
 
     func_dialect.return_(flat_outputs)
