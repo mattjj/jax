@@ -73,8 +73,6 @@ def jvp(fun: lu.WrappedFun, has_aux=False, instantiate=True,
 
 @lu.transformation
 def jvpfun(instantiate, transform_stack, primals, tangents):
-  tangents = [Zero.from_value(t) if not isinstance(t, Zero)
-              and dtype(t) == float0 else t for t in tangents]
   ctx = (source_info_util.transform_name_stack('jvp') if transform_stack
          else contextlib.nullcontext())
   with core.new_main(JVPTrace) as main, ctx:
