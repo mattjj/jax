@@ -100,6 +100,7 @@ map, unsafe_map = safe_map, map
 zip, unsafe_zip = safe_zip, zip
 
 
+@api_boundary
 def _nan_check_posthook(fun, args, kwargs, output):
   """Hook function called by the C++ jit/pmap to perform NaN checking."""
   buffers = []
@@ -109,7 +110,7 @@ def _nan_check_posthook(fun, args, kwargs, output):
 
   try:
     dispatch.check_special(pjit.pjit_p.name, buffers)
-  except FloatingPointError:
+  except dispatch.InternalFloatingPointError:
     # compiled_fun can only raise in this case
     assert config.debug_nans.value or config.debug_infs.value
     print("Invalid nan value encountered in the output of a C++-jit/pmap "
@@ -1649,6 +1650,7 @@ def _cpp_pmap(
 _pmap_cache_clears = weakref.WeakSet()  # type: ignore
 
 
+@api_boundary
 def jvp(
     fun: Callable, primals, tangents, has_aux: bool = False
   ) -> tuple[Any, ...]:
@@ -1851,6 +1853,7 @@ def _lift_linearized(jaxpr, primal_avals, io_tree, out_pvals, consts, *py_args):
 
   return apply_flat_fun_nokwargs(fun, io_tree, py_args)
 
+# @api_boundary
 def _vjp_pullback_wrapper(name, out_primal_avals, io_tree, fun, *py_args_):
   if len(py_args_) != 1:
     msg = (f"The function returned by `jax.vjp` applied to {name} was called "
@@ -1910,6 +1913,8 @@ def vjp(fun: Callable[..., tuple[T, U]], *primals: Any,
         has_aux: Literal[True],
         reduce_axes: Sequence[AxisName] = ()) -> tuple[T, Callable, U]:
   ...
+
+@api_boundary
 def vjp(
     fun: Callable, *primals, has_aux: bool = False, reduce_axes=()
   ) -> tuple[Any, Callable] | tuple[Any, Callable, Any]:

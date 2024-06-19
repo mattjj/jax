@@ -56,3 +56,6 @@ from jax._src.lax.control_flow.common import (
 )
 # TODO(mattjj): fix dependent library which expects optimization_barrier_p here
 from jax._src.lax.lax import optimization_barrier_p as optimization_barrier_p
+import os
+from jax._src import traceback_util
+traceback_util.register_exclusion(os.path.dirname(__file__))

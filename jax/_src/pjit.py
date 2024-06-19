@@ -216,6 +216,21 @@ def _python_pjit_helper(fun, jit_info, *args, **kwargs):
               f"Argument '{name}' of shape {aval.str_short()} of type"
               f' {type(arg)} is not a valid JAX type.') from e
       raise AssertionError("Unreachable") from e
+  except dispatch.InternalFloatingPointError as e:
+    jaxpr = p.params['jaxpr'].jaxpr
+    tracer_inputs = any(isinstance(x, core.Tracer) for x in args_flat)
+    if any(np.any(np.isnan(atom.val)) for atom in jaxpr.outvars
+           if isinstance(atom, core.Literal)):
+      raise FloatingPointError("cool literal bro") from None
+    if tracer_inputs and jaxpr.eqns:
+      # transforming, try recursing
+      _ = fun(*args, **kwargs)  # probably won't return
+      raise FloatingPointError("i tried bro, i tried")
+    if jit_info.inline:  # TODO is this even desirable to stop here? maybe print then proceed to recurse?
+      raise FloatingPointError(f"it was {jit_info.fun_sourceinfo} bro") from None
+    if not tracer_inputs and jaxpr.eqns:
+      _ = fun(*args, **kwargs)  # probably won't return
+    raise FloatingPointError("i tried bro, i tried")  # maybe an input
 
   if p.attrs_tracked:
     num_states_out = sum(end_tree.num_leaves for _, end_tree, _ in p.attrs_tracked)
@@ -1666,32 +1681,34 @@ def _pjit_call_impl_python(
                           ("out_layouts", out_layouts),
                           ("abstract args", map(xla.abstractify, args)),
                           ("fingerprint", fingerprint))
-  try:
-    return compiled.unsafe_call(*args), compiled, pgle_profiler
-  except FloatingPointError as e:
-    assert config.debug_nans.value or config.debug_infs.value  # compiled_fun can only raise in this case
+  return compiled.unsafe_call(*args), compiled, pgle_profiler
+  # except FloatingPointError as e:
+  #   assert config.debug_nans.value or config.debug_infs.value  # compiled_fun can only raise in this case
 
-    if len(jaxpr.eqns) > 1:
-      _ = core.jaxpr_as_fun(jaxpr)(*args)  # may raise, not return
-
-    # If control reaches this line, we got a NaN on the output of `compiled`
-    # but not `fun.call_wrapped` on the same arguments. Let's tell the user.
-    msg = (f"{str(e)}. Because "
-           "jax_config.debug_nans.value and/or config.jax_debug_infs is set, the "
-           "de-optimized function (i.e., the function as if the `jit` "
-           "decorator were removed) was called in an attempt to get a more "
-           "precise error message. However, the de-optimized function did not "
-           "produce invalid values during its execution. This behavior can "
-           "result from `jit` optimizations causing the invalid value to be "
-           "produced. It may also arise from having nan/inf constants as "
-           "outputs, like `jax.jit(lambda ...: jax.numpy.nan)(...)`. "
-           "\n\n"
-           "It may be possible to avoid the invalid value by removing the "
-           "`jit` decorator, at the cost of losing optimizations. "
-           "\n\n"
-           "If you see this error, consider opening a bug report at "
-           "https://github.com/jax-ml/jax.")
-    raise FloatingPointError(msg)
+  #   if (len(jaxpr.eqns) == 0 or
+  #       any(np.any(np.isnan(atom.val)) for atom in jaxpr.jaxpr.outvars
+  #           if isinstance(atom, core.Literal))):
+  #     raise FloatingPointError("cool literal bro") from None
+  #   elif len(jaxpr.eqns) == 1:
+  #     raise FloatingPointError(f"it was {jaxpr.eqns[0].primitive} bro") from None
+  #   else:
+  #     _ = core.jaxpr_as_fun(jaxpr)(*args)  # may raise, not return
+  #     # If control reaches this line, we got a NaN on the output of `compiled`
+  #     # but not `fun.call_wrapped` on the same arguments. Let's tell the user.
+  #     msg = (f"{str(e)}. Because jax_config.debug_nans.value and/or "
+  #            "config.jax_debug_infs is set, the de-optimized function (i.e., "
+  #            "the function as if the `jit` decorator were removed) was called "
+  #            "in an attempt to get a more precise error message. However, the "
+  #            "de-optimized function did not produce invalid values during its "
+  #            "execution. This behavior can esult from `jit` optimizations "
+  #            "causing the invalid value to be produced."
+  #            "\n\n"
+  #            "It may be possible to avoid the invalid value by removing the "
+  #            "`jit` decorator, at the cost of losing optimizations."
+  #            "\n\n"
+  #            "If you see this error, consider opening a bug report at "
+  #            "https://github.com/google/jax.")
+  #     raise FloatingPointError(msg) from None
 
 
 @weakref_lru_cache
@@ -2294,19 +2311,23 @@ def _pjit_transpose(cts_in, *primals_in,
     transpose_in_layouts = (None,) * len(attrs_tracked) + transpose_in_layouts
     transpose_out_layouts = (None,) * len(attrs_tracked) + transpose_out_layouts
 
-  nz_cts_out = pjit_p.bind(
-      *primals_and_nz_cts_in,
-      jaxpr=transpose_jaxpr,
-      in_shardings=transpose_in_shardings,
-      out_shardings=transpose_out_shardings,
-      in_layouts=transpose_in_layouts,
-      out_layouts=transpose_out_layouts,
-      resource_env=resource_env,
-      donated_invars=(False,) * len(primals_and_nz_cts_in),
-      name=name,
-      keep_unused=keep_unused,
-      inline=inline,
-      compiler_options_kvs=compiler_options_kvs)
+  try:
+    nz_cts_out = pjit_p.bind(
+        *primals_and_nz_cts_in,
+        jaxpr=transpose_jaxpr,
+        in_shardings=transpose_in_shardings,
+        out_shardings=transpose_out_shardings,
+        in_layouts=transpose_in_layouts,
+        out_layouts=transpose_out_layouts,
+        resource_env=resource_env,
+        donated_invars=(False,) * len(primals_and_nz_cts_in),
+        name=name,
+        keep_unused=keep_unused,
+        inline=inline,
+        compiler_options_kvs=compiler_options_kvs)
+  except dispatch.InternalFloatingPointError:
+    breakpoint()
+    pass
 
   if attrs_tracked:
     final_states, nz_cts_out = split_list(nz_cts_out, [len(init_states)])

@@ -44,11 +44,13 @@ from jax._src.numpy import lax_numpy
 from jax._src.numpy import reductions
 from jax._src.numpy import ufuncs
 from jax._src.ops import scatter
+from jax._src import traceback_util
 from jax._src.typing import Array, ArrayLike, DimSize, DTypeLike, Shape, StaticScalar
 from jax._src.util import safe_zip, safe_map
 
 map, unsafe_map = safe_map, map
 zip, unsafe_zip = safe_zip, zip
+traceback_util.register_exclusion(__file__)
 
 
 ### add method and operator overloads to arraylike classes

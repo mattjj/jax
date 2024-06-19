@@ -99,7 +99,7 @@ def xla_primitive_callable(prim: core.Primitive, **params):
       return prim.bind(*args, **params)
   prim_fun.__name__ = prim.name
   prim_fun.__qualname__ = prim.name
-  return api.jit(prim_fun)
+  return api.jit(prim_fun, inline=True)
 
 
 def simple_impl(prim):
@@ -312,20 +312,32 @@ def needs_check_special() -> bool:
 
 def check_special(name: str, bufs: Sequence[basearray.Array]) -> None:
   if needs_check_special():
-    for buf in bufs:
-      _check_special(name, buf.dtype, buf)
+    for i, buf in enumerate(bufs):
+      _check_special(name, i, buf.dtype, buf)
 
-def _check_special(name: str, dtype: np.dtype, buf: basearray.Array) -> None:
+def _check_special(name: str, idx: int, dtype: np.dtype, buf: basearray.Array) -> None:
   if dtypes.issubdtype(dtype, np.inexact):
     if config.debug_nans.value and np.any(np.isnan(np.asarray(buf))):
-      raise FloatingPointError(f"invalid value (nan) encountered in {name}")
+      raise InternalFloatingPointError(name, idx, 'nan', buf)
     if config.debug_infs.value and np.any(np.isinf(np.asarray(buf))):
-      raise FloatingPointError(f"invalid value (inf) encountered in {name}")
+      raise InternalFloatingPointError(name, idx, 'inf', buf)
 
 class CopySemantics(enum.Enum):
   ALIAS = enum.auto()
   COPY = enum.auto()
   DONATE = enum.auto()
+
+class InternalFloatingPointError(Exception):
+  name: str
+  idx: int
+  ty: str
+  buf: array.ArrayImpl
+
+  def __init__(self, name: str, idx: int, ty: str, buf: array.ArrayImpl):
+    self.name = name
+    self.idx = idx
+    self.ty = ty
+    self.buf = buf
 
 def _identity_fn(x):
   return x

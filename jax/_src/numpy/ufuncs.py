@@ -27,6 +27,7 @@ import numpy as np
 
 from jax._src import core
 from jax._src import dtypes
+from jax._src import traceback_util
 from jax._src.api import jit
 from jax._src.custom_derivatives import custom_jvp
 from jax._src.lax import lax
@@ -41,6 +42,7 @@ from jax._src.numpy import reductions
 from jax._src.util import set_module
 
 
+traceback_util.register_exclusion(__file__)
 export = set_module('jax.numpy')
 
 _lax_const = lax._const
