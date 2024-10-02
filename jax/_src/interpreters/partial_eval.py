@@ -1066,21 +1066,11 @@ def partial_eval_jaxpr_custom(
     ensure_out_inst: bool | Sequence[bool],
     saveable: Callable[..., RematCases_],
   ) -> tuple[Jaxpr, Jaxpr, list[bool], list[bool], int]:
-  if type(in_inst) is bool:
-    in_inst = (in_inst,) * len(jaxpr.invars)
-  if type(ensure_out_unknowns) is bool:
-    ensure_out_unknowns = (ensure_out_unknowns,) * len(jaxpr.outvars)
-  if type(ensure_out_inst) is bool:
-    ensure_out_inst = (ensure_out_inst,) * len(jaxpr.outvars)
-  jaxpr_known, jaxpr_staged, out_unknowns, out_inst, num_res, num_res_ref = \
-      _partial_eval_jaxpr_custom_cached(jaxpr, tuple(in_unknowns),
-                                        tuple(in_inst),
-                                        tuple(ensure_out_unknowns),
-                                        tuple(ensure_out_inst), saveable)
-  if num_res_ref > 0:
-    raise ValueError(
-        "Cannot use `partial_eval_jaxpr_custom` with stateful jaxprs.")
-  return jaxpr_known, jaxpr_staged, out_unknowns, out_inst, num_res
+  *outs, num_res_ref = partial_eval_jaxpr_stateful(
+      jaxpr, in_unknowns, in_inst, ensure_out_unknowns, ensure_out_inst, saveable)
+  if num_res_ref:
+    raise ValueError("Cannot use `partial_eval_jaxpr_custom` with stateful jaxprs.")
+  return outs
 
 def partial_eval_jaxpr_stateful(
     jaxpr: Jaxpr,
@@ -1097,10 +1087,9 @@ def partial_eval_jaxpr_stateful(
   if type(ensure_out_inst) is bool:
     ensure_out_inst = (ensure_out_inst,) * len(jaxpr.outvars)
   jaxpr_known, jaxpr_staged, out_unknowns, out_inst, num_res, num_res_ref = \
-      _partial_eval_jaxpr_custom_cached(jaxpr, tuple(in_unknowns),
-                                        tuple(in_inst),
-                                        tuple(ensure_out_unknowns),
-                                        tuple(ensure_out_inst), saveable)
+      _partial_eval_jaxpr_custom_cached(
+          jaxpr, tuple(in_unknowns), tuple(in_inst), tuple(ensure_out_unknowns),
+          tuple(ensure_out_inst), saveable)
   return jaxpr_known, jaxpr_staged, out_unknowns, out_inst, num_res, num_res_ref
 
 @weakref_lru_cache
@@ -2300,11 +2289,23 @@ def trace_to_subjaxpr_dynamic(
     in_tracers_ = [t for t, keep in zip(in_tracers, keep_inputs) if keep]
     ans = fun.call_wrapped(*in_tracers_)
     out_tracers = map(trace.full_raise, ans)
+    _check_no_refs(debug_info, [x.aval for x in out_tracers])
     jaxpr, consts, attrs_tracked = frame.to_jaxpr(trace, out_tracers)
     del fun, main, trace, frame, in_tracers, out_tracers, ans
   config.enable_checks.value and core.check_jaxpr(jaxpr)
   return jaxpr, [v.aval for v in jaxpr.outvars], consts, attrs_tracked
 
+def _check_no_refs(dbg: DebugInfo, avals: Sequence[AbstractValue]) -> None:
+  for i, a in enumerate(avals):
+    if isinstance(a, AbstractRef):
+      if dbg is None:
+        raise ValueError(
+        f"function returned a mutable array reference of type {a.str_short()}, "
+        "but mutable array references cannot be returned.")
+      raise ValueError(
+          f"{dbg.func_src_info} traced for {dbg.traced_for} returned a mutable "
+          f"array reference of type {a.str_short()}, but mutable array "
+          "references cannot be returned.")
 
 @profiler.annotate_function
 def trace_to_jaxpr_dynamic2(

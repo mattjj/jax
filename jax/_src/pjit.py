@@ -635,9 +635,10 @@ def _infer_params_impl(
     in_avals = tuple(a for a, e in in_type if e)
   elif in_avals is None:
     avals = []
-    for i, a in enumerate(explicit_args):
+    refs: dict[int, int] = {}
+    for i, x in enumerate(explicit_args):
       try:
-        avals.append(shaped_abstractify(a))
+        avals.append(a := shaped_abstractify(x))
       except OverflowError as e:
         arg_path = (f"argument path is {dbg.arg_names[i]}" if dbg
                     else f"flattened argument number is {i}")
@@ -656,6 +657,14 @@ def _infer_params_impl(
           " argument, and this argument was not marked as static using the"
           " static_argnums or static_argnames parameters of jax.jit."
         ) from e
+      if (isinstance(aval, AbstractRef) and
+          (dup_idx := refs.setdefault(id(core.get_referent(x)), i)) != i):
+        raise ValueError(
+          "only one reference to a mutable array may be passed as an argument "
+          f"to a function, but the mutable array reference of type {aval.str_short()} "
+          f"appeared at both {dbg.arg_names[dup_idx]} and {dbg.arg_names[i]}"
+          if dbg else
+          f"at both flat index {dup_idx} and flat index {i}")
 
     in_type = in_avals = tuple(avals)
   else:
