@@ -190,6 +190,10 @@ def _python_pjit_helper(fun, jit_info, *args, **kwargs):
       args_flat = map(core.full_lower, args_flat)
       core.check_eval_args(args_flat)
       out_flat, compiled, profiler = _pjit_call_impl_python(*args_flat, **p.params)
+      if config.debug_nans.value:
+        for a, x in zip(p.params['jaxpr'].out_avals, out_flat):
+          if isinstance(a, core.ShapedArray) and dtypes.issubdtype(a.dtype, np.inexact):
+            if (x != x).any(): breakpoint()
     else:
       out_flat = pjit_p.bind(*args_flat, **p.params)
       compiled = None
@@ -216,21 +220,21 @@ def _python_pjit_helper(fun, jit_info, *args, **kwargs):
               f"Argument '{name}' of shape {aval.str_short()} of type"
               f' {type(arg)} is not a valid JAX type.') from e
       raise AssertionError("Unreachable") from e
-  except dispatch.InternalFloatingPointError as e:
-    jaxpr = p.params['jaxpr'].jaxpr
-    tracer_inputs = any(isinstance(x, core.Tracer) for x in args_flat)
-    if any(np.any(np.isnan(atom.val)) for atom in jaxpr.outvars
-           if isinstance(atom, core.Literal)):
-      raise FloatingPointError("cool literal bro") from None
-    if tracer_inputs and jaxpr.eqns:
-      # transforming, try recursing
-      _ = fun(*args, **kwargs)  # probably won't return
-      raise FloatingPointError("i tried bro, i tried")
-    if jit_info.inline:  # TODO is this even desirable to stop here? maybe print then proceed to recurse?
-      raise FloatingPointError(f"it was {jit_info.fun_sourceinfo} bro") from None
-    if not tracer_inputs and jaxpr.eqns:
-      _ = fun(*args, **kwargs)  # probably won't return
-    raise FloatingPointError("i tried bro, i tried")  # maybe an input
+  # except dispatch.InternalFloatingPointError as e:
+  #   jaxpr = p.params['jaxpr'].jaxpr
+  #   tracer_inputs = any(isinstance(x, core.Tracer) for x in args_flat)
+  #   if any(np.any(np.isnan(atom.val)) for atom in jaxpr.outvars
+  #          if isinstance(atom, core.Literal)):
+  #     raise FloatingPointError("cool literal bro") from None
+  #   if tracer_inputs and jaxpr.eqns:
+  #     # transforming, try recursing
+  #     _ = fun(*args, **kwargs)  # probably won't return
+  #     raise FloatingPointError("i tried bro, i tried")
+  #   if jit_info.inline:  # TODO is this even desirable to stop here? maybe print then proceed to recurse?
+  #     raise FloatingPointError(f"it was {jit_info.fun_sourceinfo} bro") from None
+  #   if not tracer_inputs and jaxpr.eqns:
+  #     _ = fun(*args, **kwargs)  # probably won't return
+  #   raise FloatingPointError("i tried bro, i tried")  # maybe an input
 
   if p.attrs_tracked:
     num_states_out = sum(end_tree.num_leaves for _, end_tree, _ in p.attrs_tracked)
