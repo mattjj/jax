@@ -183,17 +183,13 @@ def _python_pjit_helper(fun, jit_info, *args, **kwargs):
     init_states = _get_states(p.attrs_tracked)
     args_flat = [*init_states, *args_flat]
 
+  run_impl = (core.trace_state_clean() and not config.debug_key_reuse.value and
+              not config.data_dependent_tracing_fallback.value)
   try:
-    if (core.trace_state_clean() and
-        not config.debug_key_reuse.value and
-        not config.data_dependent_tracing_fallback.value):
+    if run_impl:
       args_flat = map(core.full_lower, args_flat)
       core.check_eval_args(args_flat)
       out_flat, compiled, profiler = _pjit_call_impl_python(*args_flat, **p.params)
-      if config.debug_nans.value:
-        for a, x in zip(p.params['jaxpr'].out_avals, out_flat):
-          if isinstance(a, core.ShapedArray) and dtypes.issubdtype(a.dtype, np.inexact):
-            if (x != x).any(): breakpoint()
     else:
       out_flat = pjit_p.bind(*args_flat, **p.params)
       compiled = None
@@ -220,21 +216,24 @@ def _python_pjit_helper(fun, jit_info, *args, **kwargs):
               f"Argument '{name}' of shape {aval.str_short()} of type"
               f' {type(arg)} is not a valid JAX type.') from e
       raise AssertionError("Unreachable") from e
-  # except dispatch.InternalFloatingPointError as e:
-  #   jaxpr = p.params['jaxpr'].jaxpr
-  #   tracer_inputs = any(isinstance(x, core.Tracer) for x in args_flat)
-  #   if any(np.any(np.isnan(atom.val)) for atom in jaxpr.outvars
-  #          if isinstance(atom, core.Literal)):
-  #     raise FloatingPointError("cool literal bro") from None
-  #   if tracer_inputs and jaxpr.eqns:
-  #     # transforming, try recursing
-  #     _ = fun(*args, **kwargs)  # probably won't return
-  #     raise FloatingPointError("i tried bro, i tried")
-  #   if jit_info.inline:  # TODO is this even desirable to stop here? maybe print then proceed to recurse?
-  #     raise FloatingPointError(f"it was {jit_info.fun_sourceinfo} bro") from None
-  #   if not tracer_inputs and jaxpr.eqns:
-  #     _ = fun(*args, **kwargs)  # probably won't return
-  #   raise FloatingPointError("i tried bro, i tried")  # maybe an input
+  except dispatch.InternalFloatingPointError as e:
+    jaxpr = p.params['jaxpr'].jaxpr
+    if any(np.any(np.isnan(atom.val)) for atom in jaxpr.outvars
+           if isinstance(atom, core.Literal)):
+      raise FloatingPointError("cool literal bro") from None
+    if run_impl and jit_info.inline:  # heuristic to get jax.numpy-level errors
+      raise FloatingPointError(f"it was {jit_info.fun_sourceinfo} bro") from None
+    if jaxpr.eqns:  # nontrivial body, try recursing
+      # TODO and check there are no important side-effects or comms
+      # TODO tell the user we're going to try running the de-optimized function
+      try:
+        _ = fun(*args, **kwargs)
+      except (FloatingPointError, ZeroDivisionError) as e2:
+        raise e2 from None  # great, we got an internal error, raise it
+      else:
+        raise e  # 
+    # TODO trivial body, so... check if it's an input
+    raise FloatingPointError("i tried bro, i tried")
 
   if p.attrs_tracked:
     num_states_out = sum(end_tree.num_leaves for _, end_tree, _ in p.attrs_tracked)
