@@ -218,7 +218,8 @@ def _python_pjit_helper(fun, jit_info, *args, **kwargs):
       raise AssertionError("Unreachable") from e
   except dispatch.InternalFloatingPointError as e:
     if getattr(fun, '__is_primitive__', False):
-      raise FloatingPointError(f"it was {jit_info.fun_sourceinfo} bro") from None
+      # TODO jit_info.fun_sourceinfo is totally useless here...
+      raise FloatingPointError(f"it was the primitive {fun.__qualname__} bro") from None
     _maybe_recursive_nan_check(e, run_impl, fun, args, kwargs)
 
   if p.attrs_tracked:

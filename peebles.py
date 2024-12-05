@@ -27,7 +27,7 @@ def h(x, y):
 # i've been commenting-in lines from here to see what happens:
 
 with jax.debug_nans():
-  # jnp.divide(1., 1.); jnp.divide(0., 0.)  # second call hits different path!
+  jnp.divide(1., 1.); jnp.divide(0., 0.)  # second call hits different path!
 
   # jax.jvp(jnp.log, (0.,), (0.,))
   # first, in _python_pjit_helper, we hit the `not run_impl` case, with
