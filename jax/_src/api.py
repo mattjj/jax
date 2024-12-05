@@ -115,7 +115,7 @@ def _nan_check_posthook(fun, args, kwargs, output):
     assert config.debug_nans.value or config.debug_infs.value
     print("Invalid nan value encountered in the output of a C++-jit/pmap "
           "function. Calling the de-optimized version.")
-    pjit._maybe_recursive_nan_check(e, fun._fun, args, kwargs, out_flat)
+    pjit._maybe_recursive_nan_check(e, True, fun._fun, args, kwargs)
     assert False  # Unreachable.
 
 def _update_debug_special_global(_):

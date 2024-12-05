@@ -187,12 +187,10 @@ def _python_pjit_helper(fun, jit_info, *args, **kwargs):
               not config.data_dependent_tracing_fallback.value)
   try:
     if run_impl:  # "no tracers" path
-      breakpoint()
       args_flat = map(core.full_lower, args_flat)
       core.check_eval_args(args_flat)
       out_flat, compiled, profiler = _pjit_call_impl_python(*args_flat, **p.params)
     else:
-      breakpoint()
       out_flat = pjit_p.bind(*args_flat, **p.params)
       compiled = None
       profiler = None
@@ -219,26 +217,9 @@ def _python_pjit_helper(fun, jit_info, *args, **kwargs):
               f' {type(arg)} is not a valid JAX type.') from e
       raise AssertionError("Unreachable") from e
   except dispatch.InternalFloatingPointError as e:
-    jaxpr = p.params['jaxpr'].jaxpr
-    if any(np.any(np.isnan(atom.val)) for atom in jaxpr.outvars
-           if isinstance(atom, core.Literal)):
-      raise FloatingPointError("CASE 1") from None
-    if run_impl and jit_info.inline:  # heuristic to get jax.numpy-level errors
-      # maybe we should instead check if the function source file is
-      # jax.numpy... or getattr(fun, '__jax_debug_nans_recurse__', True)?
+    if getattr(fun, '__is_primitive__', False):
       raise FloatingPointError(f"it was {jit_info.fun_sourceinfo} bro") from None
-    if jaxpr.eqns:  # nontrivial body, try recursing
-      # TODO and check there are no important side-effects or comms
-      # TODO tell the user we're going to try running the de-optimized function
-      print('calling de-optimized...')
-      try:
-        _ = fun(*args, **kwargs)
-      except (FloatingPointError, ZeroDivisionError) as e2:
-        raise e2 from None  # great, we got an internal error, raise it
-      else:
-        print('didnt see a nan when we re-ran...')
-        raise e
-    assert False  # unreachable?
+    _maybe_recursive_nan_check(e, run_impl, fun, args, kwargs)
 
   if p.attrs_tracked:
     num_states_out = sum(end_tree.num_leaves for _, end_tree, _ in p.attrs_tracked)
@@ -248,6 +229,20 @@ def _python_pjit_helper(fun, jit_info, *args, **kwargs):
   outs = tree_unflatten(p.out_tree, out_flat)
   return (outs, out_flat, p.out_tree, args_flat, p.params['jaxpr'],
           p.attrs_tracked, compiled, profiler)
+
+
+def _maybe_recursive_nan_check(
+    e: Exception, run_impl: bool, fun: Callable, args, kwargs,
+) -> None:  # always raises an exception
+  print('trying to call un-jitted function...')
+  try:
+    _ = fun(*args, **kwargs)
+  except (FloatingPointError, ZeroDivisionError) as e2:
+    raise e2 from None  # great, we got an internal error, raise it
+  else:
+    print('didnt see a nan when we re-ran...')
+    raise e
+  assert False  # unreachable?
 
 
 def _set_states(attrs_tracked, vals):
