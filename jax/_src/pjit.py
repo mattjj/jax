@@ -2328,9 +2328,17 @@ def _pjit_transpose(cts_in, *primals_in,
         keep_unused=keep_unused,
         inline=inline,
         compiler_options_kvs=compiler_options_kvs)
-  except dispatch.InternalFloatingPointError:
-    breakpoint()
-    pass
+  except dispatch.InternalFloatingPointError as e:
+    print('nan arose in the bwd pass for a pjit function...')
+    print('running the bwd pass un-jitted...')
+    try:
+      _ = ad.closed_backward_pass(jaxpr, None, primals_in, cts_in)
+    except (FloatingPointError, ZeroDivisionError) as e2:
+      raise e2 from None  # great
+    else:
+      print('didnt see a nan when re-ran...')
+      raise e
+    assert False
 
   if attrs_tracked:
     final_states, nz_cts_out = split_list(nz_cts_out, [len(init_states)])
