@@ -93,19 +93,18 @@ class DebugNaNsTest(jtu.JaxTestCase):
   def testShardMap(self):
     mesh = jax.make_mesh((1,), ('x',))
     f = shard_map(lambda x: 0. / x, mesh=mesh, in_specs=(P('x')), out_specs=P('x'))
-    # For the Cpp pmap, the first execution always goes through Python.
     f(jnp.array([1.]))
 
     with self.assertRaisesRegex(
         FloatingPointError,
-        r"invalid value \(nan\) encountered in parallel computation"):
+        r"invalid value \(nan\) encountered in shard_map when applying true_divide"):
       ans = f(jnp.array([0.]))
       ans.block_until_ready()
 
     if jax.device_count() >= 2:
       with self.assertRaisesRegex(
           FloatingPointError,
-          r"invalid value \(nan\) encountered in parallel computation"):
+          r"invalid value \(nan\) encountered in shard_map when applying true_divide"):
         ans = f(jnp.array([1., 0.]))
         ans.block_until_ready()
   

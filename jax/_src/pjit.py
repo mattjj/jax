@@ -221,7 +221,6 @@ def _python_pjit_helper(fun, jit_info, *args, **kwargs):
       raise AssertionError("Unreachable") from e
   except dispatch.InternalFloatingPointError as e:
     jaxpr = p.params['jaxpr'].jaxpr
-    # What should happen with shard_map?
     name = fun.f.__qualname__ if isinstance(fun, HashablePartial) else fun.__qualname__
     if any(np.any(np.isnan(atom.val)) for atom in jaxpr.outvars
            if isinstance(atom, core.Literal)):
@@ -229,7 +228,7 @@ def _python_pjit_helper(fun, jit_info, *args, **kwargs):
     if any(np.any(np.isnan(arg)) for arg in args
            if not isinstance(arg, core.Tracer)):
       raise FloatingPointError(f"An input to function {name} is invalid ({e.ty}).") from None
-    if len(jaxpr.eqns) == 1:
+    if getattr(fun, '__jax_primitive__', False):
       raise FloatingPointError(f"invalid value ({e.ty}) encountered in {name}") from None
     _maybe_recursive_nan_check(e, fun, args, kwargs)
 

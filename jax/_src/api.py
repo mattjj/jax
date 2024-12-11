@@ -102,6 +102,7 @@ zip, unsafe_zip = safe_zip, zip
 
 def _nan_check_posthook(fun, args, kwargs, output):
   """Hook function called by the C++ jit/pmap to perform NaN checking."""
+  __tracebackhide__ = True
   buffers = []
   for leaf in tree_leaves(output):
     if hasattr(leaf, "addressable_shards"):
@@ -277,10 +278,10 @@ def jit(
     >>> g(jnp.arange(4), 3)
     Array([   0,    1,  256, 6561], dtype=int32)
   """
-  return pjit.make_jit(
+  return api_boundary(pjit.make_jit(
         fun, in_shardings, out_shardings, donate_argnums, donate_argnames,
         static_argnums, static_argnames, device, backend, abstracted_axes,
-        keep_unused, inline, compiler_options, use_resource_env=False)
+        keep_unused, inline, compiler_options, use_resource_env=False))
 
 
 @contextmanager

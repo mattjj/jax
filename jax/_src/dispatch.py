@@ -99,6 +99,7 @@ def xla_primitive_callable(prim: core.Primitive, **params):
       return prim.bind(*args, **params)
   prim_fun.__name__ = prim.name
   prim_fun.__qualname__ = prim.name
+  prim_fun.__jax_primitive__ = True
   return api.jit(prim_fun)
 
 
