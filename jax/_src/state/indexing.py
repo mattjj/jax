@@ -139,7 +139,8 @@ class NDIndexer:
       return
     if len(self.indices) != len(self.shape):
       raise ValueError(
-          f"`indices` must be the same length as `Ref` shape.: {self}."
+          f"`indices` must be the same length as `Ref` shape.: but got {self}"
+          f"for shape {self.shape}"
       )
     # We validate integer indexing shapes here
     for idx, s in zip(self.indices, self.shape):
