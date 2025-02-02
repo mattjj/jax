@@ -219,16 +219,16 @@ class NameStackTransformationTest(jtu.JaxTestCase):
       with jax.named_scope('bar'):
         return jnp.sin(x)
     jaxpr = jax.make_jaxpr(f)(1.).jaxpr
-    jaxpr_param = 'jaxpr'
 
     self.assertEqual(str(jaxpr.eqns[0].source_info.name_stack), 'jvp(foo)')
     self.assertEqual(str(jaxpr.eqns[1].source_info.name_stack), 'transpose(jvp(foo))')
+
     self.assertEqual(str(
-      jaxpr.eqns[0].params[jaxpr_param].eqns[0].source_info.name_stack), 'bar')
+      jaxpr.eqns[0].params['jaxpr'].eqns[0].source_info.name_stack), 'bar')
     self.assertEqual(str(
-      jaxpr.eqns[0].params[jaxpr_param].eqns[1].source_info.name_stack), 'bar')
+      jaxpr.eqns[0].params['jaxpr'].eqns[1].source_info.name_stack), 'bar')
     self.assertEqual(str(
-      jaxpr.eqns[1].params[jaxpr_param].eqns[0].source_info.name_stack), 'bar')
+      jaxpr.eqns[1].params['jaxpr'].eqns[0].source_info.name_stack), 'bar')
 
     hlo_text = _get_hlo(f)(1.)
     self.assertIn('jvp(foo)/jit(f)/bar/sin', hlo_text)

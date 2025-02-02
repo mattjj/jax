@@ -60,7 +60,7 @@ def _update_annotation(
   return lu.annotate(f, (*orig_type, *tan_types))
 
 def jvp(fun: lu.WrappedFun, has_aux=False, instantiate=True,
-    transform_stack=True) -> Any:
+        transform_stack=True) -> Any:
   if not has_aux:
     return jvpfun(jvp_subtrace(fun), instantiate, transform_stack)
   else:
@@ -161,7 +161,8 @@ def _linearize_jaxpr(
   tracers = [new_arg(lin_trace, v.aval, nz)
              for (v, nz) in zip(jaxpr.jaxpr.invars, nonzeros)]
 
-  with core.set_current_trace(lin_trace, check_leaks=True):
+  with (core.set_current_trace(lin_trace, check_leaks=True),
+        source_info_util.reset_name_stack()):
     ans = core.eval_jaxpr(jaxpr.jaxpr, jaxpr.consts, *tracers)
     out_primals, out_tangents = unzip2(map(lin_trace.to_primal_tangent_pair, ans))
     del lin_trace, ans, tracers, new_arg
@@ -192,7 +193,8 @@ def direct_linearize(traceable: lu.WrappedFun,
     linearize_trace = LinearizeTrace(parent_trace, tangent_trace, tag=tag)
     tracers = [LinearizeTracer(linearize_trace, p, t) for p, t in zip(primals, tangents)]
     tracers = [t.full_lower() for t in tracers]
-    with core.set_current_trace(linearize_trace, check_leaks=True):
+    with (core.set_current_trace(linearize_trace, check_leaks=True),
+          source_info_util.transform_name_stack('jvp')):
       if has_aux:
         ans, aux = traceable.call_wrapped(*tracers)
         aux_primals = [x.primal
