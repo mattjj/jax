@@ -1895,7 +1895,7 @@ def jaxpr_subcomp(ctx: ModuleContext, jaxpr: core.Jaxpr,
       h = HashableLiteral(v)
       c = cached_ir_consts.get(h)
       if c is None:
-        c = ir_constant(xla.canonicalize_dtype(v.val))
+        c = ir_constant(v.val)
         cached_ir_consts[h] = c
       return c
     else:

@@ -1694,7 +1694,8 @@ class JaxprStackFrame:
     jaxpr_effects = make_jaxpr_effects(constvars, self.invars, explicit_outvars, self.eqns)
     jaxpr = Jaxpr(constvars, invars, outvars, self.eqns, jaxpr_effects,
                   debug_info)
-    jaxpr, constvals = _const_folding_and_forwarding(jaxpr, constvals)
+    jaxpr2, constvals2 = _const_folding_and_forwarding(jaxpr, constvals)
+    if any(isinstance(c, float) for c in constvals2): breakpoint()
     jaxpr, constvals = _inline_literals(jaxpr, constvals)
     init_trees = [tree_structure(init_val) for init_val in self.attrs_inits]
     set_states(self.attrs_tracked, self.attrs_inits)

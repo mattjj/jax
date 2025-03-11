@@ -67,10 +67,11 @@ from jax._src.lib.mlir import ir
 from jax._src.lib.mlir.dialects import chlo
 from jax._src.lib.mlir.dialects import hlo
 from jax._src.sharding_impls import (PmapSharding, NamedSharding,
-                                     PartitionSpec as P, canonicalize_sharding)
+                                     PartitionSpec as P, canonicalize_sharding, SingleDeviceSharding)
 from jax._src.typing import Array, ArrayLike, DimSize, DuckTypedArray, DTypeLike, Shape
 from jax._src.util import (NumpyComplexWarning, cache, canonicalize_axis,
                            safe_map, safe_zip, split_list, weakref_lru_cache)
+from jax._src import xla_bridge as xb
 
 _max = builtins.max
 _min = builtins.min
@@ -4461,8 +4462,10 @@ def _convert_elt_type_folding_rule(consts, eqn):
     out = out.astype(new_dtype)
     if not o.aval.weak_type:
       return [out], None
-    out = out.item()
-    if core.get_aval(out).dtype is o.aval.dtype:
+    else:
+      s = SingleDeviceSharding(xb.local_devices(backend='cpu')[0])
+      out = _convert_element_type(out, out.dtype, True, s)
+      assert (a := core.get_aval(out)) == o.aval, (a, o.aval)
       return [out], None
   return [None], eqn
 

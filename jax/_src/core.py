@@ -455,6 +455,8 @@ class Literal:
   hash: int | None
 
   def __init__(self, val, aval):
+    if isinstance(val, (int, float, complex)): breakpoint()
+    if isinstance(val, np.ndarray) and '64' in str(val.dtype): breakpoint()
     self.val = val
     self.aval = aval
     try:
