@@ -1704,7 +1704,7 @@ def lower_jaxpr_to_fun(
       callee_name_stack = name_stack.extend(util.wrap_name(name, api_name))
     else:
       callee_name_stack = name_stack
-    consts = [ir_constant(xla.canonicalize_dtype(x)) for x in jaxpr.consts]
+    consts = [ir_constant(x) for x in jaxpr.consts]
     out_vals, tokens_out = jaxpr_subcomp(
         ctx, jaxpr.jaxpr, callee_name_stack, tokens_in,
         consts, *args, dim_var_values=dim_var_values)

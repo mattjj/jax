@@ -498,6 +498,7 @@ class Primitive:
     return f'{self.name}'
 
   def bind(self, *args, **params):
+    args = map(_canonicalize_dtype, args)
     args = args if self.skip_canonicalization else map(canonicalize_value, args)
     return self._true_bind(*args, **params)
 
@@ -1748,6 +1749,10 @@ def canonicalize_shape(shape: Shape, context: str="") -> tuple[Any, ...]:
   except TypeError:
     pass
   raise _invalid_shape_error(shape, context)
+
+def _canonicalize_dtype(val):
+  from jax._src.interpreters import xla
+  return val if isinstance(val, Tracer) else xla.canonicalize_dtype(val)
 
 def canonicalize_dim(d: DimSize, context: str="") -> DimSize:
   """Canonicalizes and checks for errors in a user-provided shape dimension value.
