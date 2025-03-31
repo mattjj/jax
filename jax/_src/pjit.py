@@ -47,9 +47,8 @@ from jax._src import util
 from jax._src import xla_bridge as xb
 from jax._src.api_util import (
   argnums_partial_except, flatten_axes, flatten_fun, flatten_fun_nokwargs,
-  donation_vector, check_callable, resolve_argnums,
-  argnames_partial_except, debug_info,
-  hoist_obj_attrs, _check_no_aliased_ref_args,
+  donation_vector, check_callable, resolve_argnums, argnames_partial_except,
+  debug_info, hoist_obj_attrs, _class_with_attrs, _check_no_aliased_ref_args,
   _check_no_aliased_closed_over_refs)
 from jax._src.interpreters import partial_eval as pe
 from jax._src.partition_spec import PartitionSpec
@@ -735,11 +734,12 @@ def _infer_params_internal(
     entry.pjit_params = p
   return entry.pjit_params, entry.pjit_params.consts + dynargs
 
-def _infer_input_type(fun: Callable, dbg: core.DebugInfo,
-                      explicit_args) -> tuple[core.AbstractValue, ...]:
+def _infer_input_type(fun: Callable, dbg: core.DebugInfo, explicit_args
+                      ) -> tuple[core.AbstractValue, ...]:
   avals = []
   try:
     for i, x in enumerate(explicit_args):
+      if type(x) in _class_with_attrs: continue
       avals.append(core.shaped_abstractify(x))
   except OverflowError:
     arg_path = f"argument path is {dbg.arg_names[i]}"
@@ -1622,8 +1622,7 @@ def _resolve_and_lower(
     lowering_platforms, lowering_parameters, pgle_profiler,
     compiler_options_kvs):
   in_shardings = _resolve_in_shardings(args, in_shardings)
-  in_layouts = _resolve_in_layouts(args, in_layouts, in_shardings,
-                                   jaxpr.in_avals)
+  in_layouts = _resolve_in_layouts(args, in_layouts, in_shardings, jaxpr.in_avals)
   out_layouts = _resolve_out_layouts(out_layouts, out_shardings, jaxpr.out_avals)
   return _pjit_lower(
       jaxpr, in_shardings, out_shardings, in_layouts, out_layouts,

@@ -1678,6 +1678,7 @@ class JaxprStackFrame:
   attrs_tracked: list[tuple[Any, str, AttrKind]]
   attrs_inits: list
   attrs_vars: list[Var]
+  attrs_made: list[tuple[Any, str, ShapedArray]]
   debug_info: core.DebugInfo
 
   def __init__(self, debug_info: core.DebugInfo):
@@ -1692,6 +1693,7 @@ class JaxprStackFrame:
     self.attrs_tracked = []
     self.attrs_inits = []
     self.attrs_vars = []
+    self.attrs_made = []
     self.debug_info = debug_info
 
   def add_eqn(self, eqn: core.JaxprEqn):

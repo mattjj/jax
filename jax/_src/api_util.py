@@ -738,6 +738,7 @@ class _HashableByObjectId:
 
 def register_class_with_attrs(t: type) -> None:
   _class_with_attrs.add(t)
+  return t
 _class_with_attrs: set[type] = set()
 
 # TODO(mattjj): make this function faster

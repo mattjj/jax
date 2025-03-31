@@ -536,7 +536,7 @@ class AttrsTest(jtu.JaxTestCase):
     if jit:
       f = jax.jit(f)
 
-    msg = "can only append to attr x with values of trailing shape "
+    msg = "can only append to attr 'x' with values of trailing shape "
     msg += "float32" if initialized else "int32"
     with self.assertRaisesRegex(TypeError, msg):
       f(jnp.array(1, 'int32'))
@@ -556,7 +556,7 @@ class AttrsTest(jtu.JaxTestCase):
     if jit:
       f = jax.jit(f)
 
-    msg = "can only append to attr x with values of trailing shape"
+    msg = "can only append to attr 'x' with values of trailing shape"
     with self.assertRaisesRegex(TypeError, msg):
       f(1)
 

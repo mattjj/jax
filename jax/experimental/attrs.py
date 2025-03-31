@@ -21,7 +21,7 @@ from jax._src import core
 from jax._src import source_info_util
 from jax._src import api_util
 from jax._src import linear_util as lu
-from jax._src.ad_util import (Zero)
+from jax._src.ad_util import Zero
 from jax._src.api_util import flatten_fun_nokwargs
 from jax._src.interpreters import ad
 from jax._src.interpreters import partial_eval as pe
@@ -58,6 +58,14 @@ def jax_extendattr(obj: Any, attr: str, val: Array) -> None:
   with core.take_current_trace() as t:
     return t.process_extendattr(obj, attr, val)
 
+def make_appendattr(obj: Any, attr: str, elt_ty: core.ShapedArray) -> None:
+  with core.take_current_trace() as t:
+    return t.process_makeappend(obj, attr, elt_ty)
+
+def freeze_appendattr(obj: Any, attr: str):
+  with core.take_current_trace() as t:
+    return t.process_freezeattr(obj, attr)
+
 def _getattr_impl(_, obj, attr):
   return getattr(obj, attr)
 core.EvalTrace.process_getattr = _getattr_impl
@@ -75,6 +83,14 @@ def _extendattr_impl(_, obj, attr, val):
     new = jax.numpy.concatenate([cur, val])
   setattr(obj, attr, new)
 core.EvalTrace.process_extendattr = _extendattr_impl
+
+def _makeappend_impl(_, obj, attr, elt_ty):
+  pass
+core.EvalTrace.process_makeappend = _makeappend_impl
+
+def _freezeattr_impl(_, obj, attr):
+  pass
+core.EvalTrace.process_freezeattr = _freezeattr_impl
 
 def _check_append_type_agreement(_, attr, curtype, valtype):
   expected = core.mapped_aval(curtype.shape[0], 0, curtype)
@@ -121,13 +137,27 @@ pe.DynamicJaxprTrace.process_setattr = _setattr_staging
 def _extendattr_staging(trace, obj, attr, val):
   frame = trace.frame
 
-  if (obj, attr, ReadWrite) in frame.attrs_tracked:
-    raise TypeError("can't append to read/write-only attr {attr}")
+  ety = next((e for o, a, e in frame.attrs_made if o is obj and a == attr), None)
+  made_appendattr = ety is not None
 
-  first_write = (obj, attr, Append) not in frame.attrs_tracked
+  # if this is a readwrite attr, or it was frozen, error
+  if (obj, attr, ReadWrite) in frame.attrs_tracked:
+    if made_appendattr:
+      raise TypeError(f"can't append to frozen append-only attr '{attr}'")
+    raise TypeError(f"can't append to read/write-only attr '{attr}'")
+
+  # if we called make_appendattr in this scope, check type agreement
+  if made_appendattr:
+    stacked_ty = ety.update(shape=(0, *ety.shape))
+    _check_append_type_agreement(obj, attr, stacked_ty, core.typeof(val))
+
+  # if there is already a value present at the attr, check type agreement
   init_val = getattr(obj, attr, dne_sentinel)
   if init_val is not dne_sentinel:
     _check_append_type_agreement(obj, attr, core.typeof(init_val), core.typeof(val))
+
+  # on the first write, we stash a new tracer; on subsequent writes, we concat
+  first_write = (obj, attr, Append) not in frame.attrs_tracked
   if first_write:
     frame.attrs_inits.append(init_val)
     frame.attrs_tracked.append((obj, attr, Append))
@@ -139,6 +169,26 @@ def _extendattr_staging(trace, obj, attr, val):
   setattr(obj, attr, tracer)
 pe.DynamicJaxprTrace.process_extendattr = _extendattr_staging
 
+def _makeappend_staging(trace, obj, attr, elt_ty):
+  frame = trace.frame
+  frame.attrs_made.append((obj, attr, elt_ty))
+pe.DynamicJaxprTrace.process_makeappend = _makeappend_staging
+
+def _freezeattr_staging(trace, obj, attr):
+  frame = trace.frame
+
+  made_appendattr = any(o is obj and a == attr for o, a, _ in frame.attrs_made)
+  if not made_appendattr:
+    raise Exception(f"can't freeze append-only attr '{attr}' you didn't make bro")
+
+  (idx, kind), = {(i, k) for i, (o, a, k) in enumerate(frame.attrs_tracked)
+                  if obj is o and attr == a}
+  if kind is not Append:
+    if made_appendattr:
+      raise TypeError(f"can't re-freeze an already-frozen append-only attr '{attr}'")
+    raise TypeError(f"can only freeze append-only attrs, but '{attr}' is read/write")
+  frame.attrs_tracked[idx] = (obj, attr, ReadWrite)
+pe.DynamicJaxprTrace.process_freezeattr = _freezeattr_staging
 
 def jvp(f, primals, tangents, attr_tangents):
   attrs, attr_tangents = unzip2(((o, a), t) for o, a, t in attr_tangents)
