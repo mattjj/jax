@@ -117,6 +117,7 @@ def psum(x, axis_name, *, axis_index_groups=None):
   """
   if not isinstance(axis_name, (tuple, list)):
     axis_name = (axis_name,)
+  if not axis_name: return x  # TODO(parkers): find out who called me
   if any(isinstance(axis, int) for axis in axis_name) and axis_index_groups is not None:
     raise ValueError("axis_index_groups only supported for sums over just named axes")
   _validate_reduce_axis_index_groups(axis_index_groups)
@@ -160,6 +161,7 @@ def bind_psum2_p(leaves, *, axes, axis_index_groups):
     in_vma = core.get_aval(x).vma
     args_.append(pbroadcast(x, tuple(pbroadcast_names))
                  if (pbroadcast_names := axes_ - in_vma) else x)
+  if not axes: breakpoint()
   return psum2_p.bind(*args_, axes=axes, axis_index_groups=axis_index_groups)
 
 
@@ -316,6 +318,10 @@ def pbroadcast(x, axis_name, source):
   Returns:
     Array(s) with ``x`` being copied from the ``source`` index slice of ``axis_name``.
   """
+  if not isinstance(axis_name, (list, tuple)):
+    axis_name = axis_name,
+  if not axis_name:
+    return x
   return tree_util.tree_map(
       partial(pbroadcast_p.bind, axis_name=axis_name, source=source), x)
 
