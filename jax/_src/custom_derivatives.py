@@ -1628,7 +1628,7 @@ def optimize_remat_of_custom_vjp_fwd(
     prim_tree, res_tree = out_trees()
     num_res = res_tree.num_leaves
 
-    if fwd_jaxpr.effects:
+    if core.filter_named_axis_effects(fwd_jaxpr.effects):
       raise NotImplementedError(
           "remat optimization for custom_vjp does not support forward "
           f"functions with side effects, but {fwd_name} has the following "
