@@ -3220,7 +3220,7 @@ class CustomVJPTest(jtu.JaxTestCase):
         { lambda ; a:f32[1]. let
             b:f32[1] = custom_lin[
               bwd=f_bwd
-              in_zeros=[False]
+              in_zeros=(False,)
               num_res=0
               symbolic_zeros=False
             ] a

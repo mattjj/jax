@@ -287,8 +287,8 @@ class custom_jvp(Generic[ReturnValue]):
                              (*static_args, diff_args, diff_args),
                              {},
                              static_argnums=tuple(range(len(static_args))))
-      jvp = prepend_static_args(lu.wrap_init(self.jvp,
-                                             debug_info=debug_jvp), static_args)
+      jvp = prepend_static_args(lu.wrap_init(self.jvp, debug_info=debug_jvp),
+                                static_args)
     else:
       f_, dyn_args = lu.wrap_init(self.fun, debug_info=debug), args
       debug_jvp = debug_info("custom_jvp jvp", self.jvp,
@@ -732,7 +732,7 @@ class custom_vjp(Generic[ReturnValue]):
       flat_fwd, out_trees = _flatten_fwd(
           fwd_, self.nondiff_argnums, self.symbolic_zeros, debug_fun,
           debug_fwd, in_tree, out_type)
-      flat_bwd = _flatten_bwd(bwd, in_tree, in_avals, out_trees)
+      flat_bwd = _flatten_bwd(bwd, in_tree, tuple(in_avals), out_trees)
       out_flat = custom_vjp_call_p.bind(flat_fun, flat_fwd, flat_bwd,
                                         *args_flat, out_trees=out_trees,
                                         symbolic_zeros=self.symbolic_zeros)
@@ -897,7 +897,7 @@ def _filter_forwarded_inputs(outs, ins):
 @lu.transformation2
 def _flatten_bwd(f: Callable,
                  in_tree: PyTreeDef,
-                 in_avals: Sequence[core.AbstractValue],
+                 in_avals: tuple[core.AbstractValue, ...],
                  out_trees: Callable[[], tuple[PyTreeDef, PyTreeDef, list[int | None]]],
                  *args):
   out_tree, res_tree, _ = out_trees()

@@ -30,13 +30,14 @@ from jax._src.tree_util import (
     treedef_children, generate_key_paths, broadcast_prefix,
     prefix_errors, _replace_nones)
 from jax._src import linear_util as lu
-from jax._src.util import (safe_map, WrapKwArgs, Hashable, HashableFunction,
-                           Unhashable, safe_zip as zip)
+from jax._src.util import (safe_map, safe_zip, WrapKwArgs, Hashable,
+                           HashableFunction, Unhashable, unzip2)
 from jax._src import traceback_util
 
 traceback_util.register_exclusion(__file__)
 
 map = safe_map
+zip = safe_zip
 
 def _ensure_index(x: Any) -> int | tuple[int, ...]:
   """Ensure x is either an index or a tuple of indices."""
@@ -224,14 +225,15 @@ def argnums_partial(f: lu.WrappedFun, dyn_argnums: int | Sequence[int],
 
 
 def prepend_static_args(f, static_args):
-  return _prepend_static_args(f, tuple(Unhashable(arg) for arg in static_args))
+  all_leaves_, treedefs = unzip2(map(tree_flatten, static_args))
+  all_leaves = tuple(map(tuple, all_leaves_))
+  return _prepend_static_args(f, all_leaves, treedefs)
 
 
 @lu.transformation2
-def _prepend_static_args(f, static_args, *args, **kwargs):
-  static_args = tuple(arg.val for arg in static_args)
-  all_args = static_args + args
-  return f(*all_args, **kwargs)
+def _prepend_static_args(f, all_leaves, treedefs, *args, **kwargs):
+  static_args = [tree_unflatten(td, ls) for td, ls in zip(treedefs, all_leaves)]
+  return f(*static_args, *args, **kwargs)
 
 
 def _ensure_inbounds(allow_invalid: bool, num_args: int, argnums: Sequence[int]

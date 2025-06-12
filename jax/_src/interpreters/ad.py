@@ -585,7 +585,8 @@ class JVPTrace(Trace):
     with core.set_current_trace(self.parent_trace):
       tangents_out = custom_lin_p.bind(
           *res, *nz_tangents_in, num_res=res_tree.num_leaves, bwd=bwd,
-          out_avals=avals_out, symbolic_zeros=symbolic_zeros, in_zeros=in_zeros)
+          out_avals=tuple(avals_out), symbolic_zeros=symbolic_zeros,
+          in_zeros=tuple(in_zeros))
     return map(partial(maybe_jvp_tracer, self), primals_out, tangents_out)
 
   def process_custom_transpose(self, prim, call, tracers, **params):
