@@ -817,5 +817,15 @@ class MutableArrayErrorsTest(jtu.JaxTestCase):
         "only one reference to a mutable array may be passed as an argument"):
       jax.vmap(f)(x_ref, x_ref)
 
+  def test_jvp_closed_over_ref_error(self):
+    ref = core.mutable_array(0.)
+    def f(x):
+      ref[...] = x
+      return x
+    with self.assertRaisesRegex(
+        Exception, "Move the array reference"):
+      jax.jvp(f, [1.], [1.])
+
+
 if __name__ == '__main__':
   absltest.main(testLoader=jtu.JaxTestLoader())

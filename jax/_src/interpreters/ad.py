@@ -178,15 +178,15 @@ def _linearize_jaxpr(
     return LinearizeTracer(trace, primal, tangent)
 
   source_info = source_info_util.current()
+  debug_info = jaxpr.jaxpr.debug_info
   tracers = [new_arg(lin_trace, v.aval, nz, source_info)
              for (v, nz) in zip(jaxpr.jaxpr.invars, nonzeros)]
+  in_primals = [t.primal for t in tracers]
 
   with core.set_current_trace(lin_trace, check_leaks=True):
     ans = core.eval_jaxpr(jaxpr.jaxpr, jaxpr.consts, *tracers)
     out_primals, out_tangents = unzip2(map(lin_trace.to_primal_tangent_pair, ans))
-    del lin_trace, ans, new_arg
-
-  debug_info = jaxpr.jaxpr.debug_info
+    del lin_trace, ans, new_arg, tracers
 
   # pe._check_no_returned_refs(debug_info, out_tangents)
   nzs_out = [type(t) is not Zero for t in out_tangents]
@@ -197,13 +197,11 @@ def _linearize_jaxpr(
   tangent_jaxpr, tangent_consts = _dce_consts(tangent_jaxpr, tangent_consts)
   tangent_jaxpr = pe.close_jaxpr(pe.convert_constvars_jaxpr(tangent_jaxpr))
 
-  in_primals = [t.primal for t in tracers]
   fwd_inputs = (*jaxpr.consts, *in_primals)
-  id_map = {id(x):i for i, (x, allow) in enumerate(zip(fwd_inputs, allow_fwds))
-            if allow}
+  id_map = {id(x):i for i, (x,a) in enumerate(zip(fwd_inputs, allow_fwds)) if a}
   fwds = [id_map.get(id(c)) for c in tangent_consts]
   tangent_consts = [c for c, f in zip(tangent_consts, fwds) if f is None]
-  del tracers, in_primals
+  del in_primals
 
   # pe._check_no_returned_refs(debug_info, out_primals)
   primals_and_residuals = *out_primals, *tangent_consts
