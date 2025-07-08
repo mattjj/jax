@@ -1487,7 +1487,6 @@ def _to_lojax(*hi_args, jaxpr, **params):
   hi_args = [*closed_over_himutables, *hi_args]
   params = _converted_mutables_add_params(len(closed_over_himutables), **params)
 
-
   # expand pjit params that must match number of lo inputs/outputs
   lo_nums_in = [len(aval.lo_ty()) for aval in jaxpr.in_aval_qdds]
   lo_nums_out = [len(t.lo_ty()) for t in jaxpr.out_avals]
@@ -2235,9 +2234,9 @@ def _pjit_linearize(nzs, *primals_in, jaxpr, in_shardings, out_shardings,
     tangents_nz = _filter_zeros(nzs, tangents)
     nz_tangents_out = jit_p.bind(
         *residuals, *tangents_nz, jaxpr=tangent_jaxpr,
-        in_shardings=_filter_zeros(nzs, in_shardings) + res_shardings_in,
+        in_shardings=res_shardings_in + _filter_zeros(nzs, in_shardings),
         out_shardings=_filter_zeros(nzs_out, out_shardings),
-        in_layouts=_filter_zeros(nzs, in_layouts) + res_layouts_in,
+        in_layouts=res_layouts_in + _filter_zeros(nzs, in_layouts),
         out_layouts=_filter_zeros(nzs_out, out_layouts),
         donated_invars=_filter_zeros(nzs, donated_invars) + res_donated,
         ctx_mesh=ctx_mesh,
