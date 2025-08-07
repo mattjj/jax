@@ -1747,6 +1747,7 @@ def get_aval(x):
        ' jax.numpy.array(), or register your object as a pytree.'),
       stacklevel=6)
     return get_aval(x.__jax_array__())
+  breakpoint()
   raise TypeError(f"Argument '{x}' of type '{typ}' is not a valid JAX type")
 
 typeof = get_aval
@@ -2525,6 +2526,7 @@ class ArrayRef:
   committed = _committed = property(lambda self: self._buf._committed)
   def __getitem__(self, idx): return self._aval._getitem(self, idx)
   def __setitem__(self, idx, x): return self._aval._setitem(self, idx, x)
+  def addupdate(self, x, idx=()): self._aval._addupdate(self, idx, x)
   def __repr__(self) -> str: return 'ArrayRef' + repr(self._buf)[5:]
   def __len__(self) -> int: return self._aval._len(self)
   def unsafe_buffer_pointer(self): return self._buf.unsafe_buffer_pointer()

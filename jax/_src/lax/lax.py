@@ -4573,17 +4573,30 @@ def _add_jvp(primals, tangents):
   else:
     return primal_out, add(xdot, ydot)
 
+def _aval_from_input(x):
+  if ad.is_undefined_primal(x):
+    return x.aval
+  a = core.typeof(x)
+  if isinstance(a, state.AbstractRef):
+    return a.inner_aval
+  else:
+    return a
+
 def _add_transpose(t, x, y):
   # Morally the following assertion is true, but because we instantiate zeros in
   # some places (e.g. in custom_jvp) it may not always hold. For example, see
   # api_test.py's CustomJVPTest.test_jaxpr_zeros.
   # assert ad.is_undefined_primal(x) and ad.is_undefined_primal(y)
-  x_aval = x.aval if ad.is_undefined_primal(x) else core.get_aval(x)
-  y_aval = y.aval if ad.is_undefined_primal(y) else core.get_aval(y)
+  x_aval = _aval_from_input(x)
+  y_aval = _aval_from_input(y)
+  handle = lambda val, out: (val if ad.is_undefined_primal(out)
+                             else out.addupdate(ad.instantiate_zeros(val)))
   if type(t) is ad_util.Zero:
-    return [ad_util.Zero(x_aval), ad_util.Zero(y_aval)]
+    return [handle(ad_util.Zero(x_aval), x),
+            handle(ad_util.Zero(y_aval), y)]
   else:
-    return [_unbroadcast(x_aval, t), _unbroadcast(y_aval, t)]
+    return [handle(_unbroadcast(x_aval, t), x),
+            handle(_unbroadcast(y_aval, t), y)]
 
 def _add_unreduced(out_sharding, x, y):
   x_ur, y_ur = x.sharding.spec.unreduced, y.sharding.spec.unreduced
@@ -4646,17 +4659,20 @@ batching.ragged_prop_rules[sub_p] = batching.ragged_mask_elementwise_rule
 
 
 def _mul_transpose(ct, x, y):
-  assert ad.is_undefined_primal(x) ^ ad.is_undefined_primal(y)
-  if ad.is_undefined_primal(x):
+  # assert ad.is_undefined_primal(x) ^ ad.is_undefined_primal(y)
+  x_aval, y_aval = _aval_from_input(x), _aval_from_input(y)
+  handle = lambda val, out: (val if ad.is_undefined_primal(out)
+                             else out.addupdate(ad.instantiate_zeros(val)))
+  if ad.is_undefined_primal(x) or isinstance(core.typeof(x), state.AbstractRef):
     if type(ct) is ad_util.Zero:
-      return [ad_util.Zero(x.aval), None]
+      return [handle(ad_util.Zero(x_aval), x), None]
     else:
-      return [_unbroadcast(x.aval, mul(ct, y)), None]
+      return [handle(_unbroadcast(x_aval, mul(ct, y)), x), None]
   else:
     if type(ct) is ad_util.Zero:
-      return [None, ad_util.Zero(y.aval)]
+      return [None, handle(ad_util.Zero(y_aval), y)]
     else:
-      return [None, _unbroadcast(y.aval, mul(x, ct))]
+      return [None, handle(_unbroadcast(y_aval, mul(x, ct)), y)]
 
 mul_p = standard_naryop([_num, _num], 'mul')
 ad.defjvp(mul_p,

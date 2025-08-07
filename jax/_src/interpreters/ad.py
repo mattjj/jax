@@ -330,6 +330,7 @@ def backward_pass(jaxpr: core.Jaxpr, transform_stack,
     return map(lambda v: Zero(v.aval), jaxpr.invars)
 
   def write_cotangent(prim, v, ct):
+    if type(ct) is list: breakpoint()
     # assert v not in primal_env
     assert ct is not Zero, (prim, v.aval)  # check for an old harmless type error
     if ct is None or type(v) is Literal:
@@ -376,11 +377,16 @@ def backward_pass(jaxpr: core.Jaxpr, transform_stack,
   # linearization rules that include computations on the residuals.
   lin_eqns = []
   dangling_refs = set()
+  accum_vars = set()
   for eqn in jaxpr.eqns:
     if eqn.primitive is core.mutable_array_p:
       dangling_refs.add(eqn.outvars[0])
     if eqn.primitive is core.freeze_p:
       dangling_refs.remove(eqn.invars[0])  # type: ignore
+    if str(eqn.primitive) == 'grad_ref':
+      accum_vars.add(eqn.outvars[0])
+      lin_eqns.append(eqn)
+      continue
     # TODO(dfm): The effects check is probably stricter than necessary.
     # Consider adding an allowlist of effects here.
     if jaxpr.effects or any(needs_ct(x) for x in eqn.invars):
@@ -399,6 +405,8 @@ def backward_pass(jaxpr: core.Jaxpr, transform_stack,
 
   for v in dangling_refs:
     write_primal(v, core.mutable_array(zeros_like_aval(v.aval.inner_aval)))  # type: ignore
+  for v in accum_vars:
+    write_primal(v, core.mutable_array(zeros_like_aval(v.aval)))  # type: ignore
 
   ct_env: dict[Any, Any] = {}
   ctx = (source_info_util.transform_name_stack('transpose') if transform_stack
@@ -418,6 +426,11 @@ def backward_pass(jaxpr: core.Jaxpr, transform_stack,
           ref_var, = eqn.invars   # type: ignore
           ct_in = instantiate_zeros(read_cotangent(val_var))
           write_primal(ref_var, core.mutable_array(ct_in))
+        elif str(eqn.primitive) == 'grad_ref':
+          val_var, = eqn.invars
+          ref_var, = eqn.outvars
+          ct_out = core.freeze(read_primal(ref_var))
+          write_cotangent(eqn.primitive, val_var, ct_out)
         continue
 
       invals = map(read_primal, eqn.invars)
