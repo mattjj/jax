@@ -46,6 +46,8 @@ zip = safe_zip
 map = safe_map
 def identity(x): return x
 
+Array = Any
+
 def _update_annotation(
     f: lu.WrappedFun,
     orig_type: tuple[tuple[core.AbstractValue, bool], ...] | None,
@@ -322,6 +324,58 @@ def vjp(traceable: lu.WrappedFun, primals, has_aux=False):
   else:
     return out_primals, vjp_, aux
 
+
+class GradAccum:
+  aval: core.AbstractValue
+
+  def accum(self, x) -> None:
+    assert False
+  def freeze(self) -> Array | Zero:
+    assert False
+
+class RefAccum(GradAccum):
+  aval: core.AbstractValue
+  ref: state.AbstractRef | None
+
+  def __init__(self, aval):
+    self.aval = core.typeof(ref).inner_aval
+    self.ref = None
+
+  def accum(self, x):
+    if isinstance(x, Zero):
+      return
+    elif self.ref is None:
+      self.ref = core.array_ref(x)
+    else:
+      self.ref.addupdate(x)
+
+  def freeze(self):
+    if self.ref is None:
+      return Zero(self.aval)
+    else:
+      return core.freeze(self.ref)
+
+class ValueAccum(GradAccum):
+  aval: core.AbstractValue
+  val: Array | Zero
+
+  def __init__(self, aval):
+    self.aval = aval
+    self.val = Zero(aval)
+
+  def accum(self, x):
+    self.val = add_tangents(self.val, x)
+
+  def freeze(self):
+    return self.val
+
+class NullAccum(GradAccum):
+  aval: core.AbstractValue
+  def __init__(self, aval): self.aval = aval
+  def accum(self, x): return
+  def freeze(self): assert False
+
+
 # NOTE: The FIXMEs below are caused by primal/tangent mixups (type
 # errors if you will)
 def backward_pass(jaxpr: core.Jaxpr, transform_stack,
@@ -329,22 +383,22 @@ def backward_pass(jaxpr: core.Jaxpr, transform_stack,
   if all(type(ct) is Zero for ct in cotangents_in) and not jaxpr.effects:
     return map(lambda v: Zero(v.aval), jaxpr.invars)
 
-  def write_cotangent(prim, v, ct):
+  def write_cotangent(v, ct):
     if type(ct) is list: breakpoint()
     # assert v not in primal_env
-    assert ct is not Zero, (prim, v.aval)  # check for an old harmless type error
+    assert ct is not Zero, v.aval  # check for an old harmless type error
     if ct is None or type(v) is Literal:
       return
     if type(ct) is Zero:
       # FIXME: This triggers a lot of failures!
-      # assert v.aval == ct.aval, (prim, v.aval, ct.aval)
+      # assert v.aval == ct.aval, (v.aval, ct.aval)
       return
     ct_env[v] = add_tangents(ct_env[v], ct) if v in ct_env else ct
     # TODO(mattjj): add back these checks for dynamic shapes
     # if config.enable_checks.value:
     #   ct_aval = core.get_aval(ct_env[v])
     #   joined_aval = core.lattice_join(v.aval, ct_aval).strip_weak_type()
-    #   assert v.aval.strip_weak_type() == joined_aval, (prim, v.aval, ct_aval)
+    #   assert v.aval.strip_weak_type() == joined_aval, (v.aval, ct_aval)
 
   def read_cotangent(v):
     return ct_env.pop(v, Zero(v.aval.to_tangent_aval()))
@@ -412,7 +466,7 @@ def backward_pass(jaxpr: core.Jaxpr, transform_stack,
   ctx = (source_info_util.transform_name_stack('transpose') if transform_stack
          else contextlib.nullcontext())
   with ctx:
-    foreach(partial(write_cotangent, 'outvars'), jaxpr.outvars, cotangents_in)
+    foreach(write_cotangent, jaxpr.outvars, cotangents_in)
     for eqn in lin_eqns[::-1]:
       if eqn.primitive.ref_primitive:
         if eqn.primitive is core.mutable_array_p:
@@ -420,7 +474,7 @@ def backward_pass(jaxpr: core.Jaxpr, transform_stack,
           ref_var, = eqn.outvars
           ref = read_primal(ref_var)
           ct_out = core.freeze(ref)
-          write_cotangent(eqn.primitive, val_var, ct_out)
+          write_cotangent(val_var, ct_out)
         elif eqn.primitive is core.freeze_p:
           val_var, = eqn.outvars
           ref_var, = eqn.invars   # type: ignore
@@ -430,7 +484,7 @@ def backward_pass(jaxpr: core.Jaxpr, transform_stack,
           val_var, = eqn.invars
           ref_var, = eqn.outvars
           ct_out = core.freeze(read_primal(ref_var))
-          write_cotangent(eqn.primitive, val_var, ct_out)
+          write_cotangent(val_var, ct_out)
         continue
 
       invals = map(read_primal, eqn.invars)
@@ -465,7 +519,7 @@ def backward_pass(jaxpr: core.Jaxpr, transform_stack,
             raise e from None
         cts_out = [Zero(v.aval) for v in eqn.invars] if cts_out is Zero else cts_out
         # FIXME: Some invars correspond to primals!
-        foreach(partial(write_cotangent, eqn.primitive), eqn.invars, cts_out)
+        foreach(write_cotangent, eqn.invars, cts_out)
 
   cotangents_out = map(read_cotangent, jaxpr.invars)
   return cotangents_out
@@ -475,6 +529,83 @@ def closed_backward_pass(jaxpr: core.ClosedJaxpr, transform_stack,
   return backward_pass(jaxpr.jaxpr, transform_stack, jaxpr.consts,
                        primals_in, cotangents_in)
 
+def backward_pass2(
+    jaxpr: core.Jaxpr, transform_stack: bool, consts: list[Array],
+    primals_in: list[Array | GradAccum], cotangents_in: list[Array],
+) -> None:
+  if all(type(ct) is Zero for ct in cotangents_in) and not jaxpr.effects:
+    return
+
+  env: dict = dict(zip((*jaxpr.constvars, *jaxpr.invars),
+                       (*consts, *primals_in)))
+
+  def read(x: core.Atom) -> Array | GradAccum:
+    return x.val if isinstance(x, Literal) else env[x]
+
+  lin_eqns = []
+  dangling_refs = set()
+  for eqn in jaxpr.eqns:
+    if eqn.primitive.ref_primitive:
+      if eqn.primitive is core.mutable_array_p:
+        dangling_refs.add(eqn.outvars[0])
+      elif eqn.primitive is core.freeze_p:
+        dangling_refs.remove(eqn.invars[0])  # type: ignore
+      elif eqn.primitive is core.accum_in_ref_p:
+        env[v] = RefAccum(eqn.outvars[0].aval)
+        lin_eqns.append(eqn)
+      else:
+        assert False
+    elif any(isinstance(read(x), GradAccum) for x in eqn.invars):
+      for v in eqn.outvars:
+        env[v] = ValueAccum(v.aval)
+      lin_eqns.append(eqn)
+    else:
+      subfuns, params = eqn.primitive.get_bind_params(eqn.params)
+      name_stack = source_info_util.current_name_stack() + eqn.source_info.name_stack
+      ctx = source_info_util.user_context(eqn.source_info.traceback, name_stack=name_stack)
+      with eqn.ctx.manager, ctx:
+        ans = eqn.primitive.bind(*subfuns, *map(read, eqn.invars), **params)
+      if eqn.primitive.multiple_results:
+        foreach(env.setdefault, eqn.outvars, ans)
+      else:
+        env[eqn.outvars[0]] = ans
+
+  for v in dangling_refs:
+    env[v] = RefAccum(v.aval.inner_aval)
+
+  ctx = (source_info_util.transform_name_stack('transpose') if transform_stack
+         else contextlib.nullcontext())
+  for v, ct in zip(jaxpr.outvars, cotangents_in):
+    read(v).accum(ct)
+  with ctx:
+    for eqn in lin_eqns[::-1]:
+      if eqn.primitive.ref_primitive:
+        # TODO this can be ordinary transpose rules (?)
+        read(eqn.invars[0]).accum(read(eqn.outvars[0]).freeze())
+      else:
+        cts_in = [env.pop(v).freeze() for v in eqn.outvars]
+        if not eqn.primitive.multiple_results:
+          cts_in, = cts_in
+        if eqn.primitive in fancy_transposes:
+          rule = fancy_transposes[eqn.primitive]
+          rule(cts_in, *map(read, eqn.invars), **eqn.params)
+        else:
+          rule = get_primitive_transpose(eqn.primitive)
+          primals = map(read, eqn.invars)
+          up = lambda x: UndefinedPrimal(x.aval) if isinstance(x,GradAccum) else x
+          cts_out = rule(cts_in, *map(up, primals), **eqn.params)
+          for x, ct in zip(primals, cts_out):
+            if isinstance(x, GradAccum):
+              x.accum(ct)
+
+def backward_pass(jaxpr, transform_stack, consts, primals_in, cotangents_in):
+  primals_in_ = [ValueAccum(x.aval) if isinstance(x, UndefinedPrimal) else
+                 RefAccum(a.inner_aval) if isinstance(a := core.typeof(x), AbstractRef) else
+                 x for x in primals_in]
+  backward_pass2(jaxpr, transform_stack, consts, primals_in_, cotangents_in)
+  return [x.freeze() if isinstance(x, GradAccum) else None for x in primals_in_]
+
+fancy_transposes = {}
 
 class UndefinedPrimal:
   __slots__ = ['aval']
@@ -1207,7 +1338,7 @@ def map_transpose(primitive: core.Primitive, params,
     print("Invalid nan value encountered in the backward pass of a jax.jit "
           "function. Calling the de-optimized backward pass.")
     try:
-      _ = backward_pass(call_jaxpr, None, {}, args, ct)
+      _ = backward_pass(call_jaxpr, False, {}, args, ct)
     except (FloatingPointError, ZeroDivisionError) as e2:
       raise e2 from None
     else:
