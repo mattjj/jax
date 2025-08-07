@@ -927,11 +927,11 @@ def _scan_transpose(cts, *args, reverse, length, num_consts,
   # 'tangent values' are not (since we actually put cotangent refs there).
   assert not any(ad.is_undefined_primal(r) for r in ires)
   assert not any(ad.is_undefined_primal(x) for x in mut_consts_bar)
-  assert     all(ad.is_undefined_primal(x) for x in immut_consts_dot)
-  # TODO(mattjj): enable this assertion... zeros?
+  # TODO(mattjj): these assertions fail due to zeros
+  # assert     all(ad.is_undefined_primal(x) for x in immut_consts_dot)
   # assert     all(ad.is_undefined_primal(x) for x in carry_dot)
+  # assert     all(ad.is_undefined_primal(x) for x in immut_xs_dot)
   assert not any(ad.is_undefined_primal(r) for r in mut_xs_bar)
-  assert     all(ad.is_undefined_primal(x) for x in immut_xs_dot)
   assert not any(ad.is_undefined_primal(r) for r in eres)
   del args
 
