@@ -366,6 +366,11 @@ def backward_pass(jaxpr: core.Jaxpr, transform_stack,
   foreach(write_primal, jaxpr.constvars, consts)
   foreach(write_primal, jaxpr.invars, primals_in)
 
+  def needs_ct(v):
+    if type(v) is Literal: return False
+    x = primal_env.get(v)
+    return x is None or isinstance(core.typeof(x), AbstractRef)
+
   # Start with a forward pass to evaluate any side-effect-free JaxprEqns that
   # only operate on primals. This is required to support primitives with
   # linearization rules that include computations on the residuals.
@@ -376,10 +381,9 @@ def backward_pass(jaxpr: core.Jaxpr, transform_stack,
       dangling_refs.add(eqn.outvars[0])
     if eqn.primitive is core.freeze_p:
       dangling_refs.remove(eqn.invars[0])  # type: ignore
-    # TODO (dfm): The effects check is probably stricter than necessary.
+    # TODO(dfm): The effects check is probably stricter than necessary.
     # Consider adding an allowlist of effects here.
-    if jaxpr.effects or any(
-        type(x) is not Literal and x not in primal_env for x in eqn.invars):
+    if jaxpr.effects or any(needs_ct(x) for x in eqn.invars):
       lin_eqns.append(eqn)
       continue
     subfuns, bind_params = eqn.primitive.get_bind_params(eqn.params)
@@ -1067,7 +1071,7 @@ def defbilinear(prim, lhs_rule, rhs_rule):
   primitive_transposes[prim] = partial(bilinear_transpose, lhs_rule, rhs_rule)
 
 def bilinear_transpose(lhs_rule, rhs_rule, cotangent, x, y, **kwargs):
-  assert is_undefined_primal(x) ^ is_undefined_primal(y)
+  # assert is_undefined_primal(x) ^ is_undefined_primal(y)
   if type(cotangent) is Zero:
     return Zero
   if is_undefined_primal(x):

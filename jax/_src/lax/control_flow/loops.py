@@ -913,11 +913,13 @@ def _scan_transpose(cts, *args, reverse, length, num_consts,
       args, [num_ires, num_consts - num_ires, num_carry, sum(xs_lin)])
   _, const_avals, _, xs_avals, _ = split_list(
       jaxpr.in_avals, [num_ires, num_consts - num_ires, num_carry, sum(xs_lin)])
-  is_mutable = [isinstance(a, AbstractRef) for a in const_avals]
+  is_mutable = [not ad.is_undefined_primal(x) and
+                isinstance(core.typeof(x), AbstractRef) for x in consts_dot]
   immut_consts_dot, mut_consts_bar = partition_list(is_mutable, consts_dot)
   jaxpr = _rearrange_mutable_binders(jaxpr, num_ires, num_consts - num_ires)
   del const_avals, consts_dot
-  is_mutable_ = [isinstance(a, AbstractRef) for a in xs_avals]
+  is_mutable_ = [not ad.is_undefined_primal(x) and
+                 isinstance(core.typeof(x), AbstractRef) for x in xs_dot]
   immut_xs_dot, mut_xs_bar = partition_list(is_mutable_, xs_dot)
   jaxpr = _rearrange_mutable_binders(jaxpr, num_consts + num_carry, sum(xs_lin))
   del xs_avals, xs_dot
@@ -925,10 +927,11 @@ def _scan_transpose(cts, *args, reverse, length, num_consts,
   # 'tangent values' are not (since we actually put cotangent refs there).
   assert not any(ad.is_undefined_primal(r) for r in ires)
   assert not any(ad.is_undefined_primal(x) for x in mut_consts_bar)
-  # TODO(mattjj): re-enable these asserts
-  # assert     all(ad.is_undefined_primal(x) for x in immut_consts_dot)
+  assert     all(ad.is_undefined_primal(x) for x in immut_consts_dot)
+  # TODO(mattjj): enable this assertion... zeros?
   # assert     all(ad.is_undefined_primal(x) for x in carry_dot)
-  # assert     all(ad.is_undefined_primal(x) for x in immut_xs_dot)
+  assert not any(ad.is_undefined_primal(r) for r in mut_xs_bar)
+  assert     all(ad.is_undefined_primal(x) for x in immut_xs_dot)
   assert not any(ad.is_undefined_primal(r) for r in eres)
   del args
 
@@ -1076,6 +1079,8 @@ def _transpose_scan_jaxpr(
 
   ires_avals, d_mut_avals, d_pure_avals, c_avals, a_mut_avals, a_pure_avals, eres_avals = split_list(
       jaxpr.in_avals, [num_ires, num_d_mut, num_d_pure, num_c, num_a_mut, num_a_pure])
+  refify = lambda a: AbstractRef(a) if not isinstance(a, AbstractRef) else a
+  d_mut_avals, a_mut_avals = _map(refify, d_mut_avals), _map(refify, a_mut_avals)
   _, b_avals = split_list(jaxpr.out_avals, [num_c])
   b_avals_nz = [a for a, z in zip(b_avals, ct_b_is_zeros) if not z]
 

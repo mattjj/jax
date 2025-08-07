@@ -5410,7 +5410,9 @@ def _dot_general_transpose_rhs(g, x, y, *, dimension_numbers, precision,
     swap_ans=True)
   if y_bar.dtype != y.aval.dtype:
     y_bar = _convert_element_type(y_bar, y.aval.dtype, y.aval.weak_type)
-  return y_bar
+  assert isinstance(y, ad.UndefinedPrimal) ^ (not isinstance(y, ad.UndefinedPrimal) and
+                                              isinstance(core.typeof(y), state.AbstractRef))
+  return y_bar if isinstance(y, ad.UndefinedPrimal) else y.addupdate(y_bar)
 
 
 def _dot_batch_rule(
