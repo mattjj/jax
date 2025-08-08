@@ -337,9 +337,9 @@ class RefAccum(GradAccum):
   aval: core.AbstractValue
   ref: state.AbstractRef | None
 
-  def __init__(self, aval):
-    self.aval = core.typeof(ref).inner_aval
-    self.ref = None
+  def __init__(self, aval, ref=None):
+    self.aval = aval
+    self.ref = ref
 
   def accum(self, x):
     if isinstance(x, Zero):
@@ -355,174 +355,181 @@ class RefAccum(GradAccum):
     else:
       return core.freeze(self.ref)
 
-class ValueAccum(GradAccum):
+  def inst(self):
+    if self.ref is None:
+      self.ref = core.array_ref(zeros_like_aval(self.aval))
+register_pytree_node(RefAccum, lambda r: ([r.ref], r.aval), lambda a, r: RefAccum(a, r[0]))
+
+class ValAccum(GradAccum):
   aval: core.AbstractValue
   val: Array | Zero
 
-  def __init__(self, aval):
+  def __init__(self, aval, val=None):
     self.aval = aval
-    self.val = Zero(aval)
+    self.val = Zero(aval) if val is None else val
 
   def accum(self, x):
     self.val = add_tangents(self.val, x)
 
   def freeze(self):
     return self.val
+register_pytree_node(ValAccum, lambda v: ([v.val], v.aval), lambda a, v: ValAccum(a, v[0]))
 
 class NullAccum(GradAccum):
   aval: core.AbstractValue
   def __init__(self, aval): self.aval = aval
   def accum(self, x): return
   def freeze(self): assert False
+register_pytree_node(NullAccum, lambda v: ((), v.aval), lambda a, _: NullAccum(a))
 
 
-# NOTE: The FIXMEs below are caused by primal/tangent mixups (type
-# errors if you will)
-def backward_pass(jaxpr: core.Jaxpr, transform_stack,
-                  consts, primals_in, cotangents_in):
-  if all(type(ct) is Zero for ct in cotangents_in) and not jaxpr.effects:
-    return map(lambda v: Zero(v.aval), jaxpr.invars)
+# # NOTE: The FIXMEs below are caused by primal/tangent mixups (type
+# # errors if you will)
+# def backward_pass(jaxpr: core.Jaxpr, transform_stack,
+#                   consts, primals_in, cotangents_in):
+#   if all(type(ct) is Zero for ct in cotangents_in) and not jaxpr.effects:
+#     return map(lambda v: Zero(v.aval), jaxpr.invars)
 
-  def write_cotangent(v, ct):
-    if type(ct) is list: breakpoint()
-    # assert v not in primal_env
-    assert ct is not Zero, v.aval  # check for an old harmless type error
-    if ct is None or type(v) is Literal:
-      return
-    if type(ct) is Zero:
-      # FIXME: This triggers a lot of failures!
-      # assert v.aval == ct.aval, (v.aval, ct.aval)
-      return
-    ct_env[v] = add_tangents(ct_env[v], ct) if v in ct_env else ct
-    # TODO(mattjj): add back these checks for dynamic shapes
-    # if config.enable_checks.value:
-    #   ct_aval = core.get_aval(ct_env[v])
-    #   joined_aval = core.lattice_join(v.aval, ct_aval).strip_weak_type()
-    #   assert v.aval.strip_weak_type() == joined_aval, (v.aval, ct_aval)
+#   def write_cotangent(v, ct):
+#     if type(ct) is list: breakpoint()
+#     # assert v not in primal_env
+#     assert ct is not Zero, v.aval  # check for an old harmless type error
+#     if ct is None or type(v) is Literal:
+#       return
+#     if type(ct) is Zero:
+#       # FIXME: This triggers a lot of failures!
+#       # assert v.aval == ct.aval, (v.aval, ct.aval)
+#       return
+#     ct_env[v] = add_tangents(ct_env[v], ct) if v in ct_env else ct
+#     # TODO(mattjj): add back these checks for dynamic shapes
+#     # if config.enable_checks.value:
+#     #   ct_aval = core.get_aval(ct_env[v])
+#     #   joined_aval = core.lattice_join(v.aval, ct_aval).strip_weak_type()
+#     #   assert v.aval.strip_weak_type() == joined_aval, (v.aval, ct_aval)
 
-  def read_cotangent(v):
-    return ct_env.pop(v, Zero(v.aval.to_tangent_aval()))
+#   def read_cotangent(v):
+#     return ct_env.pop(v, Zero(v.aval.to_tangent_aval()))
 
-  def read_primal(v):
-    if type(v) is Literal:
-      return v.val
-    else:
-      a = v.aval
-      if type(a) is core.DShapedArray:
-        shape = [primal_env[d] if type(d) is core.Var else d for d in a.shape]
-        a = a.update(shape=tuple(shape))
-      return primal_env.get(v, UndefinedPrimal(a))
+#   def read_primal(v):
+#     if type(v) is Literal:
+#       return v.val
+#     else:
+#       a = v.aval
+#       if type(a) is core.DShapedArray:
+#         shape = [primal_env[d] if type(d) is core.Var else d for d in a.shape]
+#         a = a.update(shape=tuple(shape))
+#       return primal_env.get(v, UndefinedPrimal(a))
 
-  def write_primal(v, val):
-    if not is_undefined_primal(val):
-      primal_env[v] = val
+#   def write_primal(v, val):
+#     if not is_undefined_primal(val):
+#       primal_env[v] = val
 
-  primal_env: dict[Any, Any] = {}
-  foreach(write_primal, jaxpr.constvars, consts)
-  foreach(write_primal, jaxpr.invars, primals_in)
+#   primal_env: dict[Any, Any] = {}
+#   foreach(write_primal, jaxpr.constvars, consts)
+#   foreach(write_primal, jaxpr.invars, primals_in)
 
-  def needs_ct(v):
-    if type(v) is Literal: return False
-    x = primal_env.get(v)
-    return x is None or isinstance(core.typeof(x), AbstractRef)
+#   def needs_ct(v):
+#     if type(v) is Literal: return False
+#     x = primal_env.get(v)
+#     return x is None or isinstance(core.typeof(x), AbstractRef)
 
-  # Start with a forward pass to evaluate any side-effect-free JaxprEqns that
-  # only operate on primals. This is required to support primitives with
-  # linearization rules that include computations on the residuals.
-  lin_eqns = []
-  dangling_refs = set()
-  accum_vars = set()
-  for eqn in jaxpr.eqns:
-    if eqn.primitive is core.mutable_array_p:
-      dangling_refs.add(eqn.outvars[0])
-    if eqn.primitive is core.freeze_p:
-      dangling_refs.remove(eqn.invars[0])  # type: ignore
-    if str(eqn.primitive) == 'grad_ref':
-      accum_vars.add(eqn.outvars[0])
-      lin_eqns.append(eqn)
-      continue
-    # TODO(dfm): The effects check is probably stricter than necessary.
-    # Consider adding an allowlist of effects here.
-    if jaxpr.effects or any(needs_ct(x) for x in eqn.invars):
-      lin_eqns.append(eqn)
-      continue
-    subfuns, bind_params = eqn.primitive.get_bind_params(eqn.params)
-    name_stack = source_info_util.current_name_stack() + eqn.source_info.name_stack
-    traceback = eqn.source_info.traceback
-    with source_info_util.user_context(
-        traceback, name_stack=name_stack), eqn.ctx.manager:
-      ans = eqn.primitive.bind(*subfuns, *map(read_primal, eqn.invars), **bind_params)
-    if eqn.primitive.multiple_results:
-      foreach(write_primal, eqn.outvars, ans)
-    else:
-      write_primal(eqn.outvars[0], ans)
+#   # Start with a forward pass to evaluate any side-effect-free JaxprEqns that
+#   # only operate on primals. This is required to support primitives with
+#   # linearization rules that include computations on the residuals.
+#   lin_eqns = []
+#   dangling_refs = set()
+#   accum_vars = set()
+#   for eqn in jaxpr.eqns:
+#     if eqn.primitive is core.mutable_array_p:
+#       dangling_refs.add(eqn.outvars[0])
+#     if eqn.primitive is core.freeze_p:
+#       dangling_refs.remove(eqn.invars[0])  # type: ignore
+#     if str(eqn.primitive) == 'grad_ref':
+#       accum_vars.add(eqn.outvars[0])
+#       lin_eqns.append(eqn)
+#       continue
+#     # TODO(dfm): The effects check is probably stricter than necessary.
+#     # Consider adding an allowlist of effects here.
+#     if jaxpr.effects or any(needs_ct(x) for x in eqn.invars):
+#       lin_eqns.append(eqn)
+#       continue
+#     subfuns, bind_params = eqn.primitive.get_bind_params(eqn.params)
+#     name_stack = source_info_util.current_name_stack() + eqn.source_info.name_stack
+#     traceback = eqn.source_info.traceback
+#     with source_info_util.user_context(
+#         traceback, name_stack=name_stack), eqn.ctx.manager:
+#       ans = eqn.primitive.bind(*subfuns, *map(read_primal, eqn.invars), **bind_params)
+#     if eqn.primitive.multiple_results:
+#       foreach(write_primal, eqn.outvars, ans)
+#     else:
+#       write_primal(eqn.outvars[0], ans)
 
-  for v in dangling_refs:
-    write_primal(v, core.mutable_array(zeros_like_aval(v.aval.inner_aval)))  # type: ignore
-  for v in accum_vars:
-    write_primal(v, core.mutable_array(zeros_like_aval(v.aval)))  # type: ignore
+#   for v in dangling_refs:
+#     write_primal(v, core.mutable_array(zeros_like_aval(v.aval.inner_aval)))  # type: ignore
+#   for v in accum_vars:
+#     write_primal(v, core.mutable_array(zeros_like_aval(v.aval)))  # type: ignore
 
-  ct_env: dict[Any, Any] = {}
-  ctx = (source_info_util.transform_name_stack('transpose') if transform_stack
-         else contextlib.nullcontext())
-  with ctx:
-    foreach(write_cotangent, jaxpr.outvars, cotangents_in)
-    for eqn in lin_eqns[::-1]:
-      if eqn.primitive.ref_primitive:
-        if eqn.primitive is core.mutable_array_p:
-          val_var, = eqn.invars
-          ref_var, = eqn.outvars
-          ref = read_primal(ref_var)
-          ct_out = core.freeze(ref)
-          write_cotangent(val_var, ct_out)
-        elif eqn.primitive is core.freeze_p:
-          val_var, = eqn.outvars
-          ref_var, = eqn.invars   # type: ignore
-          ct_in = instantiate_zeros(read_cotangent(val_var))
-          write_primal(ref_var, core.mutable_array(ct_in))
-        elif str(eqn.primitive) == 'grad_ref':
-          val_var, = eqn.invars
-          ref_var, = eqn.outvars
-          ct_out = core.freeze(read_primal(ref_var))
-          write_cotangent(val_var, ct_out)
-        continue
+#   ct_env: dict[Any, Any] = {}
+#   ctx = (source_info_util.transform_name_stack('transpose') if transform_stack
+#          else contextlib.nullcontext())
+#   with ctx:
+#     foreach(write_cotangent, jaxpr.outvars, cotangents_in)
+#     for eqn in lin_eqns[::-1]:
+#       if eqn.primitive.ref_primitive:
+#         if eqn.primitive is core.mutable_array_p:
+#           val_var, = eqn.invars
+#           ref_var, = eqn.outvars
+#           ref = read_primal(ref_var)
+#           ct_out = core.freeze(ref)
+#           write_cotangent(val_var, ct_out)
+#         elif eqn.primitive is core.freeze_p:
+#           val_var, = eqn.outvars
+#           ref_var, = eqn.invars   # type: ignore
+#           ct_in = instantiate_zeros(read_cotangent(val_var))
+#           write_primal(ref_var, core.mutable_array(ct_in))
+#         elif str(eqn.primitive) == 'grad_ref':
+#           val_var, = eqn.invars
+#           ref_var, = eqn.outvars
+#           ct_out = core.freeze(read_primal(ref_var))
+#           write_cotangent(val_var, ct_out)
+#         continue
 
-      invals = map(read_primal, eqn.invars)
-      if eqn.primitive.multiple_results:
-        cts_in = map(read_cotangent, eqn.outvars)
-      else:
-        cts_in, = map(read_cotangent, eqn.outvars)
-      name_stack = source_info_util.current_name_stack() + eqn.source_info.name_stack
-      with source_info_util.user_context(
-          eqn.source_info.traceback, name_stack=name_stack), eqn.ctx.manager:
-        if eqn.primitive.call_primitive or eqn.primitive.map_primitive:
-          cts_in_avals = [v.aval for v in eqn.outvars]
-          params = dict(eqn.params)
-          call_jaxpr = params.pop('call_jaxpr')
-          cts_out = get_primitive_transpose(eqn.primitive)(
-              params, call_jaxpr, invals, cts_in, cts_in_avals)
-        else:
-          try:
-            cts_out = get_primitive_transpose(eqn.primitive)(
-                cts_in, *invals, **eqn.params)
-          except core.ShardingTypeError as e:
-            extra_msg = ("This is a potential JAX bug. Please file an issue at"
-                         " https://github.com/jax-ml/jax/issues")
-            if extra_msg in str(e):
-              raise
-            raise core.ShardingTypeError(f"{str(e)}\n{extra_msg}")
-          except (FloatingPointError, ZeroDivisionError) as e:
-            msg = "When differentiating the code at the top of the callstack:"
-            if msg not in e.args[0]:
-              e.args = e.args[0] + f'\n{msg}',
-            e.args = e.args[0] + f'\n{source_info_util.summarize(eqn.source_info)}',
-            raise e from None
-        cts_out = [Zero(v.aval) for v in eqn.invars] if cts_out is Zero else cts_out
-        # FIXME: Some invars correspond to primals!
-        foreach(write_cotangent, eqn.invars, cts_out)
+#       invals = map(read_primal, eqn.invars)
+#       if eqn.primitive.multiple_results:
+#         cts_in = map(read_cotangent, eqn.outvars)
+#       else:
+#         cts_in, = map(read_cotangent, eqn.outvars)
+#       name_stack = source_info_util.current_name_stack() + eqn.source_info.name_stack
+#       with source_info_util.user_context(
+#           eqn.source_info.traceback, name_stack=name_stack), eqn.ctx.manager:
+#         if eqn.primitive.call_primitive or eqn.primitive.map_primitive:
+#           cts_in_avals = [v.aval for v in eqn.outvars]
+#           params = dict(eqn.params)
+#           call_jaxpr = params.pop('call_jaxpr')
+#           cts_out = get_primitive_transpose(eqn.primitive)(
+#               params, call_jaxpr, invals, cts_in, cts_in_avals)
+#         else:
+#           try:
+#             cts_out = get_primitive_transpose(eqn.primitive)(
+#                 cts_in, *invals, **eqn.params)
+#           except core.ShardingTypeError as e:
+#             extra_msg = ("This is a potential JAX bug. Please file an issue at"
+#                          " https://github.com/jax-ml/jax/issues")
+#             if extra_msg in str(e):
+#               raise
+#             raise core.ShardingTypeError(f"{str(e)}\n{extra_msg}")
+#           except (FloatingPointError, ZeroDivisionError) as e:
+#             msg = "When differentiating the code at the top of the callstack:"
+#             if msg not in e.args[0]:
+#               e.args = e.args[0] + f'\n{msg}',
+#             e.args = e.args[0] + f'\n{source_info_util.summarize(eqn.source_info)}',
+#             raise e from None
+#         cts_out = [Zero(v.aval) for v in eqn.invars] if cts_out is Zero else cts_out
+#         # FIXME: Some invars correspond to primals!
+#         foreach(write_cotangent, eqn.invars, cts_out)
 
-  cotangents_out = map(read_cotangent, jaxpr.invars)
-  return cotangents_out
+#   cotangents_out = map(read_cotangent, jaxpr.invars)
+#   return cotangents_out
 
 def closed_backward_pass(jaxpr: core.ClosedJaxpr, transform_stack,
                          primals_in, cotangents_in):
@@ -557,7 +564,7 @@ def backward_pass2(
         assert False
     elif any(isinstance(read(x), GradAccum) for x in eqn.invars):
       for v in eqn.outvars:
-        env[v] = ValueAccum(v.aval)
+        env[v] = ValAccum(v.aval)
       lin_eqns.append(eqn)
     else:
       subfuns, params = eqn.primitive.get_bind_params(eqn.params)
@@ -581,6 +588,7 @@ def backward_pass2(
     for eqn in lin_eqns[::-1]:
       if eqn.primitive.ref_primitive:
         # TODO this can be ordinary transpose rules (?)
+        # TODO don't want to freeze if borrowed...
         read(eqn.invars[0]).accum(read(eqn.outvars[0]).freeze())
       else:
         cts_in = [env.pop(v).freeze() for v in eqn.outvars]
@@ -599,11 +607,12 @@ def backward_pass2(
               x.accum(ct)
 
 def backward_pass(jaxpr, transform_stack, consts, primals_in, cotangents_in):
-  primals_in_ = [ValueAccum(x.aval) if isinstance(x, UndefinedPrimal) else
-                 RefAccum(a.inner_aval) if isinstance(a := core.typeof(x), AbstractRef) else
-                 x for x in primals_in]
+  primals_in_ = [
+      ValAccum(x.aval) if isinstance(x, UndefinedPrimal) else
+      RefAccum(a.inner_aval, x) if isinstance(a := core.typeof(x), AbstractRef)
+      else x for x in primals_in]
   backward_pass2(jaxpr, transform_stack, consts, primals_in_, cotangents_in)
-  return [x.freeze() if isinstance(x, GradAccum) else None for x in primals_in_]
+  return [x.freeze() if isinstance(x, ValAccum) else None for x in primals_in_]
 
 fancy_transposes = {}
 

@@ -4573,30 +4573,17 @@ def _add_jvp(primals, tangents):
   else:
     return primal_out, add(xdot, ydot)
 
-def _aval_from_input(x):
-  if ad.is_undefined_primal(x):
-    return x.aval
-  a = core.typeof(x)
-  if isinstance(a, state.AbstractRef):
-    return a.inner_aval
-  else:
-    return a
-
 def _add_transpose(t, x, y):
   # Morally the following assertion is true, but because we instantiate zeros in
   # some places (e.g. in custom_jvp) it may not always hold. For example, see
   # api_test.py's CustomJVPTest.test_jaxpr_zeros.
   # assert ad.is_undefined_primal(x) and ad.is_undefined_primal(y)
-  x_aval = _aval_from_input(x)
-  y_aval = _aval_from_input(y)
-  handle = lambda val, out: (val if ad.is_undefined_primal(out)
-                             else out.addupdate(ad.instantiate_zeros(val)))
+  x_aval = x.aval if ad.is_undefined_primal(x) else core.get_aval(x)
+  y_aval = y.aval if ad.is_undefined_primal(y) else core.get_aval(y)
   if type(t) is ad_util.Zero:
-    return [handle(ad_util.Zero(x_aval), x),
-            handle(ad_util.Zero(y_aval), y)]
+    return [ad_util.Zero(x_aval), ad_util.Zero(y_aval)]
   else:
-    return [handle(_unbroadcast(x_aval, t), x),
-            handle(_unbroadcast(y_aval, t), y)]
+    return [_unbroadcast(x_aval, t), _unbroadcast(y_aval, t)]
 
 def _add_unreduced(out_sharding, x, y):
   x_ur, y_ur = x.sharding.spec.unreduced, y.sharding.spec.unreduced
@@ -4659,20 +4646,17 @@ batching.ragged_prop_rules[sub_p] = batching.ragged_mask_elementwise_rule
 
 
 def _mul_transpose(ct, x, y):
-  # assert ad.is_undefined_primal(x) ^ ad.is_undefined_primal(y)
-  x_aval, y_aval = _aval_from_input(x), _aval_from_input(y)
-  handle = lambda val, out: (val if ad.is_undefined_primal(out)
-                             else out.addupdate(ad.instantiate_zeros(val)))
-  if ad.is_undefined_primal(x) or isinstance(core.typeof(x), state.AbstractRef):
+  assert ad.is_undefined_primal(x) ^ ad.is_undefined_primal(y)
+  if ad.is_undefined_primal(x):
     if type(ct) is ad_util.Zero:
-      return [handle(ad_util.Zero(x_aval), x), None]
+      return [ad_util.Zero(x.aval), None]
     else:
-      return [handle(_unbroadcast(x_aval, mul(ct, y)), x), None]
+      return [_unbroadcast(x.aval, mul(ct, y)), None]
   else:
     if type(ct) is ad_util.Zero:
-      return [None, handle(ad_util.Zero(y_aval), y)]
+      return [None, ad_util.Zero(y.aval)]
     else:
-      return [None, handle(_unbroadcast(y_aval, mul(x, ct)), y)]
+      return [None, _unbroadcast(y.aval, mul(x, ct))]
 
 mul_p = standard_naryop([_num, _num], 'mul')
 ad.defjvp(mul_p,
@@ -5426,9 +5410,7 @@ def _dot_general_transpose_rhs(g, x, y, *, dimension_numbers, precision,
     swap_ans=True)
   if y_bar.dtype != y.aval.dtype:
     y_bar = _convert_element_type(y_bar, y.aval.dtype, y.aval.weak_type)
-  assert isinstance(y, ad.UndefinedPrimal) ^ (not isinstance(y, ad.UndefinedPrimal) and
-                                              isinstance(core.typeof(y), state.AbstractRef))
-  return y_bar if isinstance(y, ad.UndefinedPrimal) else y.addupdate(y_bar)
+  return y_bar
 
 
 def _dot_batch_rule(
@@ -5493,16 +5475,7 @@ def _dot_general_batch_dim_nums(ndims, batch_dims, dimension_numbers):
   # - contraction dimensions appear in lhs and rhs but not the result
   # - batch dimensions appear in lhs, rhs, and result
   # - tensor product dimensions appear in the result and one of lhs or rhs
-  # The dimensions of the result are ordered as
-  # - Batch dimensions
-  #   - Q: In what order?  The order of appearance in lhs, rhs, or
-  #     dimension_numbers?
-  # - Tensor dimensions from the LHS
-  # - Tensor dimensions from the RHS
   lhs_ndim, rhs_ndim = ndims
-  # lbd and rbd are "batch" dimensions in the sense of dimensions being
-  # vmapped, not to be confused with "batch" dimensions in the sense of
-  # explicitly present dimensions that this dot_general is zipping together.
   lbd, rbd = batch_dims
   assert lbd is not None or rbd is not None
   (lhs_contract, rhs_contract), (lhs_batch, rhs_batch) = _from_maybe_ragged(dimension_numbers)

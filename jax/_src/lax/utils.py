@@ -142,10 +142,9 @@ def standard_abstract_eval(prim, shape_rule, dtype_rule, weak_type_rule,
                            *avals, **kwargs):
   for a in avals:
     if isinstance(a, state.AbstractRef):
-      raise ValueError(
-          f' Attempting to pass a Ref {a} to a primitive:'
-          f' {prim} - did you forget to unpack ([...]) the ref?'
-      )
+      breakpoint()
+      raise ValueError(f' Attempting to pass a Ref {a} to a primitive:'
+                       f' {prim} - did you forget to unpack ([...]) the ref?')
     if not isinstance(a, core.UnshapedArray):
       raise ValueError(
           f'Attempting to pass an unexpected type {a} to a'

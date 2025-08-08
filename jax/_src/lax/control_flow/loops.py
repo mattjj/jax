@@ -66,7 +66,7 @@ from jax._src.util import (
 from jax._src import xla_bridge as xb
 from jax._src.tree_util import (
     keystr, tree_flatten, tree_flatten_with_path, tree_map, tree_unflatten,
-    treedef_is_leaf)
+    treedef_is_leaf, tree_leaves)
 import numpy as np
 
 _map = safe_map
@@ -884,6 +884,11 @@ def _rearrange_mutable_binders(
   if config.enable_checks.value: core.check_jaxpr(new_jaxpr)
   return ClosedJaxpr(new_jaxpr, jaxpr.consts)
 
+def _jaxtype(x) -> bool:
+  try: core.typeof(x)
+  except: return False
+  else: return True
+
 def _scan_transpose(cts, *args, reverse, length, num_consts,
                     num_carry, jaxpr, linear, unroll, _split_transpose):
   # we've only implemented transposing scans with specific lin/nonlin patterns
@@ -897,8 +902,6 @@ def _scan_transpose(cts, *args, reverse, length, num_consts,
   if not all(init_lin):
     pass  # TODO(mattjj): error check https://github.com/jax-ml/jax/issues/1963
 
-  # We follow a funny convention of passing cotangent refs like primals, so they
-  # appear in `args` mixed in with the UndefinedPrimals of `T d` and `T a`.
   # Rearrange jaxpr binders and arguments to put cotangent mutable arrays first:
   #   Before: [ires,               T d, T c,               T a, eres] -> [T c, T b]
   #   After:  [ires, T d_mut, T d_pure, T c, T a_mut, T a_pure, eres] -> [T c, T b]
@@ -913,47 +916,40 @@ def _scan_transpose(cts, *args, reverse, length, num_consts,
       args, [num_ires, num_consts - num_ires, num_carry, sum(xs_lin)])
   _, const_avals, _, xs_avals, _ = split_list(
       jaxpr.in_avals, [num_ires, num_consts - num_ires, num_carry, sum(xs_lin)])
-  is_mutable = [not ad.is_undefined_primal(x) and
-                isinstance(core.typeof(x), AbstractRef) for x in consts_dot]
+  assert not any(ad.is_undefined_primal(x) for x in (*consts_dot, *carry_dot, xs_dot))
+  is_mutable = [isinstance(x, ad.RefAccum) for x in consts_dot]
   immut_consts_dot, mut_consts_bar = partition_list(is_mutable, consts_dot)
   jaxpr = _rearrange_mutable_binders(jaxpr, num_ires, num_consts - num_ires)
   del const_avals, consts_dot
-  is_mutable_ = [not ad.is_undefined_primal(x) and
-                 isinstance(core.typeof(x), AbstractRef) for x in xs_dot]
+  is_mutable_ = [isinstance(x, ad.RefAccum) for x in xs_dot]
   immut_xs_dot, mut_xs_bar = partition_list(is_mutable_, xs_dot)
   jaxpr = _rearrange_mutable_binders(jaxpr, num_consts + num_carry, sum(xs_lin))
   del xs_avals, xs_dot
-  # Check that pure tangent values are all UndefinedPrimals, and mutable
-  # 'tangent values' are not (since we actually put cotangent refs there).
-  assert not any(ad.is_undefined_primal(r) for r in ires)
-  assert not any(ad.is_undefined_primal(x) for x in mut_consts_bar)
-  # TODO(mattjj): these assertions fail due to zeros
-  # assert     all(ad.is_undefined_primal(x) for x in immut_consts_dot)
-  # assert     all(ad.is_undefined_primal(x) for x in carry_dot)
-  # assert     all(ad.is_undefined_primal(x) for x in immut_xs_dot)
-  assert not any(ad.is_undefined_primal(r) for r in mut_xs_bar)
-  assert not any(ad.is_undefined_primal(r) for r in eres)
-  del args
+  assert all(_jaxtype(x) for x in ires)
+  assert all(isinstance(x, ad.RefAccum) for x in mut_consts_bar)
+  assert all(isinstance(x, ad.ValAccum) or _jaxtype(x) for x in immut_consts_dot)
+  assert all(isinstance(x, ad.ValAccum) or _jaxtype(x) for x in carry_dot)
+  assert all(isinstance(x, ad.ValAccum) or _jaxtype(x) for x in immut_xs_dot)
+  assert all(isinstance(x, ad.RefAccum) for x in mut_xs_bar)
+  assert all(_jaxtype(x) for x in eres)
 
-  # Take apart passed-in cotangents to identify which are sym zeros.
   ct_carry, ct_ys = split_list(cts, [num_carry])
   ct_carry = _map(ad.instantiate_zeros, ct_carry)
-  ct_ys_is_zeros = [type(ct_y) is ad.Zero for ct_y in ct_ys]
-  ct_ys_nz = [x for x in ct_ys if type(x) is not ad.Zero]
+  for x in it.chain(mut_consts_bar, mut_xs_bar): x.inst()
   ct_immut_consts = _map(ad_util.zeros_like_aval,
                          jaxpr.in_avals[num_ires+len(mut_consts_bar):num_consts])
+  ct_ys_nz = [x for x in ct_ys if type(x) is not ad.Zero]
 
-  jaxpr_trans = _transpose_scan_jaxpr(
-      jaxpr, num_ires, len(mut_consts_bar), len(immut_consts_dot),
-      len(mut_xs_bar), len(immut_xs_dot), num_eres, tuple(ct_ys_is_zeros))
+  lens = _map(len, (ires, mut_consts_bar, ct_immut_consts, ct_carry, mut_xs_bar,
+                    immut_xs_dot, eres))
+  jaxpr_trans = _transpose_scan_jaxpr(jaxpr, tuple(lens), tuple(ct_ys_nz))
 
+  transpose_inputs = tree_leaves([ires, mut_consts_bar, ct_immut_consts,
+                                  ct_carry, mut_xs_bar, ct_ys_nz, eres])
   linear_trans = ([False] * num_ires +
                   [True] * (len(mut_consts_bar) + len(immut_consts_dot) +
                             len(carry_dot) + len(mut_xs_bar) + len(ct_ys_nz)) +
                   [False] * num_eres)
-  transpose_inputs = [*ires, *mut_consts_bar, *ct_immut_consts, *ct_carry,
-                      *mut_xs_bar, *ct_ys_nz, *eres]
-
   if not _split_transpose:
     outs = scan_p.bind(
         *transpose_inputs,
@@ -1046,14 +1042,10 @@ def _scan_transpose(cts, *args, reverse, length, num_consts,
     unknown_results_iter = iter(unknown_results)
     outs = [
         next(known_results_iter) if not mask else next(unknown_results_iter)
-        for mask in outs_mask
-    ]
+        for mask in outs_mask]
 
-  ct_immut_consts, ct_init, ct_immut_xs = split_list(outs, [len(immut_consts_dot), len(carry_dot)])
-  ct_consts = merge_lists(is_mutable, ct_immut_consts, [None] * len(mut_consts_bar))
-  ct_xs = merge_lists(is_mutable_, ct_immut_xs, [None] * len(mut_xs_bar))
-  return [None] * num_ires + ct_consts + ct_init + ct_xs + [None] * num_eres
-
+  for a, x in zip([*immut_consts_dot, *carry_dot, *immut_xs_dot], outs):
+    if isinstance(a, ad.GradAccum): a.accum(x)
 
 # transpose_scan_jaxpr converts the jaxpr signature:
 #  Before: [(ires,  T d_mut     T d_pure), T c,  (CT a_mut, T a, eres)] -> [T c,  T b]
@@ -1062,50 +1054,28 @@ def _scan_transpose(cts, *args, reverse, length, num_consts,
 #  After: [(ires, CT d_mut), (CT d_pure,  CT c), (CT a_mut, CT b, eres)] -> [(CT d_pure, CT c), CT a]
 #           --- consts ----  ----- carry ------  --------- ext --------
 @weakref_lru_cache
-def _transpose_scan_jaxpr(
-    jaxpr: ClosedJaxpr,
-    num_ires: int,
-    num_d_mut: int,
-    num_d_pure: int,
-    num_a_mut: int,
-    num_a_pure: int,
-    num_eres: int,
-    ct_b_is_zeros: Sequence[bool]):
-  num_d = num_d_mut + num_d_pure
-  num_a = num_a_mut + num_a_pure
-  num_b_nz = len(ct_b_is_zeros) - sum(ct_b_is_zeros)
-  num_c = len(jaxpr.out_avals) - len(ct_b_is_zeros)
-  assert num_a == len(jaxpr.in_avals) - num_ires - num_d - num_c - num_eres
-
-  ires_avals, d_mut_avals, d_pure_avals, c_avals, a_mut_avals, a_pure_avals, eres_avals = split_list(
-      jaxpr.in_avals, [num_ires, num_d_mut, num_d_pure, num_c, num_a_mut, num_a_pure])
+def _transpose_scan_jaxpr(jaxpr: ClosedJaxpr, lens, ct_b_is_zeros):
+  ires, d_mut, d_pure, c, a_mut, a_pure, eres = split_list_checked(jaxpr.in_avals, lens)
   refify = lambda a: AbstractRef(a) if not isinstance(a, AbstractRef) else a
-  d_mut_avals, a_mut_avals = _map(refify, d_mut_avals), _map(refify, a_mut_avals)
-  _, b_avals = split_list(jaxpr.out_avals, [num_c])
-  b_avals_nz = [a for a, z in zip(b_avals, ct_b_is_zeros) if not z]
+  d_mut, a_mut = _map(refify, d_mut), _map(refify, a_mut)
+  _, b = split_list(jaxpr.out_avals, [len(c)])
+  b = [a if not z else Zero(a) for a, z in zip(b, ct_b_is_zeros)]
+  trans_avals, tr_tree = tree_flatten((ires, d_mut, d_pure, c, a_mut, b, eres))
 
   # TODO(mattjj,dougalm): map to cotangent types...
   def transposed(*ct_args):
-    ires, d_mut_bar, d_pure, c_bar, a_mut_bar, b_bar, eres = split_list(
-        ct_args, [num_ires, num_d_mut, num_d_pure, num_c, num_a_mut, num_b_nz])
-    b_bar_ = iter(b_bar)
-    b_bar = [ad.Zero(a) if z else next(b_bar_) for a, z in zip(b_avals, ct_b_is_zeros)]
-    assert next(b_bar_, None) is None
-    primals = (
-        ires + d_mut_bar +
-        [ad.UndefinedPrimal(aval) for aval in [*d_pure_avals, *c_avals]] +
-        a_mut_bar + [ad.UndefinedPrimal(aval) for aval in a_pure_avals] + eres)
-    cts_out = ad.backward_pass(
-        jaxpr.jaxpr, False, jaxpr.consts, primals, c_bar + b_bar)
-    _, new_d_pure, new_c_bar, _, a_bar, _ = split_list(
-        cts_out, [num_ires + num_d_mut, num_d_pure, num_c, num_a_mut, num_a_pure])
-    d_pure = _map(ad.instantiate_zeros, _map(ad.add_tangents, d_pure, new_d_pure))
-    new_c_bar = _map(ad.instantiate_zeros, new_c_bar)
-    a_bar = _map(ad.instantiate_zeros, a_bar)
-    return [*d_pure, *new_c_bar, *a_bar]
+    ires, d_mut_bar, d_bar, c_bar, a_mut_bar, b_bar, eres = tree_unflatten(tr_tree, ct_args)
+    primals = (ires +
+               _map(ad.RefAccum, d_mut, d_mut_bar) +
+               _map(ad.ValAccum, d_pure, d_bar) +
+               _map(ad.ValAccum, c) +
+               _map(ad.RefAccum, a_mut, a_mut_bar) +
+               _map(ad.ValAccum, a_pure) +
+               eres)
+    ad.backward_pass2(jaxpr.jaxpr, False, jaxpr.consts, primals, c_bar + b_bar)
+    return [x.freeze() for x in primals if isinstance(x, ad.ValAccum)]
 
   transposed_wrapped = lu.wrap_init(transposed, debug_info=jaxpr.jaxpr.debug_info)
-  trans_avals = *ires_avals, *d_mut_avals, *d_pure_avals, *c_avals, *a_mut_avals, *b_avals_nz, *eres_avals
   trans_jaxpr = _make_closed_jaxpr(transposed_wrapped, trans_avals)
   return trans_jaxpr
 
@@ -1405,13 +1375,13 @@ def _scan_state_partial_discharge_rule(should_discharge, in_avals, out_avals, *a
                               "please open an issue at "
                               "https://github.com/jax-ml/jax/issues")
   def wrapped(*wrapped_args):
-    val_consts, carry_in, ref_consts_in, val_xs, ref_xs_in = split_list_checked(wrapped_args,
-      [n_val_consts, n_carry, n_ref_consts, n_val_xs, n_ref_xs])
+    val_consts, carry_in, ref_consts_in, val_xs, ref_xs_in = split_list_checked(
+        wrapped_args, [n_val_consts, n_carry, n_ref_consts, n_val_xs, n_ref_xs])
     consts = merge_lists(is_ref_const, val_consts, ref_consts_in)
     xs = merge_lists(is_ref_xs, val_xs, ref_xs_in)
     outs = core.eval_jaxpr(discharged_jaxpr, (), *consts, *carry_in, *xs)
-    carry_out, ys, ref_consts_out, ref_xs_out = split_list_checked(outs,
-      [n_carry, n_ys, n_ref_consts, n_ref_xs])
+    carry_out, ys, ref_consts_out, ref_xs_out = split_list_checked(
+        outs, [n_carry, n_ys, n_ref_consts, n_ref_xs])
     return [*carry_out, *ref_consts_out, *ys, *ref_xs_out]
 
   def arrange_jaxpr_args_for_wrapped(args):
@@ -1468,7 +1438,7 @@ scan_p.skip_canonicalization = True
 scan_p.def_impl(partial(dispatch.apply_primitive, scan_p))
 scan_p.def_effectful_abstract_eval(_scan_abstract_eval)
 ad.primitive_jvps[scan_p] = _scan_jvp
-ad.primitive_transposes[scan_p] = _scan_transpose
+ad.fancy_transposes[scan_p] = _scan_transpose
 ad.primitive_linearizations[scan_p] = _scan_linearize
 pe.custom_partial_eval_rules[scan_p] = _scan_partial_eval
 xla.register_initial_style_primitive(scan_p)
