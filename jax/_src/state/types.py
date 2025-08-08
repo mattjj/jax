@@ -327,6 +327,7 @@ class AbstractRef(core.AbstractValue):
   __slots__ = ["inner_aval", "memory_space"]
 
   def __init__(self, inner_aval: core.AbstractValue, memory_space: Any = None):
+    assert isinstance(inner_aval, core.ShapedArray), breakpoint()
     self.inner_aval = inner_aval
     self.memory_space = memory_space
 

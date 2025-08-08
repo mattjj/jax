@@ -917,20 +917,22 @@ def _scan_transpose(cts, *args, reverse, length, num_consts,
   _, const_avals, _, xs_avals, _ = split_list(
       jaxpr.in_avals, [num_ires, num_consts - num_ires, num_carry, sum(xs_lin)])
   assert not any(ad.is_undefined_primal(x) for x in (*consts_dot, *carry_dot, xs_dot))
-  is_mutable = [isinstance(x, ad.RefAccum) for x in consts_dot]
+  is_mutable = [isinstance(a, AbstractRef) for a in const_avals]
+  # is_mutable = [isinstance(x, ad.RefAccum) for x in consts_dot] # TODO lin|non
   immut_consts_dot, mut_consts_bar = partition_list(is_mutable, consts_dot)
   jaxpr = _rearrange_mutable_binders(jaxpr, num_ires, num_consts - num_ires)
   del const_avals, consts_dot
-  is_mutable_ = [isinstance(x, ad.RefAccum) for x in xs_dot]
+  is_mutable_ = [isinstance(a, AbstractRef) for a in xs_avals]
+  # is_mutable_ = [isinstance(x, ad.RefAccum) for x in xs_dot] # TODO lin|nonlin
   immut_xs_dot, mut_xs_bar = partition_list(is_mutable_, xs_dot)
   jaxpr = _rearrange_mutable_binders(jaxpr, num_consts + num_carry, sum(xs_lin))
   del xs_avals, xs_dot
   assert all(_jaxtype(x) for x in ires)
-  assert all(isinstance(x, ad.RefAccum) for x in mut_consts_bar)
+  # assert all(isinstance(x, ad.RefAccum) for x in mut_consts_bar)  # TODO lin|nonlin
   assert all(isinstance(x, ad.ValAccum) or _jaxtype(x) for x in immut_consts_dot)
   assert all(isinstance(x, ad.ValAccum) or _jaxtype(x) for x in carry_dot)
   assert all(isinstance(x, ad.ValAccum) or _jaxtype(x) for x in immut_xs_dot)
-  assert all(isinstance(x, ad.RefAccum) for x in mut_xs_bar)
+  # assert all(isinstance(x, ad.RefAccum) for x in mut_xs_bar)
   assert all(_jaxtype(x) for x in eres)
 
   ct_carry, ct_ys = split_list(cts, [num_carry])

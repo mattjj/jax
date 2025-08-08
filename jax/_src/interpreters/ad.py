@@ -376,6 +376,7 @@ class ValAccum(GradAccum):
       self.val = add_tangents(self.val, x)
 
   def freeze(self):
+    assert self.val is not None
     return self.val
 register_pytree_node(ValAccum, lambda v: ([v.val], v.aval), lambda a, v: ValAccum(a, v[0]))
 
@@ -542,7 +543,7 @@ def closed_backward_pass(jaxpr: core.ClosedJaxpr, transform_stack,
 
 def backward_pass2(
     jaxpr: core.Jaxpr, transform_stack: bool, consts: list[Array],
-    primals_in: list[Array | GradAccum], cotangents_in: list[Array],
+    primals_in: list[Array | ArrayRef | GradAccum], cotangents_in: list[Array],
 ) -> None:
   if all(type(ct) is Zero for ct in cotangents_in) and not jaxpr.effects:
     return
@@ -555,15 +556,16 @@ def backward_pass2(
     except: breakpoint()
 
   lin_eqns = []
-  dangling_refs = set()
   for eqn in jaxpr.eqns:
     if eqn.primitive.ref_primitive:
       if eqn.primitive is core.mutable_array_p:
-        dangling_refs.add(eqn.outvars[0])
+        env[eqn.outvars[0]] = RefAccum(eqn.outvars[0].aval.inner_aval)
+        lin_eqns.append(eqn)
       elif eqn.primitive is core.freeze_p:
-        dangling_refs.remove(eqn.invars[0])  # type: ignore
+        env[eqn.outvars[0]] = ValAccum(eqn.outvars[0].aval)
+        lin_eqns.append(eqn)
       elif eqn.primitive is core.accum_in_ref_p:
-        env[v] = RefAccum(eqn.outvars[0].aval)
+        env[eqn.outvars[0]] = RefAccum(eqn.outvars[0].aval.inner_aval)
         lin_eqns.append(eqn)
       else:
         assert False
@@ -582,9 +584,6 @@ def backward_pass2(
       else:
         env[eqn.outvars[0]] = ans
 
-  for v in dangling_refs:
-    env[v] = RefAccum(v.aval.inner_aval)
-
   ctx = (source_info_util.transform_name_stack('transpose') if transform_stack
          else contextlib.nullcontext())
   for acc, ct in zip(map(read, jaxpr.outvars), cotangents_in):
@@ -594,8 +593,10 @@ def backward_pass2(
   with ctx:
     for eqn in lin_eqns[::-1]:
       if eqn.primitive.ref_primitive:
-        # TODO(mattjj,dougalm): this can be ordinary transpose rules (?)
-        read(eqn.invars[0]).accum(read(eqn.outvars[0]).freeze())
+        ct = env.pop(eqn.outvars[0]).freeze()
+        acc = read(eqn.invars[0])
+        if isinstance(acc, GradAccum):
+          acc.accum(ct)
       else:
         cts_in = [env.pop(v).freeze() for v in eqn.outvars]
         if not eqn.primitive.multiple_results:
@@ -623,11 +624,11 @@ def backward_pass2(
 def backward_pass(jaxpr, transform_stack, consts, primals_in, cotangents_in):
   primals_in_ = [
       ValAccum(x.aval) if isinstance(x, UndefinedPrimal) else
-      RefAccum(a.inner_aval, x) if isinstance(a := core.typeof(x), AbstractRef)
-      else x for x in primals_in]
+      # RefAccum(a.inner_aval, x) if isinstance(a := core.typeof(x), AbstractRef) else
+      x for x in primals_in]
   backward_pass2(jaxpr, transform_stack, consts, primals_in_, cotangents_in)
   return [x.freeze() if isinstance(x, ValAccum) else
-          None if isinstance(x, RefAccum) else
+          Zero(x.aval) if isinstance(x, RefAccum) else  # TODO(dougalm, mattjj)
           Zero(core.typeof(x).to_tangent_aval()) for x in primals_in_]
 
 fancy_transposes = {}
