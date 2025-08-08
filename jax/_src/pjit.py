@@ -2554,6 +2554,9 @@ def _pjit_transpose(cts_in, *primals_in,
         keep_unused=keep_unused,
         inline=inline,
         compiler_options_kvs=compiler_options_kvs)
+  except Exception as e:
+    breakpoint()
+    pass
   except api_util.InternalFloatingPointError as e:
     print("Invalid nan value encountered in the backward pass of a jax.jit "
           "function. Calling the de-optimized backward pass.")

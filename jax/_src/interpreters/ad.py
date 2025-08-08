@@ -342,7 +342,8 @@ class RefAccum(GradAccum):
     self.ref = ref
 
   def accum(self, x):
-    if isinstance(x, Zero):
+    assert x is not Zero, breakpoint()
+    if isinstance(x, Zero) or x is None:
       return
     elif self.ref is None:
       self.ref = core.array_ref(x)
@@ -358,6 +359,7 @@ class RefAccum(GradAccum):
   def inst(self):
     if self.ref is None:
       self.ref = core.array_ref(zeros_like_aval(self.aval))
+    return self
 register_pytree_node(RefAccum, lambda r: ([r.ref], r.aval), lambda a, r: RefAccum(a, r[0]))
 
 class ValAccum(GradAccum):
@@ -369,7 +371,9 @@ class ValAccum(GradAccum):
     self.val = Zero(aval) if val is None else val
 
   def accum(self, x):
-    self.val = add_tangents(self.val, x)
+    assert x is not Zero, breakpoint()
+    if x is not None:
+      self.val = add_tangents(self.val, x)
 
   def freeze(self):
     return self.val
@@ -547,7 +551,8 @@ def backward_pass2(
                        (*consts, *primals_in)))
 
   def read(x: core.Atom) -> Array | GradAccum:
-    return x.val if isinstance(x, Literal) else env[x]
+    try: return x.val if isinstance(x, Literal) else env[x]
+    except: breakpoint()
 
   lin_eqns = []
   dangling_refs = set()
@@ -582,13 +587,14 @@ def backward_pass2(
 
   ctx = (source_info_util.transform_name_stack('transpose') if transform_stack
          else contextlib.nullcontext())
-  for v, ct in zip(jaxpr.outvars, cotangents_in):
-    read(v).accum(ct)
+  for acc, ct in zip(map(read, jaxpr.outvars), cotangents_in):
+    # jaxpr.outvars can have Literals, or env can have instantiated zeros
+    if isinstance(acc, GradAccum):
+      acc.accum(ct)
   with ctx:
     for eqn in lin_eqns[::-1]:
       if eqn.primitive.ref_primitive:
-        # TODO this can be ordinary transpose rules (?)
-        # TODO don't want to freeze if borrowed...
+        # TODO(mattjj,dougalm): this can be ordinary transpose rules (?)
         read(eqn.invars[0]).accum(read(eqn.outvars[0]).freeze())
       else:
         cts_in = [env.pop(v).freeze() for v in eqn.outvars]
@@ -600,8 +606,16 @@ def backward_pass2(
         else:
           rule = get_primitive_transpose(eqn.primitive)
           primals = map(read, eqn.invars)
-          up = lambda x: UndefinedPrimal(x.aval) if isinstance(x,GradAccum) else x
-          cts_out = rule(cts_in, *map(up, primals), **eqn.params)
+          up = lambda x: (UndefinedPrimal(x.aval) if isinstance(x, ValAccum)
+                          else x.inst().ref if isinstance(x, RefAccum) else x)
+          if eqn.primitive.call_primitive or eqn.primitive.map_primitive:
+            # TODO(mattjj,dougalm): remove this path by revising call/map trans
+            cts_in_avals = [v.aval for v in eqn.outvars]
+            params = dict(eqn.params)
+            call_jaxpr = params.pop('call_jaxpr')
+            cts_out = rule(params, call_jaxpr, map(up, primals), cts_in, cts_in_avals)
+          else:
+            cts_out = rule(cts_in, *map(up, primals), **eqn.params)
           for x, ct in zip(primals, cts_out):
             if isinstance(x, GradAccum):
               x.accum(ct)
@@ -612,7 +626,9 @@ def backward_pass(jaxpr, transform_stack, consts, primals_in, cotangents_in):
       RefAccum(a.inner_aval, x) if isinstance(a := core.typeof(x), AbstractRef)
       else x for x in primals_in]
   backward_pass2(jaxpr, transform_stack, consts, primals_in_, cotangents_in)
-  return [x.freeze() if isinstance(x, ValAccum) else None for x in primals_in_]
+  return [x.freeze() if isinstance(x, ValAccum) else
+          None if isinstance(x, RefAccum) else
+          Zero(core.typeof(x).to_tangent_aval()) for x in primals_in_]
 
 fancy_transposes = {}
 
@@ -1172,8 +1188,13 @@ def linear_jvp(primitive, primals, tangents, **params):
     tangents = map(instantiate_zeros, tangents)
     return val_out, primitive.bind(*tangents, **params)
 
+# TODO(mattjj,dougalm): remove this
 def linear_transpose(transpose_rule, cotangent, *args, **kwargs):
-  return Zero if type(cotangent) is Zero else transpose_rule(cotangent, **kwargs)
+  if type(cotangent) is Zero:
+    return [Zero(x.aval.to_tangent_aval()) if isinstance(x, UndefinedPrimal)
+            else None for x in args]
+  else:
+    return transpose_rule(cotangent, **kwargs)
 
 
 def deflinear2(primitive, transpose_rule):
@@ -1181,7 +1202,11 @@ def deflinear2(primitive, transpose_rule):
   primitive_transposes[primitive] = partial(linear_transpose2, transpose_rule)
 
 def linear_transpose2(transpose_rule, cotangent, *args, **kwargs):
-  return Zero if type(cotangent) is Zero else transpose_rule(cotangent, *args, **kwargs)
+  if type(cotangent) is Zero:
+    return [Zero(x.aval.to_tangent_aval()) if isinstance(x, UndefinedPrimal)
+            else None for x in args]
+  else:
+    return transpose_rule(cotangent, *args, **kwargs)
 
 
 def defjvp(primitive, *jvprules):

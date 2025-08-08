@@ -1747,7 +1747,6 @@ def get_aval(x):
        ' jax.numpy.array(), or register your object as a pytree.'),
       stacklevel=6)
     return get_aval(x.__jax_array__())
-  breakpoint()
   raise TypeError(f"Argument '{x}' of type '{typ}' is not a valid JAX type")
 
 typeof = get_aval

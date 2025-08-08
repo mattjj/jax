@@ -942,7 +942,8 @@ def _scan_transpose(cts, *args, reverse, length, num_consts,
 
   lens = _map(len, (ires, mut_consts_bar, ct_immut_consts, ct_carry, mut_xs_bar,
                     immut_xs_dot, eres))
-  jaxpr_trans = _transpose_scan_jaxpr(jaxpr, tuple(lens), tuple(ct_ys_nz))
+  ct_ys_is_zero = [isinstance(x, ad.Zero) for x in ct_ys]
+  jaxpr_trans = _transpose_scan_jaxpr(jaxpr, tuple(lens), tuple(ct_ys_is_zero))
 
   transpose_inputs = tree_leaves([ires, mut_consts_bar, ct_immut_consts,
                                   ct_carry, mut_xs_bar, ct_ys_nz, eres])
@@ -1073,7 +1074,8 @@ def _transpose_scan_jaxpr(jaxpr: ClosedJaxpr, lens, ct_b_is_zeros):
                _map(ad.ValAccum, a_pure) +
                eres)
     ad.backward_pass2(jaxpr.jaxpr, False, jaxpr.consts, primals, c_bar + b_bar)
-    return [x.freeze() for x in primals if isinstance(x, ad.ValAccum)]
+    return [ad.instantiate_zeros(x.freeze()) for x in primals
+            if isinstance(x, ad.ValAccum)]
 
   transposed_wrapped = lu.wrap_init(transposed, debug_info=jaxpr.jaxpr.debug_info)
   trans_jaxpr = _make_closed_jaxpr(transposed_wrapped, trans_avals)

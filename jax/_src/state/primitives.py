@@ -435,7 +435,9 @@ ad.primitive_transposes[get_p] = _get_transpose
 
 def _swap_transpose(g, ref, x, *idx, **params):
   # swap transpose is swap
-  x_bar = swap_p.bind(ref, ad_util.instantiate(g), *idx, **params)
+  try: x_bar = swap_p.bind(ref, ad_util.instantiate(g), *idx, **params)
+  except: breakpoint()
+  pass
   return [None, x_bar] + [None] * len(idx)
 ad.primitive_transposes[swap_p] = _swap_transpose
 
