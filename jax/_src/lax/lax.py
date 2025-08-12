@@ -48,7 +48,7 @@ from jax._src import tree_util
 from jax._src import util
 from jax._src.abstract_arrays import array_types
 from jax._src.core import (Primitive, UnshapedArray, ShapedArray,
-                           abstract_token, canonicalize_shape)
+                           abstract_token, canonicalize_shape, typeof)
 from jax._src.errors import UnexpectedTracerError
 from jax._src.hashable_array import HashableArray
 from jax._src.interpreters import ad
@@ -4307,14 +4307,41 @@ def _sin_lowering(ctx, x, accuracy):
   return _nary_lower_hlo(hlo.sine, ctx, x, accuracy=accuracy)
 
 
-def _sin_lin(nzs, x, accuracy):
+def _sin_lin(primal_trace, tangent_trace, policy,
+             nzs, primals_in, primal2s_in, tangents_in,
+             accuracy):
   nz, = nzs
-  return (sin_p.bind(x, accuracy=accuracy), nz, cos(x),
-          lambda cos_x, t: mul(t, cos_x))
+  x, = primals_in
+  x2, = primal2s_in
+  xdot, = tangents_in
+
+  with core.set_current_trace(primal_trace):
+    y = sin_p.bind(x, accuracy=accuracy)
+
+  if policy(sin_p, typeof(x), accuracy=accuracy):
+    y2 = y
+  else:
+    if x2 is ad.unavail:
+      y2 = ad.unavail
+    else:
+      with core.set_current_trace(tangent_trace):  # TODO name_stack_suffix
+        y2 = sin_p.bind(x2, accuracy=accuracy)
+  if policy(cos_p, typeof(x), accuracy=accuracy):
+    with core.set_current_trace(primal_trace):
+      cos_x = cos_p.bind(x, accuracy=accuracy)
+  else:
+    with core.set_current_trace(tangent_trace):
+      cos_x = cos_p.bind(x2, accuracy=accuracy)  # can error if unavailable
+  if nz:
+    with core.set_current_trace(tangent_trace):
+      ydot = cos_x * xdot
+  else:
+    ydot = Zero(typeof(xdot))
+  return nzs, [y], [y2], [ydot]
 
 sin_p = standard_unop(_float | _complex, 'sin')
 ad.defjvp(sin_p, lambda g, x, accuracy: mul(g, cos(x, accuracy=accuracy)))
-ad.primitive_linearizations[sin_p] = _sin_lin
+ad.fanciest_linearizations[sin_p] = _sin_lin
 mlir.register_lowering(sin_p, _sin_lowering)
 core.pp_eqn_rules[sin_p] = _unary_with_accuracy_pp_rule
 batching.ragged_prop_rules[sin_p] = batching.ragged_mask_elementwise_rule

@@ -39,8 +39,8 @@ from jax._src.core import (Trace, Tracer, get_aval, call_p, Primitive, Literal,
                            typeof)
 from jax._src.dtypes import dtype, float0
 from jax._src.state.types import AbstractRef
-from jax._src.util import (unzip2, safe_map, safe_zip, split_list, wrap_name,
-                           as_hashable_function, weakref_lru_cache,
+from jax._src.util import (unzip2, unzip3, safe_map, safe_zip, split_list,
+                           wrap_name, as_hashable_function, weakref_lru_cache,
                            partition_list, subs_list2, foreach)
 
 Array = Any
@@ -48,6 +48,8 @@ Ref = Any
 zip = safe_zip
 map = safe_map
 def identity(x): return x
+
+def save_nothing(*_, **__): return False
 
 def _update_annotation(
     f: lu.WrappedFun,
@@ -153,58 +155,70 @@ def jvp_subtrace_aux(f, store, tag, primals, tangents):
 
 def linearize_jaxpr(
     jaxpr: core.ClosedJaxpr,
+    available_primals: Sequence[bool],
     nonzeros: Sequence[bool],
     instantiate: bool | Sequence[bool] = False,
     allow_fwds: bool | Sequence[bool] = True,
-) -> tuple[core.ClosedJaxpr, int, Sequence[bool], Sequence[int | None], core.ClosedJaxpr]:
+    policy: Callable | None = None,
+) -> tuple[core.ClosedJaxpr, int, Sequence[Primal2Spec], Sequence[bool], Sequence[int | None], core.ClosedJaxpr]:
   if type(allow_fwds) is bool:
     allow_fwds = (allow_fwds,) * (len(jaxpr.consts) + len(jaxpr.jaxpr.invars))
   assert len(allow_fwds) == (len(jaxpr.consts) + len(jaxpr.jaxpr.invars))
   if type(instantiate) is bool:
     instantiate = (instantiate,) * len(jaxpr.jaxpr.outvars)
+  if policy is None:
+    policy = save_nothing
   assert len(instantiate) == len(jaxpr.jaxpr.outvars)
-  return _linearize_jaxpr(jaxpr, tuple(nonzeros), tuple(instantiate),
-                          tuple(allow_fwds))
+  return _linearize_jaxpr(jaxpr, tuple(available_primals), tuple(nonzeros),
+                          tuple(instantiate), tuple(allow_fwds), policy)
 
 @weakref_lru_cache
 @source_info_util.reset_name_stack()
 def _linearize_jaxpr(
     jaxpr: core.ClosedJaxpr,
+    available_primals: tuple[bool, ...],
     nonzeros: tuple[bool, ...],
     instantiate: tuple[bool, ...],
     allow_fwds: tuple[bool, ...],
-) -> tuple[core.ClosedJaxpr, int, Sequence[bool], Sequence[int | None], core.ClosedJaxpr]:
+    policy: Callable,
+) -> tuple[core.ClosedJaxpr, int, Sequence[Primal2Spec], Sequence[bool], Sequence[int | None], core.ClosedJaxpr]:
   dbg = jaxpr.jaxpr.debug_info
   config.enable_checks.value and dbg.assert_arg_names(len(nonzeros))
   primal_trace = pe.DynamicJaxprTrace(dbg)
   tangent_trace = pe.DynamicJaxprTrace(dbg, auto_dce=True)
-  lin_trace = LinearizeTrace(primal_trace, tangent_trace)
+  lin_trace = LinearizeTrace(primal_trace, tangent_trace, policy=policy)
   tangent_trace.tag = lin_trace.tag
 
-  def new_arg(trace, primal_aval, nz, source_info):
+  def new_arg(trace, primal_aval, available, nz, source_info):
     primal = primal_trace.new_arg(primal_aval, source_info)
+    primal2 = primal if available else ad.unavail
     tangent_aval = primal_aval.to_tangent_aval()
     tangent = tangent_trace.new_arg(tangent_aval, source_info) if nz else Zero(tangent_aval)
-    return LinearizeTracer(trace, primal, tangent)
+    return LinearizeTracer(trace, primal, primal2, tangent)
 
   source_info = source_info_util.current()
-  tracers = [new_arg(lin_trace, a, nz, source_info)
-             for (a, nz) in zip(jaxpr.in_aval_qdds, nonzeros)]
-  in_primals = [t.primal for t in tracers]
+  tracers = [new_arg(lin_trace, a, avail, nz, source_info)
+             for (a, avail, nz) in zip(jaxpr.in_aval_qdds, available_primals, nonzeros)]
+  in_primals = [t.primal2 for t in tracers]
 
   with core.set_current_trace(lin_trace, check_leaks=True):
     ans = core.eval_jaxpr(jaxpr.jaxpr, jaxpr.consts, *tracers)
-    out_primals, out_tangents = unzip2(map(lin_trace.to_primal_tangent_pair, ans))
+    out_primals, out_primal2s, out_tangents = unzip3(map(lin_trace.to_primal_tangent_triple, ans))
     out_tangents = [instantiate_zeros(t) if inst else t
                     for t, inst in zip(out_tangents, instantiate)]
     del lin_trace, ans, new_arg, tracers
 
   # pe._check_no_returned_refs(debug_info, out_tangents)
+  primal2s_spec = [same if p2 is p else inst if p2 is not unavail else unavail
+                   for p, p2 in zip(out_primals, out_primal2s)]
+  out_primal2s = [p2 for s, p2 in zip(primal2s_spec, out_primal2s) if s is inst]
+
+  # pe._check_no_returned_refs(debug_info, out_tangents)  # TODO(mattjj)
   nzs_out = [type(t) is not Zero for t in out_tangents]
   out_tangents = [tangent_trace.to_jaxpr_tracer(t, source_info)
                   for (nz, t) in zip(nzs_out, out_tangents) if nz]
   tangent_jaxpr, tangent_consts = tangent_trace.to_jaxpr(
-      out_tangents, dbg.with_unknown_names(), source_info)
+      [*out_primal2s, *out_tangents], dbg.with_unknown_names(), source_info)
   tangent_trace.invalidate()
   tangent_jaxpr, tangent_consts = _dce_consts(tangent_jaxpr, tangent_consts)
   tangent_jaxpr = pe.close_jaxpr(pe.convert_constvars_jaxpr(tangent_jaxpr))
@@ -215,7 +229,7 @@ def _linearize_jaxpr(
   tangent_consts = [c for c, f in zip(tangent_consts, fwds) if f is None]
   del in_primals
 
-  # pe._check_no_returned_refs(debug_info, out_primals)
+  # pe._check_no_returned_refs(debug_info, out_primals)  # TODO(mattjj)
   primals_and_residuals = *out_primals, *tangent_consts
   primals_and_residuals = map(partial(primal_trace.to_jaxpr_tracer, source_info=source_info),
                               primals_and_residuals)
@@ -227,7 +241,7 @@ def _linearize_jaxpr(
   primal_jaxpr = core.ClosedJaxpr(primal_jaxpr, primal_consts)
 
   num_residuals_out = len(tangent_consts)
-  return primal_jaxpr, num_residuals_out, nzs_out, fwds, tangent_jaxpr
+  return primal_jaxpr, num_residuals_out, primal2s_spec, nzs_out, fwds, tangent_jaxpr
 
 def _dce_consts(jaxpr, consts):
   jaxpr, used_consts, _ = pe.dce_jaxpr_consts(
@@ -247,7 +261,8 @@ def direct_linearize(traceable: lu.WrappedFun, primals, kwargs, *,
                 and dtype(t) == float0 else t for t in tangents]
     linearize_trace = LinearizeTrace(parent_trace, tangent_trace, tag=tag)
     tangent_trace.tag = linearize_trace.tag
-    tracers = [LinearizeTracer(linearize_trace, p, t) for p, t in zip(primals, tangents)]
+    tracers = [LinearizeTracer(linearize_trace, p, p, t)
+               for p, t in zip(primals, tangents)]
     tracers = [t.full_lower() for t in tracers]
     with (core.set_current_trace(linearize_trace),
           source_info_util.transform_name_stack('jvp')):
@@ -260,7 +275,8 @@ def direct_linearize(traceable: lu.WrappedFun, primals, kwargs, *,
       else:
         ans = traceable.call_wrapped(*tracers)
         aux = None
-      out_primals, out_tangents = unzip2(map(linearize_trace.to_primal_tangent_pair, ans))
+      out_primals, _, out_tangents = unzip3(
+          map(linearize_trace.to_primal_tangent_triple, ans))
       del linearize_trace, ans, tracers
   out_nzs = [type(t) is not Zero for t in out_tangents]
   out_nz_tangents = [t for t, nz in zip(out_tangents, out_nzs) if nz]
@@ -869,31 +885,94 @@ call_transpose_param_updaters: dict[core.Primitive, Callable] = {}
 
 class LinearizeTrace(Trace):
 
-  def __init__(self, parent_trace, tangent_trace, tag=None):
+  def __init__(self, parent_trace, tangent_trace, *, policy=None, tag=None):
     super().__init__()
-    self.tag = core.TraceTag() if tag is None else tag
     self.parent_trace = parent_trace
     self.tangent_trace = tangent_trace
+    self.tag = core.TraceTag() if tag is None else tag
+    self.policy = policy
     self._name_stack_prefix_len = len(source_info_util.current_name_stack())
     self.requires_low = False
 
   def _name_stack_suffix(self):
     return source_info_util.current_name_stack()[self._name_stack_prefix_len:]
 
-  def to_primal_tangent_pair(self, val):
+  def to_primal_tangent_triple(self, val):
     if isinstance(val, LinearizeTracer) and val._trace.tag is self.tag:
-      return (val.primal, val.tangent)
+      return (val.primal, val.primal2, val.tangent)
     else:
       tangent_zero = Zero.from_primal_value(val)
-      return (val, tangent_zero)
+      return (val, val, tangent_zero)
 
   def process_primitive(self, primitive, args, params):
-    primals_in, tangents_in = unzip2(map(self.to_primal_tangent_pair, args))
-    tangent_nzs = [type(t) is not Zero for t in tangents_in]
+    from jax._src.ad_checkpoint import remat_p
+    primals_in, primal2s_in, tangents_in = unzip3(map(self.to_primal_tangent_triple, args))
+    nzs_in = [type(t) is not Zero for t in tangents_in]
+
+    # Skip pure primitives when tangents are all zero.
     if (all(type(t) is Zero for t in tangents_in) and
         primitive is not core.mutable_array_p and
         not any(isinstance(core.typeof(x), AbstractRef) for x in primals_in)):
       return primitive.bind_with_trace(self.parent_trace, primals_in, params)
+
+    if primitive is remat_p:  # policy-changing primitives must come first
+      lin = fancy_linearizations[remat_p]
+      with core.set_current_trace(self.parent_trace):
+        primals_out, primal2s_spec, nzs_out, residuals, linearized = lin(
+            nzs_in, primals_in, primal2s_in, self.policy, **params)
+      with (core.set_current_trace(self.tangent_trace),
+            source_info_util.set_name_stack(self._name_stack_suffix())):
+        inst_primal2s, tangents_out = linearized(residuals, *tangents_in)
+      primal2s_out = merge_primal2s(primal2s_spec, primals_out, inst_primal2s)
+      return map(partial(maybe_linearize_tracer2, self),
+                 primals_out, primal2s_out, nzs_out, tangents_out)
+
+    if self.policy is None or self.policy is everything_saveable:
+      assert all(x is x2 for x, x2 in zip(primals_in, primal2s_in))
+      return self.process_primitive_everything_saveable(
+          primitive, primals_in, tangents_in, nzs_in, params)
+    elif self.policy is nothing_saveable:
+      assert all(x2 is not ad.unavailable for x2 in primal2s_in)
+      self.process_primitive_nothing_saveable(
+          primitive, primals_in, primal2s_in, tangents_in, nzs_in, params)
+    else:
+      return self.process_primitive_mixed_saveable(
+          primitive, primals_in, primal2s_in, tangents_in, nzs_in, params)
+
+  def process_primitive_mixed_saveable(
+      self, primitive, primals_in, primal2s_in, tangents_in, tangent_nzs, params):
+    from jax._src.ad_checkpoint import name_p
+
+    # Special-case handling of name_p
+    # TODO make this... fanciest?
+    if primitive is name_p and self.policy:
+      primal, = primals_in
+      primal2, = primal2s_in
+      tangent, = tangents_in
+      saveable = self.policy(name_p, typeof(primal), name=params['name'])
+      if saveable:
+        return LinearizeTracer(self, primal, primal, tangent)
+      else:
+        return LinearizeTracer(self, primal, primal2, tangent)
+
+    lin = fanciest_linearizations.get(primitive)
+    if lin:
+      nzs_out, primals_out, primal2s_out, tangents_out = lin(
+          self.parent_trace, self.tangent_trace, self.policy,
+          tangent_nzs, primals_in, primal2s_in, tangents_in, **params)
+      outs = map(partial(maybe_linearize_tracer2, self),
+                 primals_out, primal2s_out, nzs_out, tangents_out)
+      return outs if primitive.multiple_results else outs[0]
+
+    lin = fancy_linearizations.get(primitive)
+    if lin:
+      breakpoint()  # will hops fit in here? try pjit
+
+    # TODO mixed remat fallback with regular lin rules / fallback lin rule
+    breakpoint()
+
+  def process_primitive_everything_saveable(
+      self, primitive, primals_in, tangents_in, tangent_nzs, params):
     fallback = partial(fallback_linearize_rule, primitive)
     lin = primitive_linearizations.get(primitive, fallback)
     with core.set_current_trace(self.parent_trace):
@@ -903,10 +982,27 @@ class LinearizeTrace(Trace):
           source_info_util.set_name_stack(self._name_stack_suffix())):
       tangent_out = linearized(residuals, *tangents_in)
     if primitive.multiple_results:
-      return [maybe_linearize_tracer(self, x, nz, t)
-              for x, nz, t in zip(primal_out, tangent_nzs_out, tangent_out)]
+      return map(partial(maybe_linearize_tracer, self),
+                 primal_out, tangent_nzs_out, tangent_out)
     else:
       return maybe_linearize_tracer(self, primal_out, tangent_nzs_out, tangent_out)
+
+  def process_primitive_nothing_saveable(
+      self, primitive, primals_in, primal2s_in, tangents_in, tangent_nzs, params):
+    fallback = partial(fallback_linearize_rule, primitive)
+    lin = primitive_linearizations.get(primitive, fallback)
+    with core.set_current_trace(self.parent_trace):
+      primal_out = primitive.bind(*primals_in)
+    with (core.set_current_trace(self.tangent_trace),
+          source_info_util.set_name_stack(self._name_stack_suffix())):
+      primal2_out, tangent_nzs_out, residuals, linearized = lin(
+          tangent_nzs, *primal2s_in, **params)
+      tangent_out = linearized(residuals, *tangents_in)
+    if primitive.multiple_results:
+      return map(partial(maybe_linearize_tracer2, self),
+                 primal_out, primal2_out, tangent_nzs_out, tangent_out)
+    else:
+      return maybe_linearize_tracer2(self, primal_out, primal2_out, tangent_nzs_out, tangent_out)
 
   def cur_qdd(self, x):
     p, _ = self.to_primal_tangent_pair(x)
@@ -1046,13 +1142,21 @@ class LinearizeTrace(Trace):
 def maybe_linearize_tracer(trace, primal, is_nonzero, tangent):
   if is_nonzero:
     assert not type(tangent) is Zero
-    return LinearizeTracer(trace, primal, tangent)
+    return LinearizeTracer(trace, primal, primal, tangent)
   else:
     assert type(tangent) is Zero
     return primal
 
-def fallback_linearize_rule(_prim: core.Primitive,
-                            _nonzeros: Sequence[bool], *primals, **params):
+def maybe_linearize_tracer2(trace, primal, primal2, is_nonzero, tangent):
+  if is_nonzero:
+    assert not type(tangent) is Zero
+    return LinearizeTracer(trace, primal, primal2, tangent)
+  else:
+    assert type(tangent) is Zero
+    return primal
+
+def fallback_linearize_rule(
+    _prim: core.Primitive, _nonzeros: Sequence[bool], *primals, **params):
   jvp = primitive_jvps.get(_prim)
   if not jvp:
     msg = f"Differentiation rule for '{_prim}' not implemented"
@@ -1139,14 +1243,40 @@ def linearize_from_jvp(jvp: lu.WrappedFun,
     out_nz, = out_nzs
     return out_primal, out_nz, out_consts, linearized
 
-class LinearizeTracer(Tracer):
-  __slots__ = ['primal', 'tangent']
+class Primal2Spec: ...
 
-  def __init__(self, trace, primal, tangent):
+class Same(Primal2Spec): ...
+same = Same()
+
+class Instantiated(Primal2Spec): ...
+inst = Instantiated()
+
+class Unavailable(Primal2Spec): ...
+unavail = Unavailable()
+
+def merge_primal2s(spec: Sequence[Primal2Spec], primals, primal2s):
+  assert len(spec) == len(primals) and len(primal2s) <= len(spec)
+  primal2s_ = iter(primal2s)
+  out = [primals[i] if s is same else next(primal2s_) if s is inst else unavail
+         for s in spec]
+  assert next(primal2s_, None) is None
+  return out
+
+class EverythingSaveable: ...
+everything_saveable = EverythingSaveable()
+
+class NothingSaveable: ...
+nothing_saveable = NothingSaveable()
+
+class LinearizeTracer(Tracer):
+  __slots__ = ['primal', 'primal2', 'tangent']
+
+  def __init__(self, trace, primal, primal2, tangent):
     if config.enable_checks.value:
       _primal_tangent_shapes_match(primal, tangent)
     self._trace = trace
     self.primal = primal
+    self.primal2 = primal2  # Primal | Unavailable
     self.tangent = tangent
 
   @property
@@ -1174,6 +1304,8 @@ class LinearizeTracer(Tracer):
 primitive_jvps : dict[core.Primitive, Callable] = {}
 primitive_transposes: dict[core.Primitive, Callable] = {}
 primitive_linearizations : dict[core.Primitive, Callable]  = {}
+fancy_linearizations : dict[core.Primitive, Callable]  = {}
+fanciest_linearizations : dict[core.Primitive, Callable]  = {}
 
 def deflinear(primitive, transpose_rule):
   primitive_jvps[primitive] = partial(linear_jvp, primitive)
