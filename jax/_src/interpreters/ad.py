@@ -49,6 +49,8 @@ zip = safe_zip
 map = safe_map
 def identity(x): return x
 
+def save_nothing(*_, **__): return False
+
 def _update_annotation(
     f: lu.WrappedFun,
     orig_type: tuple[tuple[core.AbstractValue, bool], ...] | None,
@@ -156,15 +158,18 @@ def linearize_jaxpr(
     nonzeros: Sequence[bool],
     instantiate: bool | Sequence[bool] = False,
     allow_fwds: bool | Sequence[bool] = True,
+    policy: Callable | None = None,
 ) -> tuple[core.ClosedJaxpr, int, Sequence[bool], Sequence[int | None], core.ClosedJaxpr]:
   if type(allow_fwds) is bool:
     allow_fwds = (allow_fwds,) * (len(jaxpr.consts) + len(jaxpr.jaxpr.invars))
   assert len(allow_fwds) == (len(jaxpr.consts) + len(jaxpr.jaxpr.invars))
   if type(instantiate) is bool:
     instantiate = (instantiate,) * len(jaxpr.jaxpr.outvars)
+  if policy is None:
+    policy = save_nothing
   assert len(instantiate) == len(jaxpr.jaxpr.outvars)
   return _linearize_jaxpr(jaxpr, tuple(nonzeros), tuple(instantiate),
-                          tuple(allow_fwds))
+                          tuple(allow_fwds), policy)
 
 @weakref_lru_cache
 @source_info_util.reset_name_stack()
@@ -173,11 +178,12 @@ def _linearize_jaxpr(
     nonzeros: tuple[bool, ...],
     instantiate: tuple[bool, ...],
     allow_fwds: tuple[bool, ...],
+    policy: Callable,
 ) -> tuple[core.ClosedJaxpr, int, Sequence[bool], Sequence[int | None], core.ClosedJaxpr]:
   dbg = jaxpr.jaxpr.debug_info
   primal_trace = pe.DynamicJaxprTrace(dbg)
   tangent_trace = pe.DynamicJaxprTrace(dbg, auto_dce=True)
-  lin_trace = LinearizeTrace(primal_trace, tangent_trace)
+  lin_trace = LinearizeTrace(primal_trace, tangent_trace, policy=policy)
   tangent_trace.tag = lin_trace.tag
 
   def new_arg(trace, primal_aval, nz, source_info):
@@ -860,11 +866,12 @@ call_transpose_param_updaters: dict[core.Primitive, Callable] = {}
 
 class LinearizeTrace(Trace):
 
-  def __init__(self, parent_trace, tangent_trace, tag=None):
+  def __init__(self, parent_trace, tangent_trace, *, policy, tag=None):
     super().__init__()
-    self.tag = core.TraceTag() if tag is None else tag
     self.parent_trace = parent_trace
     self.tangent_trace = tangent_trace
+    self.tag = core.TraceTag() if tag is None else tag
+    self.policy = policy
     self._name_stack_prefix_len = len(source_info_util.current_name_stack())
     self.requires_low = False
 
@@ -889,7 +896,7 @@ class LinearizeTrace(Trace):
     lin = primitive_linearizations.get(primitive, fallback)
     with core.set_current_trace(self.parent_trace):
       primal_out, tangent_nzs_out, residuals, linearized = lin(
-          tangent_nzs, *primals_in, **params)
+          policy, tangent_nzs, *primals_in, **params)
     with (core.set_current_trace(self.tangent_trace),
           source_info_util.set_name_stack(self._name_stack_suffix())):
       tangent_out = linearized(residuals, *tangents_in)
@@ -1042,8 +1049,9 @@ def maybe_linearize_tracer(trace, primal, is_nonzero, tangent):
     assert type(tangent) is Zero
     return primal
 
-def fallback_linearize_rule(_prim: core.Primitive,
-                            _nonzeros: Sequence[bool], *primals, **params):
+def fallback_linearize_rule(
+    _prim: core.Primitive, policy: Callable, _nonzeros: Sequence[bool],
+    *primals, **params):
   jvp = primitive_jvps.get(_prim)
   if not jvp:
     msg = f"Differentiation rule for '{_prim}' not implemented"
@@ -1051,14 +1059,16 @@ def fallback_linearize_rule(_prim: core.Primitive,
   debug_jvp = debug_info("linearize_prim_jvp", jvp, primals, params)
   return linearize_from_jvp(lu.wrap_init(jvp, debug_info=debug_jvp),
                             _prim.multiple_results, _nonzeros, False, False,
-                            primals, params)
+                            primals, params, policy)
 
 def linearize_from_jvp(jvp: lu.WrappedFun,
                        multiple_results: bool,
                        nonzeros: Sequence[bool],
                        user_facing_symbolic_zeros: bool, instantiate_input_zeros: bool,
-                       primals, params):
+                       primals, params, policy):
   current_name_stack = source_info_util.current_name_stack()
+  # TODO because this should be first-order primitives, when policy is
+  # nontrivial, try making a jaxpr then munging it (jvp, partial_eval_custom)
   with core.take_current_trace() as parent_trace:
     trace = pe.JaxprTrace(parent_trace, current_name_stack, core.TraceTag())
     tangent_avals = [get_aval(p).to_tangent_aval() for p in primals]

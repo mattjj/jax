@@ -550,6 +550,30 @@ def remat_jvp(primals, tangents, jaxpr, prevent_cse, differentiated, policy):
   return out_primals, out_tangents
 ad.primitive_jvps[remat_p] = remat_jvp
 
+def _remat_linearize(
+    nzs, *primals_in, jaxpr, prevent_cse: bool, differentiated: bool, policy):
+  primal_jaxpr, num_residuals_out, nzs_out, in_fwd_res, tangent_jaxpr = \
+      ad.linearize_jaxpr(pe.close_jaxpr(jaxpr), nzs, policy=policy)
+  primal_jaxpr = _insert_reduce_precision(primal_jaxpr.jaxpr, num_residuals_out)
+  primals_res_out = core.eval_jaxpr(primal_jaxpr, (), *primals_in)  # TODO?
+  primals_out, res = split_list(primals_res_out, [len(nzs_out)])
+  tangent_avals_out = [x.aval.to_tangent_aval() for x in jaxpr.outvars]
+
+  def tangent_fun(res, *tangents):
+    tangents_nz = [t for t in tangents if not isinstance(t, ad.Zero)]
+    tangents_out_nz = remat_p.bind(
+        *res, *tangents_nz, jaxpr=tangent_jaxpr.jaxpr, prevent_cse=prevent_cse,
+        differentiated=True, policy=policy)
+    tangents_out_nz_ = iter(tangents_out_nz)
+    tangents_out = [next(tangents_out_nz_) if nz else ad.Zero(aval)
+                    for aval, nz in zip(tangent_avals_out, nzs_out)]
+    assert next(tangents_out_nz_, None) is None
+    return tangents_out
+
+  return primals_out, nzs_out, res, tangent_fun
+
+ad.primitive_linearizations[remat_p] = _remat_linearize
+
 def remat_partial_eval(trace: pe.JaxprTrace, *tracers: core.Tracer,
                        jaxpr: core.Jaxpr, **params):
   assert not jaxpr.constvars
@@ -677,11 +701,10 @@ def remat_transpose(out_cts, *in_primals, jaxpr, **params):
   transposed_jaxpr = pe.convert_constvars_jaxpr(transposed_jaxpr)
   args, _ = tree_flatten((in_primals, out_cts))
   in_cts_nz = remat_p.bind(*consts, *args, jaxpr=transposed_jaxpr, **params)
-  in_cts_nz_, in_zeros_ = iter(in_cts_nz), iter(in_zeros)
-  in_cts = [None if not ad.is_undefined_primal(x) else
-            ad_util.Zero(x.aval) if next(in_zeros_) else next(in_cts_nz_)
+  in_cts_nz_ = iter(in_cts_nz)
+  in_cts = [None if not ad.is_undefined_primal(x) else next(in_cts_nz_)
             for x in in_primals]
-  assert next(in_cts_nz_, None) is next(in_zeros_, None) is None
+  assert next(in_cts_nz_, None) is None
   return in_cts
 ad.primitive_transposes[remat_p] = remat_transpose
 
@@ -704,36 +727,14 @@ def _transpose_jaxpr(jaxpr: core.ClosedJaxpr,
   cell = lambda: None
 
   def transposed(*args_flat):
-    ins_flat, out_cts_flat = split_list(args_flat, [len(in_lin) - sum(in_lin)])
-
-    # Evaluate nonlinear parts using partial evaluation to get a linear jaxpr.
-    ins_iter = iter(ins_flat)
-    in_pvals = [pe.PartialVal.unknown(aval) if lin else
-                pe.PartialVal.known(next(ins_iter))
+    ins_flat, out_cts = split_list(args_flat, [len(in_lin) - sum(in_lin)])
+    ins_flat_ = iter(ins_flat)
+    ins_flat = [ad.UndefinedPrimal(aval) if lin else next(ins_flat_)
                 for aval, lin in zip(jaxpr.in_avals, in_lin)]
-    assert next(ins_iter, None) is None
-
-    # TODO(mattjj): revise not to require disabling checks
-    with config.mutable_array_checks(False):
-      jaxpr_rematted, lin_jaxpr, out_uk, res_avals = \
-          pe.partial_eval_jaxpr_nounits(jaxpr, in_lin, False)
-    with source_info_util.extend_name_stack('rematted_computation'):
-      consts = core.jaxpr_as_fun(jaxpr_rematted)(*ins_flat)
-
-    # Transpose the linear jaxpr (which only has linear inputs).
-    out_cts_iter = iter(out_cts_flat)
-    out_cts = [ad_util.Zero(aval) if zero else next(out_cts_iter)
-               for aval, zero in zip(jaxpr.out_avals, out_zeros)]
-    assert next(out_cts_iter, None) is None
-    dummy_args = [ad.UndefinedPrimal(aval) for aval in lin_jaxpr.in_avals[len(consts):]]
-    in_cts = ad.backward_pass(lin_jaxpr.jaxpr, False, lin_jaxpr.consts,
-                              [*consts, *dummy_args], out_cts)
-    in_cts = in_cts[len(consts):]
-
-    # Identify symbolic zeros in the resulting cotangents, and return nonzeros.
+    assert next(ins_flat_, None) is None
+    in_cts = ad.backward_pass(jaxpr.jaxpr, False, jaxpr.consts, ins_flat, out_cts)
     in_zeros = cell.in_cts_zero = [type(ct) is ad_util.Zero for ct in in_cts]
-    in_cts_nz, _ = partition_list(in_zeros, in_cts)
-    return in_cts_nz
+    return [x for x, z in zip(in_cts, in_zeros) if not z]
 
   transposed_wrapped = lu.wrap_init(transposed, debug_info=jaxpr.jaxpr.debug_info)
   transposed_jaxpr_, _, consts = pe.trace_to_jaxpr_dynamic(
