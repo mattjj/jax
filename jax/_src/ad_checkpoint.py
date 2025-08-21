@@ -551,7 +551,7 @@ def remat_jvp(primals, tangents, jaxpr, prevent_cse, differentiated, policy):
 ad.primitive_jvps[remat_p] = remat_jvp
 
 def remat_partial_eval(trace: pe.JaxprTrace, *tracers: core.Tracer,
-                       jaxpr: core.Jaxpr, **params):
+                       jaxpr: core.Jaxpr, prevent_cse, **params):
   assert not jaxpr.constvars
   disallowed_effects = effects.remat_allowed_effects.filter_not_in(jaxpr.effects)
   if disallowed_effects:
@@ -579,11 +579,14 @@ def remat_partial_eval(trace: pe.JaxprTrace, *tracers: core.Tracer,
   # on producers of any residuals. See https://github.com/jax-ml/jax/pull/22244.
   jaxpr_known_ = _insert_reduce_precision(jaxpr_known, num_res)
 
-  # compute known outputs and residuals (hoisted out of remat primitive)
+  # Compute known outputs and residuals (hoisted out of remat primitive)
   _, in_consts_ = unzip2(t.pval for t in tracers if t.pval.is_known())
   _, in_consts = partition_list(in_used_known, in_consts_)
   out_consts = core.eval_jaxpr(jaxpr_known_, (), *in_consts)
   out_knowns, residuals = split_list(out_consts, [len(out_consts)-num_res])
+
+  # Only prevent cse on intermediate residuals, not on forwarded inputs.
+  breakpoint()  # TODO
 
   # set up unknown outputs with a recipe to call remat
   res_tracers = map(trace.new_instantiated_const, residuals)
@@ -803,11 +806,15 @@ def _remat_lowering(
 ):
   jaxpr_args: Sequence[mlir.IrValues]
   if differentiated and prevent_cse:
-    arg_types = map(mlir.aval_to_ir_type, ctx.avals_in)
-    flat_args = mlir.flatten_ir_values(args)
-    barrier_op = hlo.OptimizationBarrierOp(flat_args)
-    jaxpr_args = mlir.unflatten_ir_values_like_types(
-      barrier_op.results, arg_types)
+    # TODO DO NOT SUBMIT instead of overloading prevent_cse, let's add a new arg
+    if isinstance(prevent_cse, bool):
+      prevent_cse = (prevent_cse,) * len(ctx.avals_in)
+    _, barrier_avals = partition_list(prevent_cse, ctx.avals_in)
+    other_args, barrier_args = partition_list(prevent_cse, args)
+    barrier_op = hlo.OptimizationBarrierOp(mlir.flatten_ir_values(barrier_args))
+    barrier_results = mlir.unflatten_ir_values_like_types(
+        barrier_op.results, map(mlir.aval_to_ir_type, barrier_avals))
+    jaxpr_args = merge_lists(prevent_cse, other_args, barrier_results)
   else:
     jaxpr_args = args
   outs, tokens_out = mlir.jaxpr_subcomp(

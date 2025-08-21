@@ -5310,6 +5310,12 @@ class RematTest(jtu.JaxTestCase):
     self.assertEqual(len(sin_calls), 1)
     self.assertEqual(len(cos_calls), 2)
 
+  def test_remat_basic_fwd(self):
+    @jax.remat
+    def g(x):
+      return x * lax.sin(x)
+    jax.grad(g)(3.)
+
   @parameterized.named_parameters(
       {"testcase_name": f"{suffix}", "remat": remat}
       for suffix, remat in [
