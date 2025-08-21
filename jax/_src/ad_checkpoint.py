@@ -343,9 +343,10 @@ def checkpoint(fun: Callable, *, prevent_cse: bool = True,
     args_flat, in_tree = tree_flatten((args, kwargs))
     in_avals = [core.shaped_abstractify(x) for x in args_flat]
     jaxpr, consts, out_tree = _trace_to_jaxpr(fun_, in_tree, tuple(in_avals), debug)
+    res_input = (False,) * len(in_avals)
     out_flat = remat_p.bind(
         *consts, *args_flat, jaxpr=jaxpr, prevent_cse=prevent_cse,
-        differentiated=False, policy=policy)
+        differentiated=False, policy=policy, res_input=res_input)
     return tree_unflatten(out_tree, out_flat)
   return fun_remat
 
@@ -525,16 +526,17 @@ remat_p = core.Primitive('remat2')
 remat_p.multiple_results = True
 
 @remat_p.def_impl
-def remat_impl(*args, jaxpr, prevent_cse, differentiated, policy):
-  del prevent_cse, differentiated, policy  # Unused.
+def remat_impl(*args, jaxpr, prevent_cse, differentiated, policy, res_input):
+  del prevent_cse, differentiated, policy, res_input  # Unused.
   return core.eval_jaxpr(jaxpr, (), *args)
 
 @remat_p.def_effectful_abstract_eval
-def remat_abstract_eval(*args, jaxpr, prevent_cse, differentiated, policy):
-  del args, prevent_cse, differentiated, policy  # Unused.
+def remat_abstract_eval(*args, jaxpr, prevent_cse, differentiated, policy, res_input):
+  del args, prevent_cse, differentiated, policy, res_input  # Unused.
   return [v.aval for v in jaxpr.outvars], jaxpr.effects
 
-def remat_jvp(primals, tangents, jaxpr, prevent_cse, differentiated, policy):
+def remat_jvp(primals, tangents, jaxpr, prevent_cse, differentiated, policy,
+              res_input):
   assert not jaxpr.constvars
   in_nonzeros = [type(t) is not ad_util.Zero for t in tangents]
   jaxpr_jvp_, out_nz = ad.jvp_jaxpr(pe.close_jaxpr(jaxpr), in_nonzeros, False)
@@ -542,7 +544,8 @@ def remat_jvp(primals, tangents, jaxpr, prevent_cse, differentiated, policy):
   jaxpr_jvp = pe.convert_constvars_jaxpr(jaxpr_jvp_.jaxpr)
   outs = remat_p.bind(
       *jaxpr_jvp_.consts, *primals, *nonzero_tangents, jaxpr=jaxpr_jvp,
-      prevent_cse=prevent_cse, differentiated=differentiated, policy=policy)
+      prevent_cse=prevent_cse, differentiated=differentiated, policy=policy,
+      res_input=res_input + (False,) * len(nonzero_tangents))
   out_primals, out_tangents_ = split_list(outs, [len(jaxpr.outvars)])
   out_tangents_ = iter(out_tangents_)
   out_tangents = [next(out_tangents_) if nz else ad_util.Zero.from_primal_value(p)
@@ -551,7 +554,7 @@ def remat_jvp(primals, tangents, jaxpr, prevent_cse, differentiated, policy):
 ad.primitive_jvps[remat_p] = remat_jvp
 
 def remat_partial_eval(trace: pe.JaxprTrace, *tracers: core.Tracer,
-                       jaxpr: core.Jaxpr, prevent_cse, **params):
+                       jaxpr: core.Jaxpr, res_input, **params):
   assert not jaxpr.constvars
   disallowed_effects = effects.remat_allowed_effects.filter_not_in(jaxpr.effects)
   if disallowed_effects:
@@ -585,16 +588,16 @@ def remat_partial_eval(trace: pe.JaxprTrace, *tracers: core.Tracer,
   out_consts = core.eval_jaxpr(jaxpr_known_, (), *in_consts)
   out_knowns, residuals = split_list(out_consts, [len(out_consts)-num_res])
 
-  # Only prevent cse on intermediate residuals, not on forwarded inputs.
-  breakpoint()  # TODO
-
   # set up unknown outputs with a recipe to call remat
   res_tracers = map(trace.new_instantiated_const, residuals)
   _, tracers_staged = partition_list(in_used_staged, tracers)
+  _, res_input = partition_list(in_used_staged, res_input)
   in_jaxpr_tracers = res_tracers + map(trace.instantiate_const, tracers_staged)  # type: ignore
   out_jaxpr_tracers = [pe.JaxprTracer(trace, pe.PartialVal.unknown(x.aval), None)
                        for x in jaxpr_unknown.outvars]
-  new_params = dict(params, jaxpr=jaxpr_unknown, differentiated=True)
+  res_input = (True,) * len(res_tracers) + tuple(res_input)
+  new_params = dict(params, jaxpr=jaxpr_unknown, differentiated=True,
+                    res_input=res_input)
   recipe = pe.new_eqn_recipe(trace, in_jaxpr_tracers, out_jaxpr_tracers, remat_p,
                              new_params, jaxpr_unknown.effects,
                              source_info_util.current())
@@ -665,12 +668,16 @@ def _insert_reduce_precision(jaxpr: core.Jaxpr, num_res: int) -> core.Jaxpr:
 
 def remat_partial_eval_custom_params_updater(*args):
   *_, params_known, params_staged = args
-  return params_known, dict(params_staged, differentiated=True)
+  res_input = ...
+  new_params_staged = dict(params_staged, differentiated=True,
+                           res_input=tuple(res_input))
+  return params_known, new_params_staged
 pe.partial_eval_jaxpr_custom_rules[remat_p] = \
     partial(pe.call_partial_eval_custom_rule, 'jaxpr',
             remat_partial_eval_custom_params_updater)
 
-def remat_transpose(out_cts, *in_primals, jaxpr, **params):
+def remat_transpose(out_cts, *in_primals, jaxpr, res_input, **params):
+  breakpoint()
   assert not jaxpr.constvars
   in_linear = [ad.is_undefined_primal(x) for x in in_primals]
   out_zeros = [type(ct) is ad_util.Zero for ct in out_cts]
@@ -679,7 +686,10 @@ def remat_transpose(out_cts, *in_primals, jaxpr, **params):
   transposed_jaxpr, consts = transposed_jaxpr_.jaxpr, transposed_jaxpr_.consts
   transposed_jaxpr = pe.convert_constvars_jaxpr(transposed_jaxpr)
   args, _ = tree_flatten((in_primals, out_cts))
-  in_cts_nz = remat_p.bind(*consts, *args, jaxpr=transposed_jaxpr, **params)
+  res_input, _ = partition_list(in_linear, res_input)
+  res_input = res_input + [False] * (len(out_zeros) - sum(out_zeros))
+  in_cts_nz = remat_p.bind(*consts, *args, jaxpr=transposed_jaxpr,
+                           res_input=tuple(res_input), **params)
   in_cts_nz_, in_zeros_ = iter(in_cts_nz), iter(in_zeros)
   in_cts = [None if not ad.is_undefined_primal(x) else
             ad_util.Zero(x.aval) if next(in_zeros_) else next(in_cts_nz_)
@@ -738,7 +748,8 @@ def _transpose_jaxpr(jaxpr: core.ClosedJaxpr,
     in_cts_nz, _ = partition_list(in_zeros, in_cts)
     return in_cts_nz
 
-  transposed_wrapped = lu.wrap_init(transposed, debug_info=jaxpr.jaxpr.debug_info)
+  dbg = jaxpr.jaxpr.debug_info._replace(arg_names=(), result_paths=())
+  transposed_wrapped = lu.wrap_init(transposed, debug_info=dbg)
   transposed_jaxpr_, _, consts = pe.trace_to_jaxpr_dynamic(
       transposed_wrapped, in_avals)
   transposed_jaxpr = core.ClosedJaxpr(transposed_jaxpr_, consts)
@@ -762,7 +773,8 @@ def remat_dce(used_outputs: list[bool], eqn: core.JaxprEqn
   if not any(used_outputs) and not pe.has_effects(eqn):
     return [False] * len(eqn.invars), None
   new_jaxpr, used_inputs = pe.dce_jaxpr(eqn.params['jaxpr'], used_outputs)
-  new_params = dict(eqn.params, jaxpr=new_jaxpr)
+  res_input = [b for b, u in zip(eqn.params['res_input'], used_inputs) if u]
+  new_params = dict(eqn.params, jaxpr=new_jaxpr, res_input=tuple(res_input))
   if (not any(used_inputs) and not any(used_outputs) and
       _has_effects(new_jaxpr.effects)):
     return used_inputs, None
@@ -803,18 +815,16 @@ def _remat_lowering(
     prevent_cse: bool,
     differentiated: bool,
     policy,
+    res_input,
 ):
   jaxpr_args: Sequence[mlir.IrValues]
   if differentiated and prevent_cse:
-    # TODO DO NOT SUBMIT instead of overloading prevent_cse, let's add a new arg
-    if isinstance(prevent_cse, bool):
-      prevent_cse = (prevent_cse,) * len(ctx.avals_in)
-    _, barrier_avals = partition_list(prevent_cse, ctx.avals_in)
-    other_args, barrier_args = partition_list(prevent_cse, args)
+    _, barrier_avals = partition_list(res_input, ctx.avals_in)
+    other_args, barrier_args = partition_list(res_input, args)
     barrier_op = hlo.OptimizationBarrierOp(mlir.flatten_ir_values(barrier_args))
     barrier_results = mlir.unflatten_ir_values_like_types(
         barrier_op.results, map(mlir.aval_to_ir_type, barrier_avals))
-    jaxpr_args = merge_lists(prevent_cse, other_args, barrier_results)
+    jaxpr_args = merge_lists(res_input, other_args, barrier_results)
   else:
     jaxpr_args = args
   outs, tokens_out = mlir.jaxpr_subcomp(
