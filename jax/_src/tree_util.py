@@ -965,29 +965,54 @@ def register_dataclass(
       to have the semantics of a :obj:`~dataclasses.dataclass`: namely, class
       attributes represent the whole of the object state, and can be passed
       as keywords to the class constructor to create a copy of the object.
-      All defined attributes should be listed among ``meta_fields`` or ``data_fields``.
-    meta_fields: metadata field names: these are attributes which will be treated as
-      :term:`static` when this pytree is passed to :func:`jax.jit`. ``meta_fields`` is
-      optional only if ``nodetype`` is a dataclass, in which case individual fields can
-      be marked static via :func:`dataclasses.field` (see examples below).
-      Metadata fields *must* be static, hashable, immutable objects, as these objects
-      are used to generate JIT cache keys. In particular, metadata fields cannot contain
-      :class:`jax.Array` or :class:`numpy.ndarray` objects.
-    data_fields: data field names: these are attributes which will be treated as non-static
-      when this pytree is passed to :func:`jax.jit`. ``data_fields`` is optional only if
-      ``nodetype`` is a dataclass, in which case fields are assumed data fields unless
-      marked via :func:`dataclasses.field` (see examples below).
-      Data fields *must* be JAX-compatible objects such as arrays (:class:`jax.Array`
-      or :class:`numpy.ndarray`), scalars, or pytrees whose leaves are arrays or scalars.
-      Note that ``None`` is a valid data field, as JAX recognizes this as an empty pytree.
+      If using the optional ``meta_fields`` or ``data_fields`` arguments, all
+      defined attributes should be listed among these arguments.
+    meta_fields: optional alternative to ``dataclasses.field(static=True)``
+      metadata field names: these are attributes which will be treated as
+      :term:`static` when this pytree is passed to :func:`jax.jit`.
+      ``meta_fields`` is optional only if ``nodetype`` is a dataclass, in which
+      case individual fields can be marked static via :func:`dataclasses.field`
+      (see examples below). Metadata fields *must* be static, hashable,
+      immutable objects, as these objects are used to generate JIT cache keys.
+      In particular, metadata fields cannot contain :class:`jax.Array` or
+      :class:`numpy.ndarray` objects.
+    data_fields: optional, data field names: these are attributes which will be
+      treated as non-static when this pytree is passed to :func:`jax.jit`.
+      ``data_fields`` is optional only if ``nodetype`` is a dataclass, in which
+      case fields are assumed data fields unless marked via
+      :func:`dataclasses.field` (see examples below). Data fields *must* be
+      JAX-compatible objects such as arrays (:class:`jax.Array` or
+      :class:`numpy.ndarray`), scalars, or pytrees whose leaves are arrays or
+      scalars. Note that ``None`` is a valid data field, as JAX recognizes this
+      as an empty pytree.
 
   Returns:
-    The input class ``nodetype`` is returned unchanged after being added to JAX's
-    pytree registry, so that :func:`register_dataclass` can be used as a decorator.
+    The input class ``nodetype`` is returned unchanged after being added to
+    JAX's pytree registry, so that :func:`register_dataclass` can be used as a
+    decorator.
 
   Examples:
-    In JAX v0.4.35 or older, you must specify ``data_fields`` and ``meta_fields``
-    in order to use this decorator:
+    Starting in JAX v0.4.36, the ``data_fields`` and ``meta_fields`` arguments
+    are optional for :func:`~dataclasses.dataclass` inputs, with fields
+    defaulting to ``data_fields`` unless marked as static using `static`
+    metadata in :func:`dataclasses.field`.
+
+    >>> import jax
+    >>> from dataclasses import dataclass, field
+    ...
+    >>> @jax.tree_util.register_dataclass
+    ... @dataclass
+    ... class MyStruct:
+    ...   x: jax.Array  # defaults to non-static data field
+    ...   y: jax.Array  # defaults to non-static data field
+    ...   op: str = field(metadata=dict(static=True))  # marked as static meta field.
+    ...
+    >>> m = MyStruct(x=jnp.ones(3), y=jnp.arange(3), op='add')
+    >>> m
+    MyStruct(x=Array([1., 1., 1.], dtype=float32), y=Array([0, 1, 2], dtype=int32), op='add')
+
+    In JAX v0.4.35 or older, you must specify ``data_fields`` and
+    ``meta_fields`` in order to use this decorator:
 
     >>> import jax
     >>> from dataclasses import dataclass
@@ -1006,26 +1031,8 @@ def register_dataclass(
     >>> m
     MyStruct(x=Array([1., 1., 1.], dtype=float32), y=Array([0, 1, 2], dtype=int32), op='add')
 
-    Starting in JAX v0.4.36, the ``data_fields`` and ``meta_fields`` arguments are optional
-    for :func:`~dataclasses.dataclass` inputs, with fields defaulting to ``data_fields``
-    unless marked as static using `static` metadata in :func:`dataclasses.field`.
-
-    >>> import jax
-    >>> from dataclasses import dataclass, field
-    ...
-    >>> @jax.tree_util.register_dataclass
-    ... @dataclass
-    ... class MyStruct:
-    ...   x: jax.Array  # defaults to non-static data field
-    ...   y: jax.Array  # defaults to non-static data field
-    ...   op: str = field(metadata=dict(static=True))  # marked as static meta field.
-    ...
-    >>> m = MyStruct(x=jnp.ones(3), y=jnp.arange(3), op='add')
-    >>> m
-    MyStruct(x=Array([1., 1., 1.], dtype=float32), y=Array([0, 1, 2], dtype=int32), op='add')
-
-    Once this class is registered, it can be used with functions in :mod:`jax.tree` and
-    :mod:`jax.tree_util`:
+    Once this class is registered, it can be used with functions in
+    :mod:`jax.tree` and :mod:`jax.tree_util`:
 
     >>> leaves, treedef = jax.tree.flatten(m)
     >>> leaves
@@ -1035,9 +1042,10 @@ def register_dataclass(
     >>> jax.tree.unflatten(treedef, leaves)
     MyStruct(x=Array([1., 1., 1.], dtype=float32), y=Array([0, 1, 2], dtype=int32), op='add')
 
-    In particular, this registration allows ``m`` to be passed seamlessly through code
-    wrapped in :func:`jax.jit` and other JAX transformations, with ``data_fields`` being
-    treated as dynamic arguments, and ``meta_fields`` being treated as static arguments:
+    In particular, this registration allows ``m`` to be passed seamlessly
+    through code wrapped in :func:`jax.jit` and other JAX transformations, with
+    ``data_fields`` being treated as dynamic arguments, and ``meta_fields``
+    being treated as static arguments:
 
     >>> @jax.jit
     ... def compiled_func(m):
