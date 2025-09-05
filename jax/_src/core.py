@@ -652,6 +652,7 @@ class Primitive:
       trace_ctx.set_trace(prev_trace)
 
   def bind_with_trace(self, trace, args, params):
+    if str(self) == 'jit' and len(params['jaxpr'].out_avals) != len(params['out_shardings']): breakpoint()
     # TODO(mattjj,dougalm): remove this block?
     try: in_type = map(typeof, args)
     except: pass  # try lojax error message

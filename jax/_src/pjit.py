@@ -2201,11 +2201,13 @@ def _pjit_jvp(primals_in, tangents_in,
 ad.primitive_jvps[jit_p] = _pjit_jvp
 
 
-def _pjit_linearize(nzs, *primals_in, jaxpr, in_shardings, out_shardings,
-                    in_layouts, out_layouts, donated_invars, ctx_mesh, name,
-                    keep_unused, inline, compiler_options_kvs):
-  primal_jaxpr, num_residuals_out, nzs_out, in_fwd_res, tangent_jaxpr = \
-      ad.linearize_jaxpr(jaxpr, nzs)
+def _pjit_linearize(
+    nzs, primals_in, primal2s_in, policy, *, jaxpr, in_shardings, out_shardings,
+    in_layouts, out_layouts, donated_invars, ctx_mesh, name, keep_unused,
+    inline, compiler_options_kvs):
+  primal_jaxpr, primal2s_computed, nzs_out, in_fwd_res, tangent_jaxpr = \
+      ad.linearize_jaxpr(jaxpr, nzs, policy=policy)
+  num_residuals_out = sum(f is None for f in in_fwd_res)
   num_residuals_in = len(in_fwd_res)
   num_primals_out = len(primal_jaxpr.out_avals) - num_residuals_out
 
@@ -2250,49 +2252,51 @@ def _pjit_linearize(nzs, *primals_in, jaxpr, in_shardings, out_shardings,
   del keep
 
   tangent_avals_out = [a.to_tangent_aval() for a in jaxpr.out_avals]
+  primal2_shardings_out = keep_where(out_shardings, primal2s_computed)
+  primal2_layouts_out = keep_where(out_layouts, primal2s_computed)
 
   def tangent_fun(residuals, *tangents):
     tangents_nz = _filter_zeros(nzs, tangents)
-    nz_tangents_out = jit_p.bind(
+    # TODO it's such a pain
+    outs = jit_p.bind(
         *residuals, *tangents_nz, jaxpr=tangent_jaxpr,
         in_shardings=res_shardings_in + _filter_zeros(nzs, in_shardings),
-        out_shardings=_filter_zeros(nzs_out, out_shardings),
+        out_shardings=primal2_shardings_out + _filter_zeros(nzs_out, out_shardings),
         in_layouts=res_layouts_in + _filter_zeros(nzs, in_layouts),
-        out_layouts=_filter_zeros(nzs_out, out_layouts),
+        out_layouts=primal2_layouts_out + _filter_zeros(nzs_out, out_layouts),
         donated_invars=res_donated + _filter_zeros(nzs, donated_invars),
-        ctx_mesh=ctx_mesh,
-        name=name,
-        keep_unused=keep_unused,
-        inline=inline,
+        ctx_mesh=ctx_mesh, name=name, keep_unused=keep_unused, inline=inline,
         compiler_options_kvs=compiler_options_kvs)
+    primal2s_inst, nz_tangents_out = split_list(outs, [sum(primal2s_computed)])
+
+    primal2s_inst_ = iter(primal2s_inst)
+    primal2s_out = [next(primal2s_inst_) if computed else None
+                    for computed in primal2s_computed]
+    assert next(primal2s_inst_, None) is None
+
     nz_tangents_out_ = iter(nz_tangents_out)
     tangents_out = [next(nz_tangents_out_) if nz else ad.Zero(aval)
                    for (aval, nz) in zip(tangent_avals_out, nzs_out)]
-    return tangents_out
+
+    return primal2s_out, tangents_out
 
   def _filter_zeros(is_nz_l, l):
     return tuple(x for nz, x in zip(is_nz_l, l) if nz)
 
   assert len(in_shardings) == len(primal_jaxpr.in_avals)
-  ans = jit_p.bind(*primals_in, jaxpr=primal_jaxpr,
-                   in_shardings=in_shardings,
-                   out_shardings=primal_out_shardings,
-                   in_layouts=in_layouts,
-                   out_layouts=primal_out_layouts,
-                   donated_invars=donated_invars,
-                   ctx_mesh=ctx_mesh,
-                   name=name,
-                   keep_unused=keep_unused,
-                   inline=inline,
-                   compiler_options_kvs=compiler_options_kvs)
+  ans = jit_p.bind(
+      *primals_in, jaxpr=primal_jaxpr, in_shardings=in_shardings,
+      out_shardings=primal_out_shardings, in_layouts=in_layouts,
+      out_layouts=primal_out_layouts, donated_invars=donated_invars,
+      ctx_mesh=ctx_mesh, name=name, keep_unused=keep_unused, inline=inline,
+      compiler_options_kvs=compiler_options_kvs)
   ans = subs_list(out_fwd, ans, ans)
-  ans = subs_list(in_fwd, primals_in, ans)
+  ans = subs_list(in_fwd, primal2s_in, ans)
   primal_ans, residuals_ans = split_list(ans, [len(ans) - num_residuals_out])
   residuals_ans = subs_list(in_fwd_res, [*jaxpr.consts, *primals_in], residuals_ans)
 
   return primal_ans, nzs_out, residuals_ans, tangent_fun
-
-ad.primitive_linearizations[jit_p] = _pjit_linearize
+ad.fancy_linearizations[jit_p] = _pjit_linearize
 
 
 def _pjit_partial_eval(trace: pe.JaxprTrace,

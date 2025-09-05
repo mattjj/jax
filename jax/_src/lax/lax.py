@@ -4341,7 +4341,7 @@ def _sin_lin(primal_trace, tangent_trace, policy,
 
 sin_p = standard_unop(_float | _complex, 'sin')
 ad.defjvp(sin_p, lambda g, x, accuracy: mul(g, cos(x, accuracy=accuracy)))
-ad.fanciest_linearizations[sin_p] = _sin_lin
+# ad.fanciest_linearizations[sin_p] = _sin_lin
 mlir.register_lowering(sin_p, _sin_lowering)
 core.pp_eqn_rules[sin_p] = _unary_with_accuracy_pp_rule
 batching.ragged_prop_rules[sin_p] = batching.ragged_mask_elementwise_rule

@@ -43,6 +43,7 @@ from jax._src.lib.mlir.dialects import hlo
 from jax._src.state import discharge
 from jax._src.state.types import AbstractRef
 from jax._src.traceback_util import api_boundary
+from jax._src.core import typeof
 from jax._src.tree_util import (
     PyTreeDef, tree_flatten, tree_unflatten, tree_structure, broadcast_prefix,
     tree_map)
@@ -201,7 +202,7 @@ checkpoint_policies = types.SimpleNamespace(
 
 @api_boundary
 def checkpoint(fun: Callable, *, prevent_cse: bool = True,
-               policy: Callable[..., bool] | None = None,
+               policy: Callable[..., bool] | None = None,  # TODO DO NOT SUBMIT
                static_argnums: int | tuple[int, ...] = (),
                ) -> Callable:
   """Make ``fun`` recompute internal linearization points when differentiated.
@@ -585,34 +586,36 @@ ad.primitive_jvps[remat_p] = remat_jvp
 def _remat_linearize(
     nzs, primals_in, primal2s_in, outer_policy, *,
     jaxpr, prevent_cse: bool, differentiated: bool, policy):
-  avail_primals_in = [x is not ad.unavail for x in primal2s_in]
-  primal_jaxpr, remat_jaxpr, primal2s_spec, nzs_out, in_fwd_res, tangent_jaxpr = \
-      ad.linearize_jaxpr(pe.close_jaxpr(jaxpr), avail_primals_in, nzs,
-                         policy=policy)
+  policy = outer_policy or policy  # outermost explicit policy wins
+  fwd_jaxpr, primal2s_computed, nzs_out, in_fwd_res, tangent_jaxpr = \
+      ad.linearize_jaxpr(pe.close_jaxpr(jaxpr), nzs, policy=policy)
   num_res_out = sum(f is None for f in in_fwd_res)
-  primal_jaxpr = _insert_reduce_precision(primal_jaxpr.jaxpr, num_res_out)
-  primals_res_out = core.eval_jaxpr(primal_jaxpr, (), *primals_in)
+  fwd_jaxpr = _insert_reduce_precision(fwd_jaxpr.jaxpr, num_res_out)
+  primals_res_out = core.eval_jaxpr(fwd_jaxpr, (), *primals_in)  # TODO trace time
   primals_out, res_ans = split_list(primals_res_out, [len(nzs_out)])
-  res1 = subs_list(in_fwd_res, primal2s_in, res_ans)
+  residuals = subs_list(in_fwd_res, primal2s_in, res_ans)
   tangent_avals_out = [x.aval.to_tangent_aval() for x in jaxpr.outvars]
 
-  def tangent_fun(res1, *tangents):
-    outs = core.eval_jaxpr(remat_jaxpr, (), *res1)
-    num_primal2s_out = sum(s is ad.inst for s in primal2s_spec)
-    primal2s_inst, res2 = split_list(outs, [num_primal2s_out])
-
+  def tangent_fun(residuals, *tangents):
     tangents_nz = [t for t in tangents if not isinstance(t, ad.Zero)]
-    tangents_out_nz = remat_p.bind(
-        *res2, *tangents_nz, jaxpr=tangent_jaxpr.jaxpr, prevent_cse=prevent_cse,
-        differentiated=True, policy=policy)
+    outs = remat_p.bind(
+        *residuals, *tangents_nz, jaxpr=tangent_jaxpr.jaxpr,
+        prevent_cse=prevent_cse, differentiated=True, policy=policy)
+    primal2s_inst, tangents_out_nz = split_list(outs, [sum(primal2s_computed)])
+
+    primal2s_inst_ = iter(primal2s_inst)
+    primal2s_out = [next(primal2s_inst_) if computed else None
+                    for computed in primal2s_computed]
+    assert next(primal2s_inst_, None) is None
+
     tangents_out_nz_ = iter(tangents_out_nz)
     tangents_out = [next(tangents_out_nz_) if nz else ad.Zero(aval)
                     for aval, nz in zip(tangent_avals_out, nzs_out)]
     assert next(tangents_out_nz_, None) is None
-    return primal2s_inst, tangents_out
 
-  return primals_out, primal2s_spec, nzs_out, res1, tangent_fun
+    return primal2s_out, tangents_out
 
+  return primals_out, nzs_out, residuals, tangent_fun
 ad.fancy_linearizations[remat_p] = _remat_linearize
 
 def remat_partial_eval(trace: pe.JaxprTrace, *tracers: core.Tracer,
@@ -761,7 +764,7 @@ def remat_transpose(out_cts, *in_primals, jaxpr, prevent_cse, **params):
   in_cts = [None if not ad.is_undefined_primal(x) else
             ad_util.Zero(x.aval) if next(in_zeros_) else next(in_cts_nz_)
             for x in in_primals]
-  assert next(in_cts_nz_, None) is None
+  assert next(in_cts_nz_, None) is next(in_zeros_, None) is None
   return in_cts
 ad.primitive_transposes[remat_p] = remat_transpose
 
@@ -784,14 +787,36 @@ def _transpose_jaxpr(jaxpr: core.ClosedJaxpr,
   cell = lambda: None
 
   def transposed(*args_flat):
-    ins_flat, out_cts = split_list(args_flat, [len(in_lin) - sum(in_lin)])
-    ins_flat_ = iter(ins_flat)
-    ins_flat = [ad.UndefinedPrimal(aval) if lin else next(ins_flat_)
+    ins_flat, out_cts_flat = split_list(args_flat, [len(in_lin) - sum(in_lin)])
+
+    # Evaluate nonlinear parts using partial evaluation to get a linear jaxpr.
+    ins_iter = iter(ins_flat)
+    in_pvals = [pe.PartialVal.unknown(aval) if lin else
+                pe.PartialVal.known(next(ins_iter))
                 for aval, lin in zip(jaxpr.in_avals, in_lin)]
-    assert next(ins_flat_, None) is None
-    in_cts = ad.backward_pass(jaxpr.jaxpr, False, jaxpr.consts, ins_flat, out_cts)
+    assert next(ins_iter, None) is None
+
+    # TODO(mattjj): revise not to require disabling checks
+    with config.mutable_array_checks(False):
+      jaxpr_rematted, lin_jaxpr, out_uk, res_avals = \
+          pe.partial_eval_jaxpr_nounits(jaxpr, in_lin, False)
+    with source_info_util.extend_name_stack('rematted_computation'):
+      consts = core.jaxpr_as_fun(jaxpr_rematted)(*ins_flat)
+
+    # Transpose the linear jaxpr (which only has linear inputs).
+    out_cts_iter = iter(out_cts_flat)
+    out_cts = [ad_util.Zero(aval) if zero else next(out_cts_iter)
+               for aval, zero in zip(jaxpr.out_avals, out_zeros)]
+    assert next(out_cts_iter, None) is None
+    dummy_args = [ad.UndefinedPrimal(aval) for aval in lin_jaxpr.in_avals[len(consts):]]
+    in_cts = ad.backward_pass(lin_jaxpr.jaxpr, False, lin_jaxpr.consts,
+                              [*consts, *dummy_args], out_cts)
+    in_cts = in_cts[len(consts):]
+
+    # Identify symbolic zeros in the resulting cotangents, and return nonzeros.
     in_zeros = cell.in_cts_zero = [type(ct) is ad_util.Zero for ct in in_cts]
-    return [x for x, z in zip(in_cts, in_zeros) if not z]
+    in_cts_nz, _ = partition_list(in_zeros, in_cts)
+    return in_cts_nz
 
   dbg = jaxpr.jaxpr.debug_info.with_unknown_names()
   transposed_wrapped = lu.wrap_init(transposed, debug_info=dbg)
@@ -889,6 +914,14 @@ def checkpoint_name(x, name):
 
 name_p.def_impl(lambda x, *, name: x)
 name_p.def_abstract_eval(lambda x, *, name: x)
+
+def name_lin(trace, primals_in, primal2s_in, tangents_in, *, name):
+  (x,), (x2,), (xdot,) = primals_in, primal2s_in, tangents_in
+  if trace.policy(name_p, typeof(x), name=name):
+    return [x], [x], [xdot]
+  else:
+    return [x], [x2], [xdot]
+ad.fanciest_linearizations[name_p] = name_lin
 
 def name_jvp(primals, tangents, *, name):
   (x,), (xdot,) = primals, tangents

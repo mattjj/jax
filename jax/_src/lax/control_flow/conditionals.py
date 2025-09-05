@@ -546,8 +546,9 @@ def _cond_batching_rule(axis_data, args, dims, *, branches, **params):
                       **params)
     return out, out_dims
 
-def _cond_linearize(nzs, *primals_in, branches, **params):
+def _cond_linearize(nzs, primals_in, primal2s_in, policy, *, branches, **params):
   idx_nz, *nzs = nzs
+  breakpoint()
   assert not idx_nz
   nzs_out = [ad.linearize_jaxpr(jaxpr, nzs, allow_fwds=False)[2]
              for jaxpr in branches]
@@ -792,8 +793,7 @@ def _merge_branch_residuals(branch_res_avals):
 def _join_cond_outputs(jaxprs: Sequence[core.ClosedJaxpr],
                        all_res_avals, res_aval_indices_per_jaxpr,
                        num_non_res_outputs) -> tuple[core.ClosedJaxpr, ...]:
-  def augment_jaxpr(jaxpr: core.ClosedJaxpr,
-                    res_indices):
+  def augment_jaxpr(jaxpr: core.ClosedJaxpr, res_indices):
     def f_aug(*args):
       outs_and_residuals = core.jaxpr_as_fun(jaxpr)(*args)
       outs, residuals = split_list(outs_and_residuals, [num_non_res_outputs])
@@ -1021,7 +1021,7 @@ cond_p.def_impl(partial(dispatch.apply_primitive, cond_p))
 cond_p.def_effectful_abstract_eval(_cond_abstract_eval)
 ad.primitive_jvps[cond_p] = _cond_jvp
 ad.primitive_transposes[cond_p] = _cond_transpose
-ad.primitive_linearizations[cond_p] = _cond_linearize
+ad.fancy_linearizations[cond_p] = _cond_linearize
 ad.fancy_transposes[cond_p] = _cond_transpose_fancy
 pe.custom_partial_eval_rules[cond_p] = _cond_partial_eval
 batching.fancy_primitive_batchers[cond_p] = _cond_batching_rule
