@@ -887,6 +887,22 @@ class MutableArrayTest(jtu.JaxTestCase):
     ans = jax.vmap(internally_pure)(jnp.arange(4.))
     self.assertAllClose(ans, jnp.array([1., 2., 3., 4.]))
 
+  def test_scan_vjp3_reverse(self):
+    # https://github.com/jax-ml/jax/issues/32411
+    def f(xs):
+      ys = jnp.arange(5.)
+
+      def body(_, xy):
+        x, y = xy
+        return (), x * y
+      (), z = jax.lax.scan(body, (), (xs, ys))
+      return z.sum()
+
+    grad_accum = jax.new_ref(jnp.zeros(5))
+    _, f_vjp = vjp3(f, jnp.ones(5))
+    _, = f_vjp.with_refs(grad_accum)(1.)
+    self.assertAllClose(grad_accum[...], jnp.arange(5.))
+
 
 @jtu.with_config(jax_mutable_array_checks=True)
 class MutableArrayErrorsTest(jtu.JaxTestCase):
