@@ -799,7 +799,7 @@ def matchaxis(axis_name, sz, mesh_axis, src, dst, x, sum_match=False):
     return moveaxis(x, src, dst)
   elif src is not_mapped and dst is not not_mapped:
     return broadcast(x, sz, canonicalize_axis(dst, np.ndim(x) + 1), mesh_axis)
-  elif dst is not_mapped and sum_match:
+  elif dst is not_mapped and sum_match or dst is sum_axis:
     return x.sum(src)
   else:
     if (not isinstance(axis_name, core._TempAxisName) and
@@ -843,3 +843,7 @@ skippable_batchers[add_jaxvals_p] = lambda _: ()
 ### mutable arrays
 
 defvectorized(core.ref_p)
+
+class Sum: pass
+sum_axis = Sum()
+spec_types.add(Sum)

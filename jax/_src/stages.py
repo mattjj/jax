@@ -422,10 +422,18 @@ class Traced(Stage):
   args_info = property(_traced_args_info)
   out_info = property(_traced_out_info)
   _num_consts = property(lambda self: len(self._consts))
+  _args_flat = property(lambda self: self._lfg.args[0])
+  _consts = property(lambda self: self._args_flat[:self._num_consts])
 
   @property
   def out_avals(self):
     return tree_unflatten(self.out_tree, self.jaxpr.out_avals)
+
+  def __call__(self, *args, **kwargs):
+    args_flat = tree_util.tree_leaves_checked(self.in_tree, (args, kwargs))
+    out_flat = core.jaxpr_as_fun(self.jaxpr)(*args_flat)
+    return tree_unflatten(self.out_tree, out_flat)
+
 
   @property
   def lojax(self) -> LoJax:
@@ -521,6 +529,32 @@ class LoJax:
   out_info = property(_traced_out_info)
   _num_consts = property(lambda self: len(self._consts))
 
+  def __call__(self, *args, **kwargs):
+    args_flat = tree_util.tree_leaves_checked(self.in_tree, (args, kwargs))
+    out_flat = core.jaxpr_as_fun(self.jaxpr)(*args_flat)
+    return tree_unflatten(self.out_tree, out_flat)
+
+  @property
+  def out_avals(self):
+    return tree_unflatten(self.out_tree, self.jaxpr.out_avals)
+
+  def lower(self, *, lowering_platforms: tuple[str, ...] | None = None,
+            _private_parameters: mlir.LoweringParameters | None = None):
+    """Lower to compiler input, returning a ``Lowered`` instance."""
+    if _private_parameters is None:
+      _private_parameters = mlir.LoweringParameters()
+    try:
+      lowering = self._lfg(**self._params,
+                           lowering_platforms=lowering_platforms,
+                           lowering_parameters=_private_parameters)
+    except DeviceAssignmentMismatchError as e:
+      fails, = e.args
+      msg = _device_assignment_mismatch_error(
+          self._params['name'], fails, self._args_flat, 'jit',
+          self.jaxpr.debug_info.safe_arg_names(len(self.jaxpr.in_avals)))
+      raise ValueError(msg) from None
+    return Lowered(lowering, self.args_info, self.out_tree,
+                   in_types=self._in_types, out_types=self._out_types)
 
 
 class Lowered(Stage):

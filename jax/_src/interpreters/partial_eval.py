@@ -790,6 +790,7 @@ def tracers_to_jaxpr(
   const_vars, const_vals = unzip2(consts.items())
   outvars = map(get_atom, out_tracers)  # type: ignore[arg-type]
   jaxpr_effects = make_jaxpr_effects(const_vars, invars, outvars, eqns)
+  is_high |= any(x.aval.is_high for x in it.chain(const_vars, invars, outvars))
   jaxpr = Jaxpr(const_vars, invars,  # type: ignore[arg-type]
                 outvars, eqns, jaxpr_effects,
                 debug_info)
@@ -2034,8 +2035,8 @@ class DynamicJaxprTrace(core.Trace):
     # TODO(mattjj,dougalm): clean up how we check for new-style hi primitives
     if primitive is call_hi_primitive_p:
       out_avals, effs = params['prim'].out_avals_flat, set()  # TODO effs
-    elif (primitive.name == "custom_lin" or
-        primitive.is_effectful and primitive.is_effectful(params)):
+    elif (primitive.name in ("custom_lin", "call_hi_primitive_linearized") or
+          primitive.is_effectful and primitive.is_effectful(params)):
       out_avals, effs = primitive.abstract_eval(*aval_qdds, **params)
     else:
       try:

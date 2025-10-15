@@ -37,7 +37,8 @@ from jax._src.util import safe_zip, safe_map
 from jax._src.state.discharge import run_state
 
 from jax._src.hijax import (HiPrimitive, HiType, Box, new_box, box_set, box_get,
-                            box_effect, register_hitype, ShapedArray, Ty)
+                            box_effect, register_hitype, ShapedArray, Ty,
+                            NewstyleHiPrimitive, custom_vjp3)
 from jax.experimental.hijax import VJPHiPrimitive
 
 config.parse_flags_with_absl()
@@ -698,7 +699,69 @@ class HijaxTest(jtu.JaxTestCase):
       return jnp.sum(dq(q(x)))
 
     x = jax.random.normal(jax.random.key(0), (3, 3), dtype='float32')
-    g = jax.grad(f)(x)
+    g = jax.grad(f)(x)  # don't crash
+
+  @parameterized.parameters([False, True])
+  @config.numpy_dtype_promotion('standard')
+  def test_newstyle_hiprimitive_vmap(self, jit):
+    class Prim(NewstyleHiPrimitive):
+      def __init__(self, aval):
+        super().__init__((aval,), aval)
+
+      def batch_dim_rule(self, dims):
+        d, = dims
+        return d
+
+      def expand(self, x):
+        return 2 * x
+
+      def vjp_fwd(self, x):
+        return 2 * x, x
+
+      def vjp_bwd(self, res, g):
+        return 2 * g,
+
+    def f(x):
+      aval = typeof(x)
+      return Prim(aval)(x)
+
+    if jit:
+      f = jax.jit(f)
+
+    xs = jax.random.normal(jax.random.key(0), (5, 3, 3), dtype='float32')
+    ys = jax.vmap(f)(xs)
+    self.assertAllClose(ys, 2 * xs, check_dtypes=False)
+
+    jax.grad(lambda xs: jax.vmap(f)(xs).sum())(xs)
+
+  @parameterized.parameters([False, True])
+  def test_custom_vjp3(self, jit):
+    @custom_vjp3
+    def f(x):
+      return jnp.sin(x)
+
+    def f_fwd(x):
+      return f(x), x
+
+    def f_bwd(x, g):
+      return jnp.cos(x) * g,
+
+    f.defvjp(f_fwd, f_bwd)
+
+    if jit:
+      f = jax.jit(f)
+
+    x = 2.
+    y = f(x)
+    self.assertAllClose(y, jnp.sin(x))
+
+    y2, f_vjp = jax.vjp(f, x)
+    x_bar, = f_vjp(1.)
+    self.assertAllClose(y2, jnp.sin(x))
+    self.assertAllClose(x_bar, jnp.cos(x))
+
+    xs = jnp.arange(12.).reshape(4, 3)
+    jax.grad(lambda xs: jax.vmap(f)(xs).sum())(xs)
 
 
 class BoxTest(jtu.JaxTestCase):

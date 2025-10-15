@@ -300,6 +300,8 @@ def _cpp_pjit(fun: Callable, jit_info: PjitInfo):
 
 @api_boundary
 def jit_trace(jit_func, *args, **kwargs) -> stages.Traced:
+  # TODO DO NOT SUBMIT holding onto arg values, shoudl only hold onto const vals
+  # and otehrwise hold onto type+metadata for abstracted inputs
   p, args_flat = _infer_params(jit_func._fun, jit_func._jit_info, args, kwargs)
   arg_types = map(convert_to_metaty, args_flat)
   return stages.Traced(arg_types, p.params, p.in_tree, p.out_tree, p.consts)
