@@ -338,6 +338,12 @@ def debug_print_impl(
   return ()
 
 
+def _pp_rule(eqn, ctx, settings):
+  params = dict(fmt='"' + eqn.params['fmt'] + '"')
+  return core._pp_eqn(eqn.replace(params=params), ctx, settings)
+core.pp_eqn_rules[debug_print_p] = _pp_rule
+
+
 @debug_print_p.def_effectful_abstract_eval
 def debug_print_abstract_eval(*avals: Any, fmt: str, ordered, **kwargs):
   del avals, fmt, kwargs  # Unused.
