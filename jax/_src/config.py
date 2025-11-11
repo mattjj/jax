@@ -1241,6 +1241,15 @@ random_seed_offset = int_state(
     include_in_trace_context=True,
 )
 
+remat_level = int_state(
+    name='jax_remat_level',
+    default=0,
+    include_in_jit_key=True,
+    include_in_trace_context=True,
+    help="help",
+)
+
+
 def _safer_randint_deprecation(new_val):
   if not new_val:
     deprecations.warn(
