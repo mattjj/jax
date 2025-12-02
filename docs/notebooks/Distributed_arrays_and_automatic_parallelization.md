@@ -66,7 +66,6 @@ from jax.sharding import PartitionSpec as P, NamedSharding
 ```{code-cell}
 :id: q-XBTEoy3vGG
 
-# Create a Sharding object to distribute a value across devices:
 mesh = jax.make_mesh((4, 2), ('x', 'y'))
 ```
 
