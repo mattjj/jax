@@ -1355,8 +1355,8 @@ class FlatTree:
   """
   def __init__(self, vals:Sequence, treedef:PyTreeDef):
     assert isinstance(treedef, pytree.PyTreeDef)
-    self.tree = treedef
     self.vals = tuple(vals)
+    self.tree = treedef
 
   def map(self, f:Callable) -> FlatTree:
     ans_vals = []
@@ -1435,6 +1435,7 @@ class FlatTree:
     return FlatTree(*tree_flatten(tree))
 
   def unflatten(self) -> PyTree:
+    # TODO recurse and unwrap things from Static
     return tree_unflatten(self.tree, self.vals)
 
   def update_from_list(self, new_vals:list) -> FlatTree:
@@ -1453,3 +1454,21 @@ class FlatTree:
 
   def __hash__(self):
     return hash((self.vals, self.tree))
+
+  @staticmethod
+  def flatten_with_static(tree, which_static: TupleTreeOfBools):
+    # TODO recurse and wrap things in Static
+    assert isinstance(args, tuple)
+    if static_argnums:
+      static_argnums = set(static_argnums)
+      args = tuple(Static(x) if i in static_argnums else x
+                   for i, x in enumerate(args))
+
+    return FlatTree.flatten(args)
+
+TupleTreeOfBools = bool | tuple[TupleTreeOfBools, ...]
+
+@register_static
+@dataclasses.dataclass(frozen=True)
+class Static:
+  val: Any

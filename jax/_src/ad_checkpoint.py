@@ -368,22 +368,24 @@ def checkpoint(fun: Callable, *, prevent_cse: bool = True,
   @wraps(fun)
   @api_boundary
   def fun_remat(*args, **kwargs):
-    debug = api_util.debug_info(
-        "checkpoint / remat", fun,
-        args, kwargs, static_argnums=static_argnums)
-    fun_, args = _remat_static_argnums(fun, static_argnums, args)
-    args_flat, in_tree = tree_flatten((args, kwargs))
-    in_avals = [core.shaped_abstractify(x) for x in args_flat]
-    jaxpr, consts, out_tree = _trace_to_jaxpr(fun_, in_tree, tuple(in_avals), debug)
+    dbg = api_util.debug_info("checkpoint / remat", fun, args, kwargs,
+                              static_argnums=static_argnums)
+    args = api_util.resolve_kwargs(fun, args, kwargs)
+    args_ft = FlatTree.flatten_with_static(args, static_argnums)
+    in_avals = args_ft.map(core.typeof)
+    jaxpr, out_avals = pe.trace_to_jaxpr(fun, in_avals, dbg)
+    jaxpr, consts = pe.separate_consts(jaxpr)
+
     if isinstance(prevent_cse, tuple):
       cse_args = (tuple(args), kwargs) if kwargs else tuple(args)
       cse = (False,) * len(consts) + tuple(broadcast_prefix(prevent_cse, cse_args))
     else:
       cse = prevent_cse
+
     out_flat = remat_p.bind(
-        *consts, *args_flat, jaxpr=jaxpr, prevent_cse=cse, differentiated=False,
-        policy=policy)
-    return tree_unflatten(out_tree, out_flat)
+        *consts, *args_ft, jaxpr=jaxpr.jaxpr, prevent_cse=cse,
+        differentiated=False, policy=policy)
+    return out_avals.update_from_list(out_flat).unflatten()
   return fun_remat
 
 
@@ -394,104 +396,6 @@ def remat(fun: Callable, *, prevent_cse: bool = True,
   """Alias of :func:`jax.checkpoint`."""
   return checkpoint(fun, prevent_cse=prevent_cse, policy=policy,
                     static_argnums=static_argnums, concrete=concrete)
-
-# This function is similar to api_util.argnums_partial, except the error
-# messages are specific to jax.remat (and thus more actionable), the
-# hashing/caching behavior is slightly different, and this function accepts a
-# boolean for static_argnums. Perhaps the two could be de-duplicated.
-def _remat_static_argnums(fun, static_argnums, args):
-  if type(static_argnums) is int:
-    static_argnums = (static_argnums,)
-  elif not (type(static_argnums) is tuple and
-            all(type(d) is int for d in static_argnums)):
-    raise TypeError("the `static_argnums` argument to `jax.checkpoint` / "
-                    "`jax.remat` must be an int, tuple of ints or, bool, but "
-                    f"got value {static_argnums}")
-
-  if not all(-len(args) <= d < len(args) for d in static_argnums):
-    raise ValueError("the `static_argnums` argument to `jax.checkpoint` / "
-                     "`jax.remat` can only take integer values greater than or "
-                     "equal to `-len(args)` and less than `len(args)`, but got "
-                     f"{static_argnums}, while `len(args)` = {len(args)}")
-
-  if not static_argnums:
-    return fun, args
-  nargs = len(args)
-  static_argnums_ = frozenset(d % len(args) for d in static_argnums)
-  dyn_args, static_args = [], []
-  for i, x in enumerate(args):
-    if i in static_argnums_: static_args.append(WrapHashably(x))
-    else: dyn_args.append(x)
-  new_fun = _dyn_args_fun(fun, static_argnums_, tuple(static_args), nargs)
-  return new_fun, dyn_args
-
-class WrapHashably:
-  val: Any
-  hash: int
-  hashable: bool
-
-  def __init__(self, val):
-    self.val = val
-    try:
-      self.hash = hash(val)
-      self.hashable = True
-    except:
-      self.hash = id(val)
-      self.hashable = False
-  def __hash__(self):
-    return self.hash
-  def __eq__(self, other):
-    if isinstance(other, WrapHashably):
-      if self.hashable and other.hashable:
-        return self.val == other.val
-      else:
-        return self.val is other.val
-    return False
-
-# This caching is useful to avoid retracing even when static_argnums is used.
-# See api_benchmark.py:bench_remat_eager_retracing_overheads_static_argnums.
-# On that benchmark, including this caching makes a ~10x difference (which can
-# be made arbitrary large by involving larger functions to be traced).
-def _dyn_args_fun(fun: Callable, static_argnums: frozenset[int],
-                  static_args: tuple[WrapHashably, ...], nargs: int):
-  if any(isinstance(x.val, core.Tracer) for x in static_args):
-    return _dyn_args_fun_uncached(fun, static_argnums, static_args, nargs)
-  return _dyn_args_fun_cached(fun, static_argnums, static_args, nargs)
-
-def _dyn_args_fun_uncached(fun: Callable, static_argnums: frozenset[int],
-                           static_args: tuple[WrapHashably, ...], nargs: int):
-  def new_fun(*dyn_args, **kwargs):
-    static_args_, dyn_args_ = iter(static_args), iter(dyn_args)
-    full_args = [next(static_args_).val if i in static_argnums
-                 else next(dyn_args_) for i in range(nargs)]
-    return fun(*full_args, **kwargs)
-  return new_fun
-
-_dyn_args_fun_cached = weakref_lru_cache(_dyn_args_fun_uncached)
-
-# This helper is similar to those in control_flow/common.py, but with
-# remat-specific errors.
-@weakref_lru_cache
-def _trace_to_jaxpr(fun: Callable,
-                    in_tree: PyTreeDef,
-                    in_avals: Sequence[core.AbstractValue],
-                    debug: core.DebugInfo
-                    ) -> tuple[core.Jaxpr, Sequence[Any], PyTreeDef]:
-  flat_fun, out_tree = api_util.flatten_fun(lu.wrap_init(fun, debug_info=debug), in_tree)
-  try:
-    jaxpr, _, consts = pe.trace_to_jaxpr_dynamic(flat_fun, in_avals)
-  except core.ConcretizationTypeError as e:
-    msg, = e.args
-    if 'for checkpoint' in msg:
-      msg += "\n\n" + (
-          "Consider using the `static_argnums` parameter for `jax.remat` or "
-          "`jax.checkpoint`. See the `jax.checkpoint` docstring and its example "
-          "involving `static_argnums`:\n"
-          "https://docs.jax.dev/en/latest/_autosummary/jax.checkpoint.html"
-          "\n")
-      e.args = msg,
-    raise
-  return pe.convert_constvars_jaxpr(jaxpr), consts, out_tree()
 
 
 ### Utilities
