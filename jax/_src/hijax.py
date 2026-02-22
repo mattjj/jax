@@ -418,6 +418,14 @@ class VJPHiPrimitive:
     raise NotImplementedError(f"for vmap support, subclass {type(self)} must "
                               "implement `batch` or `batch_dim_rule`")
 
+  # dce interface
+  def dce(self, used_outs):
+    used_outs_flat = tree_leaves_checked(self.out_tree, used_outs)
+    if not any(used_outs_flat):
+      return False, False, None
+    else:
+      return True, True, self
+
   def __call__(self, *args):
     args_flat = tree_leaves_checked(self.in_tree, args)
     ans_flat = call_hi_primitive_p.bind(*args_flat, _prim=self)
@@ -597,10 +605,18 @@ def _call_hi_primitive_jvp(primals, tangents, *, _prim):
 ad.primitive_jvps[call_hi_primitive_p] = _call_hi_primitive_jvp
 
 def _call_hi_primitive_dce(used_outs_flat, eqn):
-  if hasattr(prim := eqn.params['_prim'], 'dce'):
-    return prim.dce(used_outs_flat, eqn)
-  else:
-    return pe._default_dce_rule(used_outs_flat, eqn)
+  _prim = eqn.params['_prim']
+  used_out = tree_unflatten(_prim.out_tree, used_outs_flat)
+  used_ins, produced_outs, new_prim = _prim.dce(used_out)
+  if new_prim is None:
+    return [False] * len(eqn.invars), None
+  used_ins_flat = broadcast_prefix(used_ins, _prim.in_avals)
+  produced_outs_flat = broadcast_prefix(produced_outs, _prim.out_aval)
+  new_invars = [x for x, u in zip(eqn.invars, used_ins_flat) if u]
+  new_outvars = [v for v, u in zip(eqn.outvars, produced_outs_flat) if u]
+  new_eqn = eqn.replace(invars=new_invars, outvars=new_outvars,
+                        params=dict(_prim=new_prim))
+  return used_ins_flat, new_eqn
 pe.dce_rules[call_hi_primitive_p] = _call_hi_primitive_dce
 
 call_hi_primitive_linearized_p.to_lojax = ad.raise_custom_vjp_error_on_jvp
@@ -677,7 +693,7 @@ class CustomVJPTraced(VJPHiPrimitive):
     tangents = tree_map(ad_util.instantiate, tangents, is_leaf=zero)
     if self.opt_remat:  # type: ignore
       fwd_traced = api.jit(partial(self.vjp_fwd, (True,) * len(primals))).trace(*primals)
-      primals_out, residuals = OptRemat(self.traced, fwd_traced)(*primals)  # type: ignore
+      primals_out, residuals = OptRemat(self, fwd_traced)(*primals)  # type: ignore
     else:
       primals_out, residuals, *_ = self.vjp_fwd((True,) * len(primals), *primals)
     tangents_out_flat = fake_linear_op(self, [True] * len(tangents), residuals, *tangents)
@@ -771,37 +787,26 @@ class custom_vjp3:
     return prim(*args)
 
 class OptRemat(VJPHiPrimitive):
-  traced_primal: Any
+  orig: CustomVJPTraced
   traced_fwd: Any
 
-  def __init__(self, traced_primal, traced_fwd):
-    self.in_avals, _ = traced_primal.in_avals
+  def __init__(self, orig, traced_fwd):
+    self.in_avals = orig.in_avals
     self.out_aval = traced_fwd.out_avals
-    self.params = dict(traced_primal=traced_primal, traced_fwd=traced_fwd)
+    self.params = dict(orig=orig, traced_fwd=traced_fwd)
     super().__init__()
 
   def expand(self, *primals):
     return self.traced_fwd(*primals)
 
-  def dce(self, used_outs, eqn):
-    num_primals_in = len(self.traced_primal.jaxpr.in_avals)
-    num_primals_out = len(self.traced_primal.jaxpr.out_avals)
-    used_prims, used_res = split_list(used_outs, [num_primals_out])
-    if any(used_res):
-      return [True] * num_primals_in, eqn
+  def dce(self, used_outs):
+    used_primals, used_res = used_outs
+    if any(tree_leaves(used_res)):
+      return True, (True, True), self  # if any res used, no dce at all
+    elif any(tree_leaves(used_primals)):
+      return True, (True, False), self.orig  # if only primals used, undo AD
     else:
-      new_jaxpr, used_consts, used_ins = pe.dce_jaxpr_consts(
-          self.traced_primal.jaxpr.jaxpr, used_prims)
-      consts = self.traced_primal.jaxpr.consts
-      consts = [c for used, c in zip(used_consts, consts) if used]
-      closed_jaxpr = core.ClosedJaxpr(new_jaxpr, consts)
-      _, invars = split_list(eqn.invars, [len(consts)])
-      invars = [v for used, v in zip(used_ins, invars) if used]
-      outvars = [v for used, v in zip(used_outs, eqn.outvars) if used]
-      primal_eqn = pe.new_jaxpr_eqn(
-          invars, outvars, core.closed_call_p, dict(call_jaxpr=closed_jaxpr),
-          self.traced_primal.jaxpr.effects, eqn.source_info, eqn.ctx)
-      return [True] * num_primals_in, primal_eqn
+      return False, (False, False), None
 
   # TODO(mattjj): jvp and transpose? does anyone rely on them?
 
