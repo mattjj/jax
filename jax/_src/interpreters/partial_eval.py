@@ -1393,7 +1393,7 @@ def _prune_closed_jaxpr_outputs(
                      jaxpr.consts)
 
 
-def dce_jaxpr(jaxpr: Jaxpr, used_outputs: Sequence[bool],
+def dce_jaxpr(jaxpr: Jaxpr, used_outputs: bool | Sequence[bool],
               instantiate: bool | Sequence[bool] = False,
               ) -> tuple[Jaxpr, list[bool]]:
   """Runs dead-code elementation on a given jaxpr.
@@ -1408,6 +1408,8 @@ def dce_jaxpr(jaxpr: Jaxpr, used_outputs: Sequence[bool],
   Returns:
     A tuple of ``(new_jaxpr, used_inputs)``.
   """
+  if type(used_outputs) is bool:
+    used_outputs = (used_outputs,) * len(jaxpr.outvars)
   if type(instantiate) is bool:
     instantiate = (instantiate,) * len(jaxpr.invars)
   # pyrefly: ignore[bad-argument-type]  # pyrefly#2530
