@@ -243,15 +243,13 @@ def _eval_jaxpr_discharge_state(
         invals = map(env.read, eqn.invars)
         in_avals = [v.aval for v in eqn.invars]
         out_avals = [v.aval for v in eqn.outvars]
-        new_invals, ans = rule(
-            in_avals, out_avals, *invals, **eqn.params)
+        new_invals, ans = rule(in_avals, out_avals, *invals, **eqn.params)
         for invar, should, new_inval in zip(eqn.invars, should_discharge, new_invals):
           if new_inval is not None:
             if not should:
               raise ValueError(
                   f"Did not ask for inval to be discharged but it was. ({invar=},"
-                  f" {new_inval=})"
-              )
+                  f" {new_inval=})")
             env.write(invar, new_inval)  # type: ignore[arg-type]
       else:
         # Default primitive rule, similar to `core.eval_jaxpr`. Note that here

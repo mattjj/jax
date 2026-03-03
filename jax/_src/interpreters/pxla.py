@@ -2245,10 +2245,17 @@ def lower_sharding_computation(
   in_shardings = tuple(s for i, s in enumerate(in_shardings) if i in kept_var_idx)
   in_layouts = tuple(l for i, l in enumerate(in_layouts) if i in kept_var_idx)
 
+  brk = 'TRef' in str(closed_jaxpr)
+  if brk:
+    print(closed_jaxpr)
+    print()
   (closed_jaxpr, inout_aliases, mut, in_shardings, in_layouts,
    donated_invars, out_shardings, out_layouts) = _discharge_refs_jaxpr(
        closed_jaxpr, in_shardings, in_layouts, donated_invars, out_shardings,
        out_layouts)
+  if brk:
+    print(closed_jaxpr)
+    breakpoint()
 
   jaxpr = closed_jaxpr.jaxpr
   global_in_avals = closed_jaxpr.in_avals

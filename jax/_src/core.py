@@ -2574,7 +2574,7 @@ class Ref(metaclass=RefMeta):
   def unsafe_buffer_pointer(self): return self._refs._buf.unsafe_buffer_pointer()
 
   @property
-  def at(self): raise NotImplementedError()  # TODO(mattjj)
+  def at(self): return self._aval.at.fget(self)
 
 class ArrayRefImpl:
   _aval: AbstractValue
