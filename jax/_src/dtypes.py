@@ -1154,7 +1154,7 @@ class PrimalTangentDType(ExtendedDType):
   name: str
   type = primal_tangent_dtype_scalar
   def __repr__(self): return self.name
-  @property
+  @functools.cached_property
   def _rules(self):  # type: ignore
     return types.SimpleNamespace(
       physical_element_aval=
