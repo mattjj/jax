@@ -52,7 +52,7 @@ def _merge_common_consts(
   # Jaxprs must share consts, so we concat consts and pad the jaxprs' constvars.
   lens = map(len, all_consts)
   consts = [c for cs in all_consts for c in cs]
-  avalqdds = tuple(map(core.cur_aval_qdd, consts))
+  avalqdds = tuple(map(core.fresh_aval_qdd, consts))
   num_constss = [len(cs) for cs in all_consts]
   jaxprs = [_pad_constvars(jaxpr, num_consts, avalqdds[:sum(lens[:i])], avalqdds[sum(lens[:i+1]):])  # type: ignore
             for i, (jaxpr, num_consts) in enumerate(zip(jaxprs, num_constss))]

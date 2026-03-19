@@ -299,9 +299,6 @@ class Box(metaclass=_BoxMeta):  # noqa: F811
   def set(self, val):
     box_set(self, val)
 
-  def cur_qdd(self):
-    return self.type_state()
-
   @property
   def ty(self):
     return BoxTy()
@@ -310,6 +307,7 @@ class Box(metaclass=_BoxMeta):  # noqa: F811
     leaves, treedef = tree_flatten(self._val)
     leaf_avals = tuple(map(core.typeof, leaves))
     return BoxTypeState(leaf_avals, treedef)
+  cur_qdd = type_state
 
 register_hitype(Box, lambda b: b.ty)
 

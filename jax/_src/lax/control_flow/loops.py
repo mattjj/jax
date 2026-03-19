@@ -1390,8 +1390,8 @@ def _scan_is_high(*_, jaxpr, **__) -> bool:
 scan_p.is_high = _scan_is_high
 
 def _scan_to_lojax(*hi_args, jaxpr, num_carry, num_consts, linear, **params):
-  # move qdd binders and corresponding hi_args from consts slots to carry slots
-  to_move = [t.has_qdd for t in jaxpr.in_aval_qdds[:num_consts]]
+  # move non-writer qdd binders and corresponding hi_args from consts to carries
+  to_move = [t.has_qdd and not t.qdd.writer for t in jaxpr.in_aval_qdds[:num_consts]]
   jaxpr = pe.move_invars_right(jaxpr, to_move)
   hi_args = _move_right(hi_args, to_move)
   num_consts -= sum(to_move)
@@ -1399,8 +1399,8 @@ def _scan_to_lojax(*hi_args, jaxpr, num_carry, num_consts, linear, **params):
 
   # expand num_consts, num_carry, linear according to lo types
   const_in_avals, carry_in_avals, _ = split_list(jaxpr.in_aval_qdds, [num_consts, num_carry])
-  num_consts = sum(len(aval.lo_ty()) for aval in const_in_avals)
-  num_carry = sum(len(aval.lo_ty()) for aval in carry_in_avals)
+  num_lo_consts = sum(len(aval.lo_ty()) for aval in const_in_avals)
+  num_lo_carry = sum(len(aval.lo_ty()) for aval in carry_in_avals)
   linear = [l for aval, l_ in zip(jaxpr.in_aval_qdds, linear)
             for l in (l_,) * len(aval.lo_ty())]
 
@@ -1416,13 +1416,13 @@ def _scan_to_lojax(*hi_args, jaxpr, num_carry, num_consts, linear, **params):
   num_carry_mut = sum(len(a.lo_ty()) for a in carry_qdds if a.has_qdd)
   num_ext_mut = sum(len(a.lo_ty()) for a in ext_qdds if a.has_qdd)
   num_rest = len(lo_jaxpr.out_avals) - num_const_mut - num_carry_mut - num_ext_mut
-  assert num_const_mut == 0
-  to_move = [False] * num_carry_mut + [True] * num_ext_mut + [False] * num_rest
+  to_move = ([True] * num_const_mut + [False] * num_carry_mut +
+             [True] * num_ext_mut + [False] * num_rest)
   lo_jaxpr = pe.move_outvars_to_back(lo_jaxpr, to_move)
 
   # bind on lo inputs
-  all_outs = scan_p.bind(*lo_args, jaxpr=lo_jaxpr, num_consts=num_consts,
-                         num_carry=num_carry, linear=tuple(linear), **params)
+  all_outs = scan_p.bind(*lo_args, jaxpr=lo_jaxpr, num_consts=num_lo_consts,
+                         num_carry=num_lo_carry, linear=tuple(linear), **params)
 
   # split out mutable outputs and apply them
   out_mut1, lo_outs, out_mut2 = split_list(all_outs, [num_carry_mut, num_rest])
@@ -2303,7 +2303,7 @@ while_p.to_lojax = _while_to_lojax
 def _insert_binders(jaxpr, n_after, vals):
   avals = _map(typeof, vals)
   invars = [core.Var(lo_ty) for a, x in zip(avals, vals) for lo_ty in
-            (a.lo_ty_qdd(cur_qdd(x)) if a.has_qdd else a.lo_ty())]
+            (a.lo_ty_qdd(cur_qdd(x).fresh()) if a.has_qdd else a.lo_ty())]
   invars = jaxpr.jaxpr.invars[:n_after] + invars + jaxpr.jaxpr.invars[n_after:]
   return jaxpr.replace(jaxpr=jaxpr.jaxpr.replace(invars=invars))
 

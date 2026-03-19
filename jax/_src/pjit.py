@@ -503,7 +503,7 @@ def _trace_for_jit(
   assert None not in out_shardings_leaves
 
   in_type = avals_ft.map2(
-    lambda a, x: core.AvalQDD(a, cur_qdd(x)) if a.has_qdd else a,
+    lambda a, x: core.AvalQDD(a, cur_qdd(x).fresh()) if a.has_qdd else a,
     args_ft)
   assert avals_ft is not None
 

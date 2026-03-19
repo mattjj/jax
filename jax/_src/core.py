@@ -1915,13 +1915,15 @@ class QuasiDynamicData:
   def inc_rank(self, size, spec):
     raise NotImplementedError("must override")
 
+  def fresh(self): return self  # are you a writer? default no
+  writer = property(lambda self: self.fresh.__func__ != QuasiDynamicData.fresh)
+
 @dataclass(frozen=True)
 class AvalQDD:
-  is_high = True
+  is_high = has_qdd = True
   aval: AbstractValue
   qdd: QuasiDynamicData | None # immutable
 
-  has_qdd = True
   def lo_ty(self):
     return self.aval.lo_ty_qdd(self.qdd)
 
@@ -1950,9 +1952,9 @@ def cur_qdd(x):
   finally:
     trace_ctx.set_trace(prev_trace)
 
-def cur_aval_qdd(x) -> AvalQDD:
+def fresh_aval_qdd(x):
   aval = typeof(x)
-  qdd = cur_qdd(x) if aval.has_qdd else None
+  qdd = cur_qdd(x).fresh() if aval.has_qdd else None
   return AvalQDD(aval, qdd)
 
 # TODO(mattjj,dougalm): maybe dedup with above function?
@@ -3167,7 +3169,7 @@ def mapped_leading_aval_qdd(size, a: AbstractValue | AvalQDD) -> AbstractValue |
   if isinstance(a, AvalQDD):
     aval, qdd = a.aval, a.qdd
     return AvalQDD(mapped_aval(size, aval.leading_axis_spec(), aval),
-                  qdd.dec_rank(size, qdd.leading_axis_spec()))
+                   qdd.dec_rank(size, qdd.leading_axis_spec()))  # type: ignore
   elif isinstance(a, AbstractValue):
     return mapped_aval(size, a.leading_axis_spec(), a)
   else:
