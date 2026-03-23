@@ -637,26 +637,6 @@ class JVPTrace(Trace):
     with core.set_current_trace(self.parent_trace):
       return core.cur_qdd(p)
 
-  def process_call(self, call_primitive, f, tracers, params, /):
-    assert call_primitive.multiple_results
-    primals, tangents = unzip2(map(self.to_primal_tangent_pair, tracers))
-    which_nz = [     type(t) is not Zero           for t in tangents]
-    tangents = [t if type(t) is not Zero else None for t in tangents]
-    args, in_tree = tree_flatten((primals, tangents))
-    f_jvp = jvp_subtrace(f, self.tag)
-    f_jvp, which_nz_out = nonzero_tangent_outputs(f_jvp)
-    f_jvp, out_tree = traceable(f_jvp, in_tree)
-    update_params = call_param_updaters.get(call_primitive)
-    new_params = update_params(params, which_nz) if update_params else params
-    fun_and_args = _update_annotation(f_jvp.with_unknown_names(), f.in_type, which_nz)
-    new_params = dict(new_params, subfuns=(fun_and_args,))
-    avals = tuple(core.typeof(x) for x in args)
-    result = call_primitive.bind_with_trace(self.parent_trace, args, avals, new_params)
-    primal_out, tangent_out = tree_unflatten(out_tree(), result)
-    tangent_out = [p2tz(p) if t is None else t
-                   for p, t in zip(primal_out, tangent_out)]
-    return [maybe_jvp_tracer(self, p, t) for p, t in zip(primal_out, tangent_out)]
-
   def process_custom_jvp_call(self, primitive, fun, jvp, tracers, /, *, symbolic_zeros):
     primals_in, tangents_in = unzip2(map(self.to_primal_tangent_pair, tracers))
     if all(type(t) is Zero for t in tangents_in):

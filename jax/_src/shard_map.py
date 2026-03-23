@@ -1365,13 +1365,6 @@ class ShardMapTrace(core.Trace):
     out_vmas = [v - _spec_to_vma(spec) for v, spec in zip(out_vmas_, out_specs)]
     return out_vals.map2(lambda val, vma: ShardMapTracer(self, vma, val), out_vmas)
 
-  def process_call(self, call_primitive, fun, tracers, params, /):
-    raise NotImplementedError(
-        f"Eager evaluation of `{call_primitive}` inside a `shard_map` isn't "
-        "yet supported. Put a `jax.jit` around the `shard_map`-decorated "
-        "function, and open a feature request at "
-        "https://github.com/jax-ml/jax/issues !")
-
   def process_custom_jvp_call(self, prim, fun, jvp, tracers, /, *, symbolic_zeros):
     # Since ShardMapTrace is only used as a base main, we can drop the jvp.
     del prim, jvp, symbolic_zeros

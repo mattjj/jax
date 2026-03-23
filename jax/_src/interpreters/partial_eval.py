@@ -216,63 +216,6 @@ class JaxprTrace(Trace):
       out_tracer.recipe = eqn
       return out_tracer
 
-  def process_call(self, primitive, f: lu.WrappedFun, tracers, params, /):
-    tracers = map(self.to_jaxpr_tracer, tracers)
-    rule = call_partial_eval_rules.get(primitive)
-    if rule:
-      return rule(self, primitive, f, tracers, params)
-
-    update_params = call_param_updaters.get(primitive) or (lambda p, _, __: p)
-    in_knowns, in_avals, in_consts = partition_pvals([t.pval for t in tracers])
-    # TODO(mattjj): check in_avals are consistent with f.in_type
-
-    # We want to partially evaluate this call into two calls: one evaluated now
-    # taking known values (in_consts) as inputs and producing known values
-    # (out_consts) as outputs, and the other staged out as an eqn into the jaxpr
-    # being built. The latter takes as input residuals (res) produced as outputs
-    # of the first call, shared closed-over values (env), and explicit arguments
-    # which were unknown to the first call (corresponding to in_avals).
-
-    # Wrap f to perform the partial evaluation and plumb out aux data.
-    f = f.with_unknown_names()
-    f_ = trace_to_subjaxpr_nounits_fwd(f, self.tag, f.debug_info, False)
-    f_, aux = partial_eval_wrapper_nounits(f_, tuple(in_knowns), tuple(in_avals))
-
-    # Adjust parameters (e.g. donated_invars) for the call to be evaluated now.
-    const_params = update_params(params, in_knowns, 0)
-    const_params = dict(const_params, subfuns=(f_,))
-
-    # Run the call, getting known out vals and aux data used for staged-out call
-    in_const_avals = tuple(core.typeof(c) for c in in_consts)
-    out = primitive.bind_with_trace(self.parent_trace, tuple(in_consts), in_const_avals, const_params)
-    fwds, out_knowns, out_type, jaxpr, env = aux()
-    # Split apart known outputs from the original call and non-fwded residuals.
-    out_consts, non_fwd_res = split_list(out, [sum(out_knowns)])
-    in_consts_full = in_consts
-    res = subs_list(fwds, in_consts_full, non_fwd_res)
-
-    # Create the input tracers for the staged-out (unknown-value) call.
-    res_tracers = map(self.instantiate_const, map(self.new_const, res))
-    env_tracers = map(self.to_jaxpr_tracer, env)
-    unknown_arg_tracers = [t for t in tracers if not t.is_known()]
-    # Adjust parameters (e.g. donated_invars) for the staged-out call's args.
-    num_new_args = len(res_tracers) + len(env_tracers)
-    new_jaxpr = convert_constvars_jaxpr(jaxpr)
-    if isinstance(primitive, core.ClosedCallPrimitive):
-      new_jaxpr = close_jaxpr(new_jaxpr)
-    staged_params = dict(params, call_jaxpr=new_jaxpr)
-    staged_params = update_params(staged_params, map(op.not_, in_knowns),
-                                  num_new_args)
-    out_tracers = [JaxprTracer(self, PartialVal.unknown(a), None)
-                   for a in out_type]
-    name_stack = self._current_truncated_name_stack()
-    source = source_info_util.current().replace(name_stack=name_stack)
-    eqn = new_eqn_recipe(self, (*res_tracers, *env_tracers, *unknown_arg_tracers),
-                         out_tracers, primitive, staged_params, jaxpr.effects,
-                         source)
-    for t in out_tracers: t.recipe = eqn
-    return merge_lists(out_knowns, out_tracers, out_consts)
-
   def _current_truncated_name_stack(self):
     return source_info_util.current_name_stack()[len(self.name_stack):]
 
