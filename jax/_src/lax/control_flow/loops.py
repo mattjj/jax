@@ -1390,7 +1390,7 @@ def _scan_is_high(*_, jaxpr, **__) -> bool:
 scan_p.is_high = _scan_is_high
 
 def _scan_to_lojax(*hi_args, jaxpr, num_carry, num_consts, linear, **params):
-  # move non-writer qdd binders and corresponding hi_args from consts to carries
+  # move non-concat qdd binders and corresponding hi_args from consts to carries
   to_move = [t.has_qdd and not t.qdd.writer for t in jaxpr.in_aval_qdds[:num_consts]]
   jaxpr = pe.move_invars_right(jaxpr, to_move)
   hi_args = _move_right(hi_args, to_move)
