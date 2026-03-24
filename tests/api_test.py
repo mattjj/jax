@@ -6410,15 +6410,10 @@ class RematTest(jtu.JaxTestCase):
       return z * ((x1 * x2) * y) * np.array([3.])
 
     res = saved_residuals(f, (2., 3.), y=4.)
-    if config.use_simplified_jaxpr_constants.value:
-      self.assertLen(res, 5)
-      start_idx = 0
-    else:
-      self.assertLen(res, 6)
-      self.assertEqual(res[0][0].shape, (1,))
-      self.assertEqual(res[0][1], "from a constant")
-      start_idx = 1
-
+    self.assertLen(res, 6)
+    self.assertEqual(res[0][0].shape, (1,))
+    self.assertEqual(res[0][1], "from a literal")
+    start_idx = 1
     self.assertEqual(res[start_idx][0].shape, ())
     self.assertEqual(res[start_idx][1], "from the argument x[0]")
     self.assertEqual(res[start_idx + 1][0].shape, ())

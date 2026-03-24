@@ -569,11 +569,14 @@ class Literal:
 # end up as `constvars`.
 literalable_types: set[type] = set()
 
-def is_literalable(x: Any) -> bool:
+def is_literalable(x: Any, check_flag: bool = True) -> bool:
   # See https://docs.jax.dev/en/latest/internals/constants.html
+  from jax._src.array import ArrayImpl  # type: ignore
+  flag = check_flag and config.use_simplified_jaxpr_constants.value
+  lit_types = literalable_types if flag else (literalable_types - {ArrayImpl})
   for t in type(x).__mro__:
-    if t in literalable_types:
-      return (not np.shape(x) or config.use_simplified_jaxpr_constants.value)
+    if t in lit_types:
+      return (not np.shape(x) or flag)
   return False
 
 @partial(weakref_lru_cache, trace_context_in_key=False)
