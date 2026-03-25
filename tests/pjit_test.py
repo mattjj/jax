@@ -9708,6 +9708,11 @@ class ShardingInTypesTest(jtu.JaxTestCase):
     for s, inp_s in zip(out2.addressable_shards, inp.addressable_shards):
       self.assertArraysEqual(s.data, inp_s.data)
 
+    out = jax.device_put(inp, P(unreduced={'x'}))
+    expected_out = [inp, jnp.array(0)]
+    for s, ex_out in zip(out.addressable_shards, expected_out):
+      self.assertArraysEqual(s.data, ex_out)
+
   @parameterized.parameters(
       ((4,), P(None), P(None, unreduced={'x'})),
       ((4,), P(None), P(None, unreduced={'y'})),
