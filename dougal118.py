@@ -23,6 +23,7 @@ cat = CatMonoid(None, None)
 class LogQDD(QDD):
   ft: FlatTree  # FlatTree[AbstractValue]
   mons: tuple[Monoid, ...]
+  reduction_axis: core.AxisName | None
 
   @classmethod
   def fresh(self):
@@ -44,14 +45,14 @@ class Log:
     return LogQDD(FlatTree.flatten(self._dct).map(core.typeof),
                   tuple(self._mons[k] for k in sorted(self._mons)))
 
-  def append(self, key, val, mon=cat):
-    log_append(self, key, val, mon)
+  def append(self, key, val, reduction_axis=None, mon=cat):
+    log_append(self, key, val, mon, reduction_axis)
 
   def __repr__(self) -> str:
     return f'Log({self._dct})'
 
-def log_append(log, key, val, mon=cat):
-  log_append_p.bind(log, val, key=key, mon=mon)
+def log_append(log, key, val, mon=cat, reduction_axis=None):
+  log_append_p.bind(log, val, key=key, mon=mon, reduction_axis=reduction_axis)
 
 class LogTy(MutableHiType):
   has_qdd = True
@@ -73,6 +74,8 @@ class LogTy(MutableHiType):
     return list(FlatTree.flatten(log._dct))
 
   def update_from_loval(self, state: LogQDD, log: Log, *lo_vals) -> None:
+    # TODO must bind a primitive right? extend! actually append is just a
+    # user-level wrapper
     new_stuff = state.ft.update(lo_vals).unflatten()
     new_mons = state.ft.update(state.mons).unflatten()
     log._dct = dict(log._dct, **new_stuff)
@@ -86,8 +89,9 @@ register_hitype(Log, lambda _: LogTy())
 class LogAppend(HiPrimitive):
   multiple_results = True  # no results
 
-  def abstract_eval(self, log_ty, val_ty, *, key, mon):
+  def abstract_eval(self, log_ty, val_ty, *, key, mon, reduction_axis):
     log_qdd = log_ty.mutable_qdd.cur_val
+    assert log_qdd.reduction_axis == reduction_axis
     new_ft = FlatTree.flatten({**log_qdd.ft.unflatten(), key: val_ty})
     new_mons = FlatTree.flatten({**log_qdd.ft.update(log_qdd.mons).unflatten(), key: mon})
     log_ty.mutable_qdd.update(LogQDD(new_ft, tuple(new_mons)))
@@ -142,13 +146,16 @@ def f(l, x):
 jax.grad(partial(f, l))(1.0)
 print(l._dct)
 
-# TODO: this is always a stacking monoid, but what if we want some reduction?
-# gotta teach scan about it, since it's got to either put it in the carry or the
-# extensive output, and if it's in the carry it's got to call the reduction.
-# so how about some new methods on hitypes that scan can call?
-# currently, in _scan_to_lojax we move non-concat qddful hi-binders from consts
-# to carry, then expand them. but if some components are concat-y and some
-# aren't... the bookkeeping gets annoying.
-# what about the scan-index idea? maybe the type's components aren't tagged one
-# way or the other, it's just the uses. as in, the use of the whole log is
-# stacking or not.
+##
+
+l = Log()
+
+def body(c, x):
+  l.append('x', x, reduction_axis='microbatch')
+  l.append('x', c + x)
+  return c * 2, ()
+
+c, () = jax.lax.scan(body, 1., jnp.arange(3.), axis_name='microbatch')
+print(c, 2**3)
+print(l._dct, '\n', {'x': [3., jnp.array([1., 2., 4.])]})
+

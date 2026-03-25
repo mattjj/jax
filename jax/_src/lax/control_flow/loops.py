@@ -106,7 +106,9 @@ def scan(f: Callable[[Carry, X], tuple[Carry, Y]],
          length: int | None = None,
          reverse: bool = False,
          unroll: int | bool = 1,
-         _split_transpose: bool = False) -> tuple[Carry, Y]:
+         _split_transpose: bool = False,
+         axis_name: core.AxisName | None = None,
+         ) -> tuple[Carry, Y]:
   """Scan a function over leading array axes while carrying along state.
 
   The `Haskell-like type signature`_ in brief is
@@ -324,7 +326,8 @@ def scan(f: Callable[[Carry, X], tuple[Carry, Y]],
                     reverse=reverse, length=length, jaxpr=jaxpr,
                     num_consts=len(consts), num_carry=num_carry,
                     linear=(False,) * (len(consts) + len(args_flat)),
-                    unroll=unroll, _split_transpose=_split_transpose)
+                    unroll=unroll, _split_transpose=_split_transpose,
+                    axis_name=axis_name)
 
   # Apply input to output forwarding that was computed above.
   carry_out, out = split_list(out, [num_carry])
@@ -593,7 +596,8 @@ def _stage_jaxpr_abstract_eval(*_, jaxpr):
   return jaxpr.out_avals, jaxpr.effects
 
 def _scan_abstract_eval(*args, reverse, length, num_consts, num_carry, jaxpr,
-                        linear, unroll, _split_transpose):
+                        linear, unroll, _split_transpose, axis_name=None):
+  del axis_name
   if len(args) != len(jaxpr.in_avals):
     raise ValueError("scan number of arguments doesn't match the number "
                      "of jaxpr arguments: {len(args)} vs {len(jaxpr.in_avals)}")
@@ -679,7 +683,8 @@ def _scan_jvp(primals, tangents, reverse, length, jaxpr, num_consts, num_carry,
 
 def _scan_linearize(is_vjp, nzs, *primals_in, reverse: bool, length: int, num_consts:
                     int, num_carry: int, jaxpr: ClosedJaxpr, linear:
-                    Sequence[bool], unroll: int, _split_transpose: bool):
+                    Sequence[bool], unroll: int, _split_transpose: bool,
+                    axis_name: core.AxisName | None):
   const_nz, init_nz, xs_nz = split_list(nzs, [num_consts, num_carry])
   num_ys = len(jaxpr.out_avals) - num_carry
   carry_nz = init_nz
@@ -738,7 +743,7 @@ def _scan_linearize(is_vjp, nzs, *primals_in, reverse: bool, length: int, num_co
                       jaxpr=primal_jaxpr, reverse=reverse, length=length,
                       num_consts=len(const_primals_in_), num_carry=num_carry,
                       linear=linear_, unroll=unroll,
-                      _split_transpose=_split_transpose)
+                      _split_transpose=_split_transpose, axis_name=axis_name)
   primals_out, ext_res = split_list(out, [num_primals_out])
 
   # Complete res using hoisted_res and input forwards.
@@ -756,7 +761,7 @@ def _scan_linearize(is_vjp, nzs, *primals_in, reverse: bool, length: int, num_co
         *int_res, *nz_tangents, *ext_res, jaxpr=tangent_jaxpr, reverse=reverse,
         length=length, num_consts=tangent_num_consts,
         num_carry=tangent_num_carry, linear=tangent_linear, unroll=unroll,
-        _split_transpose=_split_transpose)
+        _split_transpose=_split_transpose, axis_name=axis_name)
     tangent_avals_out = [v.aval.to_tangent_aval() for v in jaxpr.jaxpr.outvars]
     nz_tangents_out_ = iter(nz_tangents_out)
     tangents_out = [next(nz_tangents_out_) if nz else ad.Zero(aval)
@@ -948,7 +953,8 @@ def _rearrange_mutable_binders(
   return ClosedJaxpr(new_jaxpr, jaxpr.consts)
 
 def _scan_transpose_fancy(cts, *args, reverse, length, num_consts,
-                          num_carry, jaxpr, linear, unroll, _split_transpose):
+                          num_carry, jaxpr, linear, unroll, _split_transpose,
+                          axis_name):
   consts_lin, init_lin, xs_lin = split_list(linear, [num_consts, num_carry])
   num_ires = len(consts_lin) - sum(consts_lin)
   num_eres = len(xs_lin) - sum(xs_lin)
@@ -1009,7 +1015,8 @@ def _scan_transpose_fancy(cts, *args, reverse, length, num_consts,
       *trans_in, reverse=not reverse, length=length, jaxpr=jaxpr_trans,
       num_consts=num_ires + len(mut_consts_bar),
       num_carry=len(immut_consts_dot) + len(carry_dot),
-      linear=tuple(linear_trans), unroll=unroll, _split_transpose=False)
+      linear=tuple(linear_trans), unroll=unroll, _split_transpose=False,
+      axis_name=axis_name)
 
   for a, x in zip([*immut_consts_dot, *carry_dot, *immut_xs_dot], outs):
     if isinstance(a, ad.GradAccum): a.accum(x)
@@ -1389,7 +1396,7 @@ def _scan_is_high(*_, jaxpr, **__) -> bool:
   return jaxpr.jaxpr.is_high
 scan_p.is_high = _scan_is_high
 
-def _scan_to_lojax(*hi_args, jaxpr, num_carry, num_consts, linear, **params):
+def _scan_to_lojax(*hi_args, jaxpr, num_carry, num_consts, linear, axis_name, **params):
   # move non-concat qdd binders and corresponding hi_args from consts to carries
   to_move = [t.has_qdd and not t.qdd.writer for t in jaxpr.in_aval_qdds[:num_consts]]
   jaxpr = pe.move_invars_right(jaxpr, to_move)
