@@ -67,9 +67,9 @@ jax.config.update('jax_num_cpu_devices', 8)
 # +
 jax.set_mesh(jax.make_mesh((4, 2), ('X', 'Y')))  # explicit mode by default
 
-x = jax.random.normal(jax.random.key(0), (8192, 8192))
+x = jnp.arange(8 * 2.).reshape(8, 2)
 x = jax.device_put(x, jax.P('X', 'Y'))
-print(jax.typeof(x))  # f32[8192@X, 8192@Y]
+print(jax.typeof(x))  # f32[8@X, 2@Y]
 
 # +
 jax.debug.visualize_array_sharding(x)
@@ -78,7 +78,7 @@ jax.debug.visualize_array_sharding(x)
 # stored across multiple devices too:
 
 y = jnp.sin(x).T
-print(jax.typeof(y))  # f32[8192@Y, 8192@X]
+print(jax.typeof(y))  # f32[8@Y, 2@X]
 
 # The `jnp.sin` and transpose computations were automatically parallelized
 # across the devices on which the input values (and output values) are stored.
@@ -161,7 +161,7 @@ def f(x):
     return y * 2
 
 z = f(x)
-print(jax.typeof(z))  # f32[8192@A, 8192]
+print(jax.typeof(z))  # f32[8@A, 2]
 
 # ## A `Sharding` describes how array values are laid out over a `Mesh`
 
@@ -178,6 +178,13 @@ jax.debug.visualize_array_sharding(x)
 
 # Here, `PartitionSpec('X', 'Y')` expresses that the first and second axes of
 # the array `x` are sharded over the mesh axes 'X' and 'Y', respectively.
+# We can see how that translates to physical storage using `addressable_shards`:
+
+for s in x.addressable_shards:
+  print(s.device)
+  print(s.data)
+  print()
+import sys; sys.exit(0)
 
 # We can use `jax.device_put` (or `jax.reshard`) to produce a new array that is
 # sharded over the same mesh of devices but with a different layout specified by
@@ -208,6 +215,13 @@ y = jax.device_put(x, jax.P(('X', 'Y')))
 print(y.sharding)
 jax.debug.visualize_array_sharding(y)
 
+# So an array's data can be replicated over a mesh axis, or one of its array
+# axes can be sharded over that mesh axis, but there's another possibility too:
+# an array can be _unreduced_ over a mesh axis:
+
+y = jax.device_put(x, jax.P('X', None, unreduced={'Y'}))
+print(y.sharding)
+
 # Note that because every array has its own `Sharding` instance, and every
 # `Sharding` instance has its own `Mesh` instance, arrays in scope can be
 # associated with different meshes. To illustrate, we can use `jax.device_put`
@@ -218,11 +232,6 @@ mesh2 = jax.make_mesh((8,), ('A',))
 z = jax.device_put(x, jax.NamedSharding(mesh2, jax.P('A', None)))
 print(z.sharding)
 print(y.sharding)
-
-# So an array's data can be replicated over a mesh axis, or one of its array
-# axes can be sharded over that mesh axis, but there's another possibility too:
-# an array can be _unreduced_ over a mesh axis.
-# TODO DO NOT SUBMIT add more words
 
 # Now that we understand mesh shapes, axis names, and shardings at the top
 # level, we can dive into mesh axis types and how Explicit and Auto modes
