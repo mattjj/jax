@@ -67,9 +67,9 @@ jax.config.update('jax_num_cpu_devices', 8)
 # +
 jax.set_mesh(jax.make_mesh((4, 2), ('X', 'Y')))  # explicit mode by default
 
-x = jnp.arange(8 * 2.).reshape(8, 2)
+x = jnp.arange(8 * 4.).reshape(8, 4)
 x = jax.device_put(x, jax.P('X', 'Y'))
-print(jax.typeof(x))  # f32[8@X, 2@Y]
+print(jax.typeof(x))  # f32[8@X, 4@Y]
 
 # +
 jax.debug.visualize_array_sharding(x)
@@ -78,7 +78,7 @@ jax.debug.visualize_array_sharding(x)
 # stored across multiple devices too:
 
 y = jnp.sin(x).T
-print(jax.typeof(y))  # f32[8@Y, 2@X]
+print(jax.typeof(y))  # f32[8@Y, 4@X]
 
 # The `jnp.sin` and transpose computations were automatically parallelized
 # across the devices on which the input values (and output values) are stored.
@@ -161,7 +161,7 @@ def f(x):
     return y * 2
 
 z = f(x)
-print(jax.typeof(z))  # f32[8@A, 2]
+print(jax.typeof(z))  # f32[8@A, 4]
 
 # ## A `Sharding` describes how array values are laid out over a `Mesh`
 
@@ -181,10 +181,7 @@ jax.debug.visualize_array_sharding(x)
 # We can see how that translates to physical storage using `addressable_shards`:
 
 for s in x.addressable_shards:
-  print(s.device)
-  print(s.data)
-  print()
-import sys; sys.exit(0)
+  print(s.device, s.data, sep='\n', end='\n\n')
 
 # We can use `jax.device_put` (or `jax.reshard`) to produce a new array that is
 # sharded over the same mesh of devices but with a different layout specified by
@@ -208,6 +205,9 @@ jax.debug.visualize_array_sharding(y)
 # `None` placeholders can be omitted, so that P('X', None) here means the same
 # thing as P('X'). But it doesn’t hurt to be explicit!)
 
+for s in y.addressable_shards:
+  print(s.device, s.data, sep='\n', end='\n\n')
+
 # By using tuples of axis names inside a `PartitionSpec`, we can shard one array
 # axis over multiple mesh axes:
 
@@ -221,6 +221,15 @@ jax.debug.visualize_array_sharding(y)
 
 y = jax.device_put(x, jax.P('X', None, unreduced={'Y'}))
 print(y.sharding)
+
+# Unreduced means that the logical value equals the distributed sum of the
+# physical shards' values along that axis:
+
+for s in y.addressable_shards:
+  print(s.device, s.data, sep='\n', end='\n\n')
+
+# Unreduced is useful for delaying distributed reductions, especially in
+# the context of autodiff. More on that later.
 
 # Note that because every array has its own `Sharding` instance, and every
 # `Sharding` instance has its own `Mesh` instance, arrays in scope can be
