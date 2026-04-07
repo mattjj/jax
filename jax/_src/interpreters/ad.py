@@ -24,7 +24,7 @@ from typing import Any
 from jax._src import config
 from jax._src import linear_util as lu
 from jax._src.interpreters import partial_eval as pe
-from jax._src.tree_util import (tree_flatten, tree_unflatten,
+from jax._src.tree_util import (tree_flatten, tree_unflatten, tree_map,
                                 register_pytree_node, PyTreeDef)
 from jax._src import mesh as mesh_lib
 from jax._src import core
@@ -1362,3 +1362,36 @@ def call_transpose(primitive, params, call_jaxpr: core.Jaxpr, args, ct, _):
                            [type(x) is not Zero for x in ct])
   out_flat = primitive.bind(*all_args, **dict(params, subfuns=(fun,)))
   return tree_unflatten(out_tree(), out_flat)
+
+
+def defvjp(prim, fwd):
+  primitive_linearizations[prim] = partial(_vjp_rule, fwd)
+
+def _vjp_rule(fwd, is_vjp, nz_in, *args, **params):
+  if not is_vjp: raise Exception("only VJP is supported, not linearize")
+  ans, nz_out, res, bwd = fwd(nz_in, *args, **params)
+  assert isinstance(ans, (list, tuple))  # assumes multiple_results=True
+  assert isinstance(res, (list, tuple))  # must be a flat list
+  in_avals = tuple(typeof(x) for x in args)
+  out_avals = tuple(typeof(x).to_tangent_aval() for x in ans)
+  lin = lambda res, *ts: fake_linear_p.bind(
+      *res, *ts, nz_in=tuple(nz_in), bwd=bwd, num_res=len(res),
+      in_avals=in_avals, out_avals=out_avals)
+  return ans, nz_out, res, lin
+
+fake_linear_p = core.Primitive('fake_linear')
+fake_linear_p.multiple_results = True
+@fake_linear_p.def_abstract_eval
+def _fake_linear_abstract_eval(*_, out_avals, **__):
+  return out_avals
+def _fake_linear_transpose(cts, *args, nz_in, bwd, num_res, in_avals, out_avals):
+  del out_avals
+  res, accums = split_list(args, [num_res])
+  accums_iter = iter(accums)
+  accums = [next(accums_iter) if nz else NullAccum(a.to_ct_aval())
+            for nz, a in zip(nz_in, in_avals)]
+  assert next(accums_iter, None) is None
+  grads = bwd(res, *cts)
+  for a, g in zip(accums, grads):
+    a.accum(g)
+fancy_transposes[fake_linear_p] = _fake_linear_transpose
