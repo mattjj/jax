@@ -4564,7 +4564,7 @@ def _sin_lowering(ctx, x, accuracy):
 
 def _sin_lin(_is_vjp, nzs, x, accuracy):
   nz, = nzs
-  return (sin_p.bind(x, accuracy=accuracy), nz, cos(x),
+  return (sin_p.bind(x, accuracy=accuracy), nz, cos(x_var),
           lambda cos_x, t: mul(t, cos_x))
 
 sin_p = standard_unop(_float | _complex, 'sin')

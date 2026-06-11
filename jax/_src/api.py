@@ -1605,25 +1605,20 @@ def vjp(
     raise NotImplementedError("reduce_axes argument to vjp is deprecated")
   del reduce_axes
   check_callable(fun)
+  is_saveable = lambda x: (x.val, False) if isinstance(x, NotSaveable) else (x, True)
+  primals_ft, saveable_ft = FlatTree.flatten(primals).map(is_saveable).unzip2()
   canon = lambda x: x if isinstance(x, core.Tracer) else canonicalize_value(x)
-  primals_ft = FlatTree.flatten(primals).map(canon)
+  primals_ft = primals_ft.map(canon)
   primals_ft.map(dispatch.check_arg)
-  out_primals_ft, out_known, jaxpr, residuals, *maybe_aux = ad.linearize(
-      fun, primals_ft, is_vjp=True, has_aux=has_aux)
-
-  id_map = {id(x): i for i, x in enumerate(primals_ft)}
-  used, opaque_residuals = set(), []
-  spec = [used.add(id(r)) or RSpec(id_map[id(r)], True) if id(r) in id_map else
-          RSpec(opaque_residuals.append(r) or (len(opaque_residuals) - 1), False)
-          for r in residuals]
-  args_res = tuptree_map(lambda x: x if id(x) in used else NotNeeded(),
-                         primals_ft.tree, list(primals_ft))
+  primals_ft = [primals_ft]
+  out_primals_ft, out_known, jaxpr, opaque_residuals, *maybe_aux = ad.linearize(
+      fun, primals_ft.pop(), saveable_ft, is_vjp=True, has_aux=has_aux)
   out_primal_avals = list(out_primals_ft.map(typeof))
-  f_vjp = VJP(partial(_vjp3_callable, spec, out_known, jaxpr, out_primal_avals),
-              primals_ft.tree, out_primals_ft.tree, list(args_res), opaque_residuals)
+  f_vjp = VJP(partial(_vjp3_callable, out_known, jaxpr, out_primal_avals),
+              primals_ft.tree, out_primals_ft.tree, opaque_residuals)
   return out_primals_ft.unflatten(), f_vjp, *maybe_aux
 
-def _vjp3_callable(spec, out_known, jaxpr, out_primal_avals, in_tree, out_tree,
+def _vjp3_callable(out_known, jaxpr, out_primal_avals, in_tree, out_tree,
                    args_res, opaque_res, *maybe_ct_refs):
   if not maybe_ct_refs:
     maybe_ct_refs_flat = [GradValue()] * in_tree.num_leaves
@@ -1633,27 +1628,31 @@ def _vjp3_callable(spec, out_known, jaxpr, out_primal_avals, in_tree, out_tree,
       raise Exception  # TODO accept isomorph tuple tree
   args_res_ = tree_leaves(args_res, is_leaf=lambda x: isinstance(x, NotNeeded))
   residuals = [args_res_[i.idx] if i.primal else opaque_res[i.idx] for i in spec]
-  maybe_accums = [check_accum(v.aval.to_ct_aval(), x) if isinstance(x, ad.GradAccum) else
+
+  maybe_ct_refs_flat = [x for x in ([ArgRes(), y] if s else [y]) for s in saveable_ft]
+
+  maybe_accums = [next(args_res_) if isinstance(x, ArgRes) else
+                  check_accum(v.aval.to_ct_aval(), x) if isinstance(x, ad.GradAccum) else
                   ad.RefAccum(v.aval.to_ct_aval(), x) if _is_ref(x) else
                   ad.NullAccum(v.aval.to_ct_aval()) if isinstance(x, DontWant) else
                   ad.ValAccum(v.aval.to_ct_aval())
                   for v, x in zip(jaxpr.invars, maybe_ct_refs_flat)]
   return Partial(partial(_vjp3_bwd, in_tree, out_tree, out_known, jaxpr,
-                         out_primal_avals), residuals, maybe_accums)
+                         out_primal_avals), opaque_res, maybe_accums)
 
 def check_accum(aval, acc):
   if not core.typecompat(acc.aval, aval):
     raise ValueError(f"Accumulator aval mismatch: expected {aval}, got {acc.aval}")
   return acc
 
-def _vjp3_bwd(in_tree, out_tree, out_known, jaxpr, out_primal_avals, residuals,
+def _vjp3_bwd(in_tree, out_tree, out_known, jaxpr, out_primal_avals, opaque_residuals,
               maybe_accums, out_ct):
   cts_flat, out_tree_ = tree_flatten(out_ct, is_leaf=lambda x: isinstance(x, ad.Zero))
   if out_tree != out_tree_:
     _vjp_ct_tree_error(jaxpr, out_tree, out_tree_)
   _vjp_check_ct_avals(cts_flat, out_primal_avals)
   cts_flat = [ct for ct, k in zip(cts_flat, out_known) if not k]
-  ad.backward_pass3(jaxpr, True, residuals, maybe_accums, cts_flat)
+  ad.backward_pass3(jaxpr, True, opaque_residuals, maybe_accums, cts_flat)
   arg_cts = [x.freeze() if isinstance(x, ad.ValAccum) else
              DidntWant() if isinstance(x, ad.NullAccum) else GradRef()
              for x in maybe_accums]

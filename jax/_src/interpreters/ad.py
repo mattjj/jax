@@ -293,18 +293,38 @@ def linearize(traceable, primals_ft, has_aux=False, is_vjp=False):
     tangent_trace = pe.DynamicJaxprTrace(dbg, auto_dce=True)
     tangent_trace.tag = tag
     lin_trace = LinearizeTrace(parent_trace, tangent_trace, is_vjp)
-    def make_tracer(_lin_trace, p):
+
+    if not saveable:
+      LienarizeTracer(
+          primal_val,  # for binding in parent_trace
+          primal_var,  # for when i'm captured as a residual
+          tangent_var
+          )
+    else:
+      LinearizeTracer(
+          primal_val,  # for binding in parent_trace
+          primal_val,  # for when i'm captured as a residual
+          tangent_var,
+          )
+
+
+    def replace_unsaveable(p):
+      if isinstance(p, NotSaveable):
+        P = tangent_trace.new_arg(typeof(p.val), source_info)
+      return p
+
+    def make_tracer(p):
       t = tangent_trace.new_arg(typeof(p).to_tangent_aval(), source_info)
       if (not isinstance(t, Zero)
           and isinstance(typeof(t), core.ShapedArray)
           and dtype(t) == float0):
         t = p2tz(t)
-      return LinearizeTracer(_lin_trace, p, t).full_lower()
-    tracers = primals_ft.map(partial(make_tracer, lin_trace))
+      return LinearizeTracer(lin_trace, p, t).full_lower()
+    primals_ft = primals_ft.map(replace_unsaveable).map(make_tracer)
 
     with (core.set_current_trace(lin_trace),
           source_info_util.transform_name_stack('jvp')):
-      ans = traceable(*tracers.unflatten())
+      ans = traceable(*primals_ft.unflatten())
       if has_aux:
         if not isinstance(ans, (list, tuple)) or len(ans) != 2:
           raise TypeError("expected function with aux output to return a two-element "
@@ -315,7 +335,7 @@ def linearize(traceable, primals_ft, has_aux=False, is_vjp=False):
         auxs = ()
       out_primals, out_tangents = ft.flatten(ans).map(
           lin_trace.to_primal_tangent_pair).unzip2()
-      del lin_trace, ans, tracers
+      del lin_trace, ans
   out_nzs = [type(t) is not Zero for t in out_tangents]
   out_nz_tangents = [t for t, nz in zip(out_tangents, out_nzs) if nz]
   out_nz_tangents = map(partial(tangent_trace.to_jaxpr_tracer,
@@ -448,6 +468,7 @@ class RefAccum(GradAccum):
   ref: Ref | None
 
   def __init__(self, aval, ref=None):
+    if getattr(aval, 'weak_type', False): breakpoint()
     self.aval = aval
     self.ref = ref
 
