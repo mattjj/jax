@@ -939,7 +939,6 @@ class CustomVJPTraced(VJPHiPrimitive):
     return in_cts
 
   def jvp(self, primals, tangents):
-    if self.symbolic_zeros: ad.raise_custom_vjp_error_on_jvp()
     zero = lambda x: isinstance(x, ad_util.Zero)
     tangents = tree_map(ad_util.instantiate, tangents, is_leaf=zero)
     if self.opt_remat:
@@ -978,13 +977,25 @@ class CustomVJPTraced(VJPHiPrimitive):
       dyn_args, static_args = partition_list(which_static, args)
       static_args = [x.val for x in static_args]
       fwd = lambda *dyn_args: self.fwd(*merge_lists(which_static, dyn_args, static_args))
+    if self.symbolic_zeros:
+      # remat_transform traces with plain values, but a symbolic_zeros fwd
+      # takes CustomVJPPrimal-wrapped args and can return wrapped outputs
+      is_primal = lambda x: isinstance(x, CustomVJPPrimal)
+      unwrap = lambda x: x.value if isinstance(x, CustomVJPPrimal) else x
+      fwd_sz = fwd
+      def fwd(*args):
+        out, res = fwd_sz(*tree_map(lambda x: CustomVJPPrimal(x, True), args))
+        return tree_map(unwrap, out, is_leaf=is_primal), res
     # custom_vjp_rules=False so that custom_vjp applications inside fwd hit
     # the early return above rather than recursively tracing their fwds.
     (out, _), rem_ = remat.remat_transform(trace.policy, fwd, *dyn_args,
                                            custom_vjp_rules=False)
     rem = lambda *args: rem_(*[x for i, x in enumerate(args) if i not in self.static_argnums])
+    if self.symbolic_zeros:
+      rem_ns = rem
+      rem = lambda *args: rem_ns(*tree_map(unwrap, args, is_leaf=is_primal))
     helper = CustomVJPTraced(self.traced, rem, self.bwd, self.in_avals,
-                             False, self.static_argnums, False)
+                             self.symbolic_zeros, self.static_argnums, False)
     return out, helper
 
 def _vjp_primal_fwd_tree_mismatch_err(self, tree):
@@ -1020,6 +1031,12 @@ def _vjp_bwd_aval_mismatch_err(path, primal_aval, ct):
       not _temporary_dtype_exception(expected, ct_aval) and
       getattr(expected, 'dtype', None) is not dtypes.float0):
     result = f"at output{keystr(path)} " if path else ""
+    if isinstance(ct, ad_util.SymbolicZero):
+      raise ValueError(
+          f"{result}the bwd rule produced a SymbolicZero of type "
+          f"{ct_aval.str_short()} which doesn't match expected type "
+          f"{expected.str_short()}. Consider just returning a None here "
+          "instead of a SymbolicZero object.")
     raise ValueError(
         f"{result}the bwd rule produced an output of type {ct_aval.str_short()}"
         f" which doesn't match expected type {expected.str_short()}")
@@ -1042,6 +1059,9 @@ class custom_vjp3:
     update_wrapper(self, f)
 
   def defvjp(self, fwd, bwd, *, symbolic_zeros=False, optimize_remat=False):
+    if symbolic_zeros and optimize_remat:
+      raise NotImplementedError(
+          "remat optimization for custom_vjp does not support symbolic zeros")
     self.fwd = fwd
     self.bwd = bwd
     self.symz = symbolic_zeros

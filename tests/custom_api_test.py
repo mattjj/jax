@@ -3417,8 +3417,6 @@ class CustomVJP3Test(CustomVJPTest):
   # regress these, hope no one cares
   def test_python_control_flow(self): pass
   def test_pytrees_not_required_to_contain_nones(self): pass
-  def test_symbolic_zero_custom_vjp_bwd_shape_error(self): pass
-  def test_symbolic_zeros_remat(self): pass
   def test_dce(self): pass
 
   def test_pretty_print(self):
@@ -3542,7 +3540,7 @@ class CustomVJP3Test(CustomVJPTest):
     def f(x):
       return jnp.sin(x)
     def f_fwd(x):
-      return f(x), jnp.cos(x)
+      return f(x.value), jnp.cos(x.value)
     def f_rev(cos_x, g):
       return (2 * cos_x * g.value,)
     f.defvjp(f_fwd, f_rev, symbolic_zeros=True)
