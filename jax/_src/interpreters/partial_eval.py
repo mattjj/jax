@@ -706,7 +706,6 @@ def move_envvars(jaxpr: Jaxpr, which: tuple[bool, ...]) -> Jaxpr:
   constvars, envvars = partition_list(which, jaxpr.constvars)
   return jaxpr.replace(constvars=constvars, invars=[*envvars, *jaxpr.invars])
 
-@weakref_lru_cache
 def separate_consts(jaxpr: Jaxpr) -> tuple[Jaxpr, list[Any]]:
   """Moves the constvars to the start of invars and returns the consts explicitly."""
   return convert_constvars_jaxpr(jaxpr), jaxpr.consts
@@ -1789,6 +1788,7 @@ class DynamicJaxprTrace(core.Trace):
   def invalidate(self):
     # TODO(mattjj): exposed existing tracer leaks; fix them and re-enable!
     # super().invalidate()
+    self._run_on_invalidate_callbacks()
 
     # avoid cyclic refs
     self.frame.tracing_eqns = []  # thunk -> eqn -> in_tracers -> trace ->
@@ -2316,6 +2316,27 @@ def trace_to_jaxpr_nocache(
   return jaxpr.with_consts(consts), out_avals
 
 
+def evict_from_cache_on_trace_invalidate(cache, fun, consts) -> None:
+  """Evicts fun's entries from a weakref cache when consts' traces finish.
+
+  A cache entry whose value refers to tracers (e.g. as jaxpr consts) is only
+  valid while the trace those tracers belong to can still be extended: the
+  cache key doesn't include the trace, so once it finishes the entry both
+  keeps the dead tracers alive (tripping the leak checker) and can serve them
+  to a later retrace of the enclosing function (raising UnexpectedTracerError
+  on valid programs). See https://github.com/jax-ml/jax/issues/27315
+  """
+  weak_fun = ref(fun)  # if fun dies, its entries are evicted already
+  def evict():
+    fun = weak_fun()
+    if fun is not None:
+      cache.evict_weakref(fun)
+  trace_ids = set()
+  for c in consts:
+    if isinstance(c, core.Tracer) and id(c._trace) not in trace_ids:
+      trace_ids.add(id(c._trace))
+      c._trace.on_invalidate(evict)
+
 @weakref_lru_cache(maxsize=None, explain=explain)
 def trace_to_jaxpr(
     fun: Callable,
@@ -2326,7 +2347,7 @@ def trace_to_jaxpr(
     fun_returns_flat_tree=False,
     requires_low=False,
 ) -> tuple[Jaxpr, ft.FlatTree]:
-  return trace_to_jaxpr_nocache(
+  jaxpr, out_avals = trace_to_jaxpr_nocache(
       fun,
       in_avals,
       debug_info,
@@ -2335,6 +2356,11 @@ def trace_to_jaxpr(
       fun_returns_flat_tree=fun_returns_flat_tree,
       requires_low=requires_low,
   )
+  # This body only runs on a cache miss, i.e. exactly when a new cache entry
+  # is created, so register the entry to be evicted when the traces of any
+  # closed-over tracers finish.
+  evict_from_cache_on_trace_invalidate(trace_to_jaxpr, fun, jaxpr.consts)
+  return jaxpr, out_avals
 
 
 # TODO(dougalm): remove in favor of `trace_to_jaxpr`

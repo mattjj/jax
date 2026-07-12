@@ -635,6 +635,9 @@ def _infer_params(
   p = _trace_for_jit(fun, ji, ctx_mesh, dbg_fn(), avals, args, kwargs)
   if p.params['jaxpr'].is_high:
     return p, p.consts + dynargs
+  # If the consts refer to tracers, only keep the cached entry until their
+  # trace finishes; see pe.evict_from_cache_on_trace_invalidate.
+  pe.evict_from_cache_on_trace_invalidate(_infer_params_cached, fun, p.consts)
   entry.pjit_params = p
   return p, p.consts + dynargs
 

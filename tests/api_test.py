@@ -4069,6 +4069,49 @@ class APITest(jtu.JaxTestCase):
       f = jax.jit(jax.remat(lambda x: x + 1))
       f(jnp.arange(3))  # doesn't crash
 
+  def test_leak_checker_avoids_false_positives_nested_jit_closure(self):
+    # https://github.com/jax-ml/jax/issues/27315
+    with jax.checking_leaks():
+      @jit
+      def f():
+        a = None
+
+        @jit
+        def g():
+          return a
+
+        @jit
+        def h():
+          nonlocal a
+          a = jnp.uint32(0)
+          g()
+          a = None
+
+        h()
+
+      f()  # doesn't crash
+
+  def test_retrace_nested_jit_closing_over_tracer(self):
+    # https://github.com/jax-ml/jax/issues/27315
+    a = None
+
+    @jit
+    def g():
+      return a
+
+    @jit
+    def h(x):
+      nonlocal a
+      a = x * 1
+      out = g()
+      a = None
+      return out
+
+    self.assertAllClose(h(1.), jnp.asarray(1.), check_dtypes=False)
+    # Retracing h must not reuse g's cached jaxpr, whose consts refer to
+    # tracers from the first, now-finished trace of h.
+    self.assertAllClose(h(jnp.arange(3.)), jnp.arange(3.))
+
   def test_leak_checker_catches_a_sublevel_leak(self):
     with jax.checking_leaks():
       @jit

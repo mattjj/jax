@@ -849,13 +849,15 @@ def check_avals_context_mesh(avals, prim_name):
 TraceType = TypeVar('TraceType', bound='Trace')
 
 class Trace:
-  __slots__ = ("__weakref__", "_invalidated", "_weakref", "requires_low")
+  __slots__ = ("__weakref__", "_invalidated", "_weakref", "requires_low",
+               "_on_invalidate")
 
   def __init__(self):
     self._invalidated = False
     # We frequently need a weakref to a trace, so let's precompute one.
     self._weakref = weakref.ref(self)
     self.requires_low = True
+    self._on_invalidate = None
 
   def stage_value(self, val):
     """Lifts a value into a trace.
@@ -869,6 +871,28 @@ class Trace:
 
   def invalidate(self):
     self._invalidated = True
+    self._run_on_invalidate_callbacks()
+
+  def _run_on_invalidate_callbacks(self):
+    callbacks, self._on_invalidate = self._on_invalidate, None
+    if callbacks:
+      for callback in callbacks:
+        callback()
+
+  def on_invalidate(self, callback):
+    """Registers a callback to run when this trace is invalidated.
+
+    Used to evict cache entries that refer to this trace's tracers (e.g. as
+    jaxpr consts) once the trace can no longer be extended, so that finished
+    traces aren't kept alive by caches (and so stale tracers can't be served
+    to a later trace). Runs immediately if the trace is already invalid.
+    """
+    if self._invalidated:
+      callback()
+    elif self._on_invalidate is None:
+      self._on_invalidate = [callback]
+    else:
+      self._on_invalidate.append(callback)
 
   def is_valid(self):
     return not self._invalidated
