@@ -1201,6 +1201,28 @@ class LaxAutodiffTest(jtu.JaxTestCase):
       with self.assertRaises(TypeError):
         lax.stop_gradient(lambda x: x)
 
+  def testStopGradientTranspose(self):
+    # stop_gradient is the identity, so its transpose is too. See
+    # https://github.com/jax-ml/jax/issues/39219.
+    out = jax.linear_transpose(lax.stop_gradient, 1.)(2.)
+    self.assertAllClose(out[0], 2., check_dtypes=False)
+
+    # A batched-predicate cond wraps its operands in stop_gradient, which
+    # previously lacked a transpose rule and broke reverse-mode differentiation.
+    def cond(pred, x):
+      return lax.cond(pred, lambda: x, lambda: 2 * x)
+
+    def linearize(pred, x):
+      _, lin_fn = jax.linearize(lambda y: cond(pred, y), 1.)
+      return lin_fn(x)
+
+    def vmapped(pred, x):
+      return jax.vmap(linearize)(pred[None], x[None])[0]
+
+    pred = np.array(True)
+    out = jax.linear_transpose(lambda y: vmapped(pred, y), 1.)(np.array(1.))
+    self.assertAllClose(out[0], 1., check_dtypes=False)
+
   # TODO(mattjj): make this a more systematic test
   def testRemainder(self):
     def gen_x(rng, size):

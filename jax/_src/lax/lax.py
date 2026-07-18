@@ -8997,7 +8997,16 @@ def _stop_gradient_batch_rule(batched_args, batch_dims):
   dim, = batch_dims
   return stop_gradient(x), dim
 
+def _stop_gradient_transpose_rule(ct, x):
+  # stop_gradient is the identity, so its transpose is the identity too. We wrap
+  # the cotangent in stop_gradient to preserve the stop_gradient semantics.
+  assert ad.is_undefined_primal(x)
+  if type(ct) is ad_util.Zero:
+    return [ad_util.Zero(x.aval)]
+  return [stop_gradient(ct)]
+
 ad.primitive_jvps[ad_util.stop_gradient_p] = _stop_gradient_jvp_rule
+ad.primitive_transposes[ad_util.stop_gradient_p] = _stop_gradient_transpose_rule
 batching.primitive_batchers[ad_util.stop_gradient_p] = _stop_gradient_batch_rule
 
 
