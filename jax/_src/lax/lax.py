@@ -4776,9 +4776,42 @@ ad.defjvp2(abs_p, _abs_jvp_rule)
 _maybe_conj = lambda x: conj(x) if _iscomplex(x) else x
 _maybe_real = lambda x: real(x) if _iscomplex(x) else x
 
+def _copysign(x, y):
+  # Returns the magnitude of `x` with the sign bit of `y`, matching C/NumPy
+  # `copysign` semantics including for signed zeros, infinities and NaNs. `x`
+  # and `y` must be real floating-point values of the same dtype.
+  bits = dtypes.finfo(_dtype(x)).bits
+  int_dtype = np.dtype(f'uint{bits}')
+  xi = bitcast_convert_type(x, int_dtype)
+  yi = bitcast_convert_type(y, int_dtype)
+  one = _const(xi, 1)
+  shift = _const(xi, bits - 1)
+  magnitude = shift_right_logical(shift_left(xi, one), one)
+  sign = shift_left(shift_right_logical(yi, shift), shift)
+  return bitcast_convert_type(bitwise_or(magnitude, sign), _dtype(x))
+
+def _sqrt_complex_sign_fix(x, sqrt_x):
+  # The imaginary part of the principal complex square root always shares the
+  # sign of the input's imaginary part, but XLA's complex sqrt drops the sign of
+  # a negative-zero imaginary part on the branch cut (the negative real axis),
+  # e.g. returning +1j instead of -1j for sqrt(-1 - 0j). Restore it with
+  # copysign; this is a no-op except where the input imaginary part is a
+  # (signed) zero.
+  return complex(real(sqrt_x), _copysign(imag(sqrt_x), imag(x)))
+
+def _sqrt_lower(ctx, x, *, accuracy):
+  aval, = ctx.avals_in
+  if dtypes.issubdtype(aval.dtype, np.complexfloating):
+    sqrt_x = (hlo.sqrt(x, result_accuracy=accuracy_attr(accuracy))
+              if accuracy else hlo.sqrt(x))
+    sub_ctx = ctx.replace(avals_in=(aval, aval))
+    return mlir.lower_fun(_sqrt_complex_sign_fix, multiple_results=False)(
+        sub_ctx, x, sqrt_x)
+  return _nary_lower_hlo(hlo.sqrt, ctx, x, accuracy=accuracy)
+
 sqrt_p = standard_unop(_float | _complex, 'sqrt')
 ad.defjvp2(sqrt_p, lambda g, ans, x, **kwargs: mul(g, div(_const(x, 0.5), ans)))
-mlir.register_lowering(sqrt_p, partial(_nary_lower_hlo, hlo.sqrt))
+mlir.register_lowering(sqrt_p, _sqrt_lower)
 core.pp_eqn_rules[sqrt_p] = _unary_with_accuracy_pp_rule
 
 rsqrt_p = standard_unop(_float | _complex, 'rsqrt')

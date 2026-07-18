@@ -2646,6 +2646,22 @@ class LaxTest(jtu.JaxTestCase):
     self.assertArraysEqual(argsort(x), index)
     self.assertArraysEqual(jax.jit(argsort)(x), index)
 
+  @jtu.sample_product(dtype=lax_test_util.complex_dtypes)
+  def testSqrtComplexBranchCut(self, dtype):
+    # The sign of a (signed) zero imaginary part selects the branch of the
+    # complex square root along the negative real axis. Check that we match
+    # NumPy, including for negative-zero imaginary parts (jax-ml/jax#39110).
+    reals = [-2.0, -1.0, -0.0, 0.0, 1.0, 2.0]
+    for imag in [0.0, -0.0]:
+      x = jnp.array([complex(r, imag) for r in reals], dtype=dtype)
+      expected = np.sqrt(np.asarray(x))
+      for op in [lax.sqrt, jax.jit(lax.sqrt)]:
+        result = op(x)
+        self.assertArraysEqual(result, expected)
+        # Signed zeros compare equal above, so check the sign bit explicitly.
+        self.assertArraysEqual(np.signbit(np.asarray(result).imag),
+                               np.signbit(expected.imag))
+
   @jtu.sample_product(
     [dict(shape=shape, axis=axis)
      for shape in [(5,), (5, 7)] for axis in [-1, len(shape) - 1]],

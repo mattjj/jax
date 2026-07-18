@@ -50,6 +50,12 @@ When releasing, please add the new-release-boilerplate to docs/pallas/CHANGELOG.
 * Deprecations
   * Passing 2-dimensional arrays (or mixed 2D and 3D arrays) to {func}`jax.numpy.cross` is deprecated and will be removed in JAX 0.12.0, aligning with NumPy 2.5 behavior.
 
+* Bug fixes
+  * {func}`jax.numpy.sqrt` and {func}`jax.lax.sqrt` now respect the sign of a
+    negative-zero imaginary part when selecting the branch of the complex square
+    root along the negative real axis, matching NumPy (e.g. `sqrt(-1 - 0j)` now
+    returns `-1j` instead of `+1j`) ({jax-issue}`#39110`).
+
 ## JAX 0.10.2 (June 17, 2026)
 
 * New features
