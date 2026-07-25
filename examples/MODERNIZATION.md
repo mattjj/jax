@@ -1,7 +1,8 @@
 # Modernizing `examples/`
 
-A proposal to replace the current `examples/` directory. Status: **draft for
-discussion**, not implemented.
+A plan to replace the current `examples/` directory. Sections 1–4 are the
+original proposal, left as written; §5 tracks what has actually landed. Rough
+edges found along the way are logged separately in [`FINDINGS.md`](FINDINGS.md).
 
 ## 1. Where we are
 
@@ -173,45 +174,7 @@ the obvious follow-up.
 
 ## 6. What writing these turned up
 
-Four things worth flagging, since they are all cases where the examples ran
-into the sharp edges before a user would.
-
-**Explicit sharding catches genuine ambiguities in ordinary model code.** The
-embedding lookup `params['embed'][tokens]` raises `ShardingTypeError` and
-requires `.at[tokens].get(out_sharding=...)`; so does the attention output
-projection, where the contracted head axis is sharded on both operands. Both
-errors are *correct* and both land inside a twenty-line model body. This is the
-best advertisement the feature has, and it is why `nanolm.py` leaves them in
-rather than working around them.
-
-**Sharded refs can't be indexed by integers.** Writing a KV cache entry as
-`k_cache[i, :, pos] = k` fails with "sharded ref (array reference) can only be
-indexed by slices, not integers", and a Python slice with a traced bound fails
-with a `TracerBoolConversionError` from `canonicalize_slice`. The working form
-is `k_cache[i:i+1, :, jax.ds(start, seq)] = k[None]`. `jax.ds` is public and is
-the right tool, but nothing in `docs/new_docs/101/state.md` mentions it, and the
-in-place update of a sharded buffer at a dynamic offset is *the* motivating use
-case for refs. Worth an example in the refs docs.
-
-**`jax.get_mesh()` doesn't exist.** `docs/new_docs/201/sharding.md` says "the
-concrete mesh can be queried using `jax.get_mesh() -> jax.sharding.Mesh`". The
-accessor is `jax.sharding.get_mesh()`; `jax.get_mesh` raises `AttributeError`.
-
-**Async dispatch can deadlock CPU collectives.** A training loop that never
-waits on its output runs ahead and queues hundreds of steps' worth of
-collectives; because every simulated CPU device is backed by the same thread
-pool, the rendezvous then times out and aborts the process:
-
-```
-Termination timeout for `all gather RendezvousKey{...}` of 40 seconds
-exceeded. Exiting to ensure a consistent program state. Expected 4 threads
-to join the rendezvous, but only 3 of them arrived on time.
-```
-
-This reproduced at both 8 and 4 simulated devices on a 4-core machine, and only
-on longer runs — short ones sync often enough to stay under the limit, which
-makes it look nondeterministic. The fix in these examples is a `float(loss)`
-per step, but a hard abort is a rough failure mode for something a user hits by
-writing an ordinary un-synchronized training loop on CPU. It may be worth
-either bounding in-flight executions per device or making the message name the
-cause.
+Writing complete programs against the public API surfaced four things worth a
+closer look — one of them a hard abort you reach by writing an ordinary
+training loop. They're logged in [`FINDINGS.md`](FINDINGS.md), which is meant
+to keep accumulating as the rest of these examples get written.

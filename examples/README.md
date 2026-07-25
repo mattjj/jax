@@ -19,7 +19,9 @@ library — because they are here to teach JAX, not a framework.
 | [`k8s/`](k8s) | multi-host JAX on Kubernetes | |
 
 The last three files in the first group are older and are being replaced; see
-[`MODERNIZATION.md`](MODERNIZATION.md).
+[`MODERNIZATION.md`](MODERNIZATION.md) for the plan, and
+[`FINDINGS.md`](FINDINGS.md) for a running log of JAX rough edges these
+examples have turned up.
 
 ## Running them
 
