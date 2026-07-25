@@ -84,8 +84,7 @@ sharded on a 2-D `('data', 'model')` mesh so that FSDP and TP fall out of the
 sharding annotations alone — no collectives written by hand, the compiler
 inserts them and the example prints the count. Changing `(4, 2)` to `(8, 1)`
 turns it into pure FSDP; `(1, 8)` into pure TP. Demonstrates: **explicit
-sharding, FSDP, TP, `jit`, `grad`, `scan`, `remat`, donation.** A validated
-prototype is in §5 below.
+sharding, FSDP, TP, `jit`, `grad`, `scan`, `remat`, donation.**
 
 **`sample.py` — autoregressive decoding with a KV cache.**
 The natural sequel, and something no JAX example currently covers. Demonstrates
@@ -146,110 +145,73 @@ kernel-authoring layer, which `examples/` says nothing about today.
 | `flash_attention.py` | ✅ | ✅ | | | | | | |
 | `dpsgd.py` (kept) | ✅ | ✅ | ✅ | | ✅ | | | |
 
-## 5. Worked prototype
 
-The following runs today on CPU against this checkout (jax
-`0.11.0.dev20260711`), on eight simulated devices. It is ~80 lines and is the
-whole of `nanolm.py` minus data loading, sampling, and CLI.
+## 5. Status
 
-```python
-import jax, jax.numpy as jnp, numpy as np
+Landed (see [`README.md`](README.md)):
 
-jax.config.update('jax_num_cpu_devices', 8)
+| | | |
+|---|---|---|
+| `nanolm.py` | new | transformer with FSDP + TP from sharding annotations alone |
+| `sample.py` | new | KV-cache decoding on `jax.new_ref` mutable arrays |
+| `moe.py` | new | expert parallelism with `shard_map` + `all_to_all` |
+| `data.py` | new | byte-level text, replacing the MNIST downloader |
+| `util.py` | new | simulated-device defaults |
+| `examples_test.py` | new | runs every `--check` mode |
+| `mnist_classifier.py` | deleted | |
+| `mnist_classifier_fromscratch.py` | deleted | |
+| `spmd_mnist_classifier_fromscratch.py` | deleted | |
+| `onnx2xla.py` | deleted | |
 
-V, L, D, F, H, N, T, B = 256, 4, 128, 512, 32, 4, 64, 16
-jax.set_mesh(jax.make_mesh((4, 2), ('data', 'model')))
+Still to do, in the order proposed above: `lora.py`, then `flow_matching.py`
+(retiring `mnist_vae.py`), `hmc.py` (absorbing `advi.py`), `diffsim.py`,
+`flash_attention.py`, and modernizing `differentially_private_sgd.py` off
+`jax.example_libraries`. `datasets.py` stays until the last MNIST consumer is
+gone. Nothing in CI runs `examples_test.py` yet; wiring it into
+`.github/workflows/ci-build.yaml` next to the existing `examples/ffi` step is
+the obvious follow-up.
 
-# 'data' shards give FSDP, 'model' shards give tensor parallelism.
-SPECS = dict(
-    embed = jax.P('data', 'model'),              # [V, D]
-    qkv   = jax.P(None, 'data', 'model', None),  # [L, D, N, 3H]
-    proj  = jax.P(None, 'model', None, 'data'),  # [L, N, H, D]
-    up    = jax.P(None, 'data', 'model'),        # [L, D, F]
-    down  = jax.P(None, 'model', 'data'),        # [L, F, D]
-    unemb = jax.P('data', 'model'),              # [D, V]
-)
-SHAPES = dict(embed=(V, D), qkv=(L, D, N, 3 * H), proj=(L, N, H, D),
-              up=(L, D, F), down=(L, F, D), unemb=(D, V))
+## 6. What writing these turned up
 
-def init(key):
-  keys = jax.random.split(key, len(SHAPES))
-  return {k: jax.random.normal(kk, s, out_sharding=SPECS[k]) * (s[-2] ** -0.5)
-          for kk, (k, s) in zip(keys, SHAPES.items())}
+Four things worth flagging, since they are all cases where the examples ran
+into the sharp edges before a user would.
 
-def rmsnorm(x):
-  return x * jax.lax.rsqrt(jnp.mean(jnp.square(x), -1, keepdims=True) + 1e-6)
+**Explicit sharding catches genuine ambiguities in ordinary model code.** The
+embedding lookup `params['embed'][tokens]` raises `ShardingTypeError` and
+requires `.at[tokens].get(out_sharding=...)`; so does the attention output
+projection, where the contracted head axis is sharded on both operands. Both
+errors are *correct* and both land inside a twenty-line model body. This is the
+best advertisement the feature has, and it is why `nanolm.py` leaves them in
+rather than working around them.
 
-def layer(x, p):
-  q, k, v = jnp.split(jnp.einsum('btd,dnh->btnh', rmsnorm(x), p['qkv']), 3, -1)
-  a = jax.nn.dot_product_attention(q, k, v, is_causal=True)
-  x += jnp.einsum('btnh,nhd->btd', a, p['proj'], out_sharding=jax.P('data', None, None))
-  h = jax.nn.gelu(jnp.einsum('btd,df->btf', rmsnorm(x), p['up']))
-  x += jnp.einsum('btf,fd->btd', h, p['down'], out_sharding=jax.P('data', None, None))
-  return x, None
+**Sharded refs can't be indexed by integers.** Writing a KV cache entry as
+`k_cache[i, :, pos] = k` fails with "sharded ref (array reference) can only be
+indexed by slices, not integers", and a Python slice with a traced bound fails
+with a `TracerBoolConversionError` from `canonicalize_slice`. The working form
+is `k_cache[i:i+1, :, jax.ds(start, seq)] = k[None]`. `jax.ds` is public and is
+the right tool, but nothing in `docs/new_docs/101/state.md` mentions it, and the
+in-place update of a sharded buffer at a dynamic offset is *the* motivating use
+case for refs. Worth an example in the refs docs.
 
-def logits(params, tokens):
-  x = params['embed'].at[tokens].get(out_sharding=jax.P('data', None, None))
-  x, _ = jax.lax.scan(layer, x, {k: params[k] for k in ('qkv', 'proj', 'up', 'down')})
-  return jnp.einsum('btd,dv->btv', rmsnorm(x), params['unemb'],
-                    out_sharding=jax.P('data', None, None))
+**`jax.get_mesh()` doesn't exist.** `docs/new_docs/201/sharding.md` says "the
+concrete mesh can be queried using `jax.get_mesh() -> jax.sharding.Mesh`". The
+accessor is `jax.sharding.get_mesh()`; `jax.get_mesh` raises `AttributeError`.
 
-def loss(params, tokens):
-  lg = logits(params, tokens[:, :-1])
-  return -jnp.mean(jnp.take_along_axis(jax.nn.log_softmax(lg), tokens[:, 1:, None], -1))
-
-@jax.jit
-def step(params, opt, tokens, lr=1e-3):
-  g = jax.grad(loss)(params, tokens)
-  m = jax.tree.map(lambda m, g: 0.9 * m + 0.1 * g, opt['m'], g)
-  v = jax.tree.map(lambda v, g: 0.99 * v + 0.01 * g * g, opt['v'], g)
-  params = jax.tree.map(lambda p, m, v: p - lr * m / (jnp.sqrt(v) + 1e-8), params, m, v)
-  return params, dict(m=m, v=v)
-```
-
-Output:
+**Async dispatch can deadlock CPU collectives.** A training loop that never
+waits on its output runs ahead and queues hundreds of steps' worth of
+collectives; because every simulated CPU device is backed by the same thread
+pool, the rendezvous then times out and aborts the process:
 
 ```
-embed  float32[256@data,128@model]
-qkv    float32[4,128@data,4@model,96]
-proj   float32[4,4@model,32,128@data]
-up     float32[4,128@data,512@model]
-down   float32[4,512@model,128@data]
-unemb  float32[128@data,256@model]
-tokens int32[16@data,65]
-loss    6.043725      <- before 20 steps
-loss    4.114750      <- after
-all-gather      8     <- FSDP: params gathered just in time
-all-reduce      3     <- TP: partial sums combined
-reduce-scatter  0
+Termination timeout for `all gather RendezvousKey{...}` of 40 seconds
+exceeded. Exiting to ensure a consistent program state. Expected 4 threads
+to join the rendezvous, but only 3 of them arrived on time.
 ```
 
-Three things worth noting, all of which are the *point* of the example:
-
-- **The collectives are output, not commentary.** The reader annotates six
-  arrays and gets FSDP and tensor parallelism; the HLO counts prove it.
-- **Changing the mesh changes the strategy.** `(8, 1)` drops to 6 all-gathers
-  and 1 all-reduce — pure FSDP. `(2, 4)` keeps 8 and 3. All verified. (`(1, 8)`
-  needs `N ≥ 8` heads; the toy config only has 4. Real config sizes should be
-  picked so every factorization of 8 works, which is itself a lesson worth
-  putting in a comment.)
-- **Explicit sharding caught a real ambiguity while writing this.** The
-  embedding lookup `params['embed'][tokens]` raised `ShardingTypeError` because
-  the gather's output sharding was ambiguous, forcing the explicit
-  `.at[tokens].get(out_sharding=...)`. That error message *is* the sales pitch
-  for sharding-in-types, and having it appear in a 20-line model body is worth
-  more than a paragraph of docs.
-
-## 6. Suggested sequencing
-
-1. Land `nanolm.py` + a byte-level `data.py`; delete the three MNIST
-   classifiers and `onnx2xla.py`.
-2. Add `sample.py` and `moe.py`. Delete `mnist_vae.py` when `flow_matching.py`
-   lands.
-3. Modernize `differentially_private_sgd.py` (drop `example_libraries`) and fold
-   `advi.py` into `hmc.py`.
-4. Add an `examples/README.md` indexing the set by JAX feature, and wire the
-   `--check` modes into CI so the directory can't rot again.
-
-Steps 1 and 2 alone would replace 471 of the current 1109 lines with something
-that argues for JAX as it exists now.
+This reproduced at both 8 and 4 simulated devices on a 4-core machine, and only
+on longer runs — short ones sync often enough to stay under the limit, which
+makes it look nondeterministic. The fix in these examples is a `float(loss)`
+per step, but a hard abort is a rough failure mode for something a user hits by
+writing an ordinary un-synchronized training loop on CPU. It may be worth
+either bounding in-flight executions per device or making the message name the
+cause.
