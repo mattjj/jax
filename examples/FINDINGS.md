@@ -37,33 +37,27 @@ you print or assert on a gradient.
 
 ### 6. `jax.reshard` with a wrong-rank spec raises a bare `AssertionError`
 
-Passing a spec whose rank doesn't match the array's:
+Minimal repro:
 
 ```python
-jax.reshard(x, jax.P(None, None, None, 'data'))   # x has rank 3
+import jax, jax.numpy as jnp
+jax.config.update('jax_num_cpu_devices', 4)
+jax.set_mesh(jax.make_mesh((4,), ('data',)))
+
+x = jnp.zeros((8, 4, 2))                 # rank 3
+spec = jax.P(None, None, None, 'data')   # rank 4
+jax.reshard(x, spec)
 # AssertionError: (3, P(None, None, None, 'data'))
 ```
 
-The tuple in the message is `(ndim, spec)`, which is the right information with
-none of the words. This is a very easy mistake to make when a stacked parameter
-`[L, ...]` and a single layer's slice share a spec table, which is exactly the
-situation in `fsdp_pipeline.py`. A `TypeError` naming both ranks would have
-saved a debugging cycle.
+The tuple in the message is `(ndim, spec)` — the right information with none of
+the words, and an `AssertionError` rather than a `TypeError`. This is easy to
+hit whenever a stacked parameter `[L, ...]` and a single layer's slice share a
+spec table, which is exactly the situation in `fsdp_pipeline.py`; it cost a
+debugging cycle there, and it also sent an earlier version of this log chasing
+the wrong culprit (see below). A `TypeError` naming both ranks would fix it.
 
-### 7. `PartitionSpec` is a tuple subclass, so `tree.map` silently destructures it
-
-```python
-jax.tree.map(lambda x, s: jax.reshard(x, s), weights, specs)
-```
-
-does not do what it looks like: `PartitionSpec` subclasses `tuple`, so
-`tree.map` treats each spec as a container and pairs array leaves with
-individual *axis names*. There's no error at the tree level — you get a
-confusing failure further in, from whatever receives a string where it wanted a
-spec. Registering `PartitionSpec` as a leaf, or documenting the hazard next to
-`jax.P`, would help; specs and pytrees-of-arrays are natural to zip together.
-
-### 8. XLA:CPU doesn't fuse all-reduce + dynamic-slice into reduce-scatter
+### 7. XLA:CPU doesn't fuse all-reduce + dynamic-slice into reduce-scatter
 
 `jax.reshard(unreduced_grad, P('data', ...))` should be a reduce-scatter, and on
 TPU/GPU the all-reduce + dynamic-slice pair it lowers to gets rewritten into
@@ -75,6 +69,25 @@ only because these examples *print their collective counts as output* — so the
 CPU run under-reports the pattern the reader is meant to see, and `nanolm.py`
 has to spend three lines explaining that. Worth knowing if anyone else builds
 teaching material around inspecting CPU HLO.
+
+### Retracted: "`PartitionSpec` is destructured by `tree.map`"
+
+An earlier revision of this log claimed that `jax.tree.map(f, arrays, specs)`
+silently flattens each `PartitionSpec` into its axis names, because
+`PartitionSpec` subclasses `tuple`. **That is wrong on current main** —
+`PartitionSpec.__mro__` is `(PartitionSpec, object)`, and `tree.map` correctly
+treats a spec as a leaf:
+
+```python
+jax.tree.map(lambda x, s: (x.shape, s), (a, b), (P('data', None), P(None, 'data')))
+# (((8, 4), P('data', None)), ((4, 8), P(None, 'data')))
+```
+
+What actually happened: a `tree.map` over specs failed with finding 6's bare
+`AssertionError`, and the rank mismatch was misread as destructuring. Rewriting
+it as an explicit `zip` failed identically — which should have settled it, and
+didn't. No bug here; kept as a note because the misdiagnosis is exactly the kind
+an unhelpful error message invites.
 
 ---
 

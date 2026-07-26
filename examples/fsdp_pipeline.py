@@ -97,12 +97,8 @@ def gather(w):
 
 
 def scatter(w_bar, specs):
-  """Unreduced -> sharded: the reduce-scatter, in the backward pass.
-
-  Zipped rather than `tree.map`ed over `specs`: a `PartitionSpec` is a tuple
-  subclass, so `tree.map` would flatten it into its axis names.
-  """
-  return tuple(jax.reshard(x, s) for x, s in zip(w_bar, specs))
+  """Unreduced -> sharded: the reduce-scatter, in the backward pass."""
+  return jax.tree.map(jax.reshard, w_bar, specs)
 
 
 def layer(x, w):
