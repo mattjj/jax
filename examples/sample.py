@@ -49,14 +49,13 @@ import jax.numpy as jnp
 import data
 import util
 import nanolm
-from nanolm import B, H, L, N, T
 
 CACHE = jax.P(None, 'data', None, 'model', None)  # [L, B, T, N, H]
 ACTS = nanolm.ACTS
 
 
 def new_cache(batch, length):
-  shape = (L, batch, length, N, H)
+  shape = (nanolm.L, batch, length, nanolm.N, nanolm.H)
   return (jax.new_ref(jnp.zeros(shape, out_sharding=CACHE)),
           jax.new_ref(jnp.zeros(shape, out_sharding=CACHE)))
 
@@ -74,7 +73,7 @@ def forward(params, k_cache, v_cache, tokens, start):
   mask = jnp.arange(k_cache.shape[2])[None, :] <= q_pos[:, None]
 
   x = params['embed'].at[tokens].get(out_sharding=ACTS)
-  for i in range(L):
+  for i in range(nanolm.L):
     q, k, v = jnp.split(
         jnp.einsum('btd,dnh->btnh', nanolm.rmsnorm(x), params['qkv'][i]), 3, -1)
     # The only mutation in the program: one dynamic slice of the cache per
@@ -99,7 +98,8 @@ def step(params, k_cache, v_cache, tokens, start, key, temperature):
   return jnp.where(temperature > 0, sampled, greedy).astype(jnp.int32)
 
 
-def generate(params, prompt, num_tokens, key, temperature, length=T):
+def generate(params, prompt, num_tokens, key, temperature,
+             length=nanolm.T):
   """Prefills `prompt`, then decodes `num_tokens` tokens one at a time."""
   batch = prompt.shape[0]
   k_cache, v_cache = new_cache(batch, length)
@@ -150,7 +150,8 @@ def main(args):
   else:
     print(f'no --params given; training for {args.train_steps} steps first')
     key, subkey = jax.random.split(key)
-    batch_iter = data.batches(data.load(args.offline), B, T, seed=args.seed)
+    batch_iter = data.batches(data.load(args.offline), nanolm.B, nanolm.T,
+                              seed=args.seed)
     params = nanolm.train(nanolm.init(subkey), batch_iter, args.train_steps)
 
   if args.check:
@@ -159,7 +160,7 @@ def main(args):
   prompt = jnp.asarray(np.tile(data.encode(args.prompt)[None], (args.batch, 1)),
                        jnp.int32)
   print(f'prompt {jax.typeof(jax.device_put(prompt, jax.P("data", None)))}, '
-        f'cache {jax.typeof(new_cache(args.batch, T)[0])}')
+        f'cache {jax.typeof(new_cache(args.batch, nanolm.T)[0])}')
   tokens = generate(params, prompt, args.tokens, key, args.temperature)
   for row in tokens:
     print(f'  {args.prompt!r} -> {data.decode(row)!r}')

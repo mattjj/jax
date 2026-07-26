@@ -52,7 +52,6 @@ import jax.numpy as jnp
 import data
 import nanolm
 import util
-from nanolm import B, D, F, H, L, N, T
 
 RANK = 4       # the "low rank" in low-rank adaptation
 LORA_B = 16    # batch and sequence length for adapter training: smaller than
@@ -63,8 +62,9 @@ LORA_T = 64    # the base model's, since the adapters have far less to learn
 # factor carries that same shard and `a @ b` needs no communication. `unemb`
 # is replicated, so its factors are too. In both cases the rule is the same:
 # the correction must be sharded like the weight it is added to.
-LORA_SHAPES = dict(up_a=(L, D, RANK), up_b=(L, RANK, F),
-                   unemb_a=(D, RANK), unemb_b=(RANK, nanolm.V))
+LORA_SHAPES = dict(up_a=(nanolm.L, nanolm.D, RANK),
+                   up_b=(nanolm.L, RANK, nanolm.F),
+                   unemb_a=(nanolm.D, RANK), unemb_b=(RANK, nanolm.V))
 LORA_SPECS = dict(up_a=jax.P(None, None, None),
                   up_b=jax.P(None, None, 'model'),
                   unemb_a=jax.P(None, None),
@@ -111,7 +111,7 @@ def init_lora(key, adapters):
       out[name] = jnp.zeros((adapters, *shape), out_sharding=spec)
     else:
       out[name] = jax.random.normal(kk, (adapters, *shape),
-                                    out_sharding=spec) * D ** -0.5
+                                    out_sharding=spec) * nanolm.D ** -0.5
   return out
 
 
@@ -187,7 +187,7 @@ def main(args):
   else:
     print(f'  pretraining the base model for {args.base_steps} steps')
     base = nanolm.train(nanolm.init(subkey),
-                        data.batches(raw, B, T, seed=args.seed), args.base_steps)
+                        data.batches(raw, nanolm.B, nanolm.T, seed=args.seed), args.base_steps)
   base = {k: jax.reshard(v, nanolm.PARAM_SPECS[k]) for k, v in base.items()}
 
   key, subkey = jax.random.split(key)

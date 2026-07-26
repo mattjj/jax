@@ -60,7 +60,6 @@ import jax.numpy as jnp
 import data
 import nanolm
 import util
-from nanolm import B, D, F, H, L, N, T, V
 
 # Parameters are sharded over 'data' -- this is the FSDP part. Each device
 # holds 1/N of every weight and never materializes more than one layer's worth.
@@ -167,7 +166,7 @@ def pipelined_fwd(ws, x, specs):
 
 def pipelined_bwd(specs, res, out_bar):
   ws, xs, x_last = res
-  assert L >= 3, 'the pipelined backward pass peels two layers'
+  assert nanolm.L >= 3, 'the pipelined backward pass peels two layers'
   # Last layer, peeled: its weights are gathered and its vjp applied, and the
   # second-to-last layer's gather is issued before the loop starts.
   _, vjp = jax.vjp(layer, x_last, gather(first(ws, -1)))
@@ -249,14 +248,14 @@ def scan_carry(fn, *args):
 
 def main(args):
   jax.set_mesh(jax.make_mesh((args.devices or jax.device_count(),), ('data',)))
-  print(f'FSDP over {jax.device_count()} devices, {L} layers')
+  print(f'FSDP over {jax.device_count()} devices, {nanolm.L} layers')
 
   key = jax.random.key(args.seed)
   params = init(key)
   print('\n'.join(f'  {k:6s} {jax.typeof(v)}' for k, v in params.items()))
 
   batch = jax.device_put(
-      next(data.batches(data.load(args.offline), B, T, seed=args.seed)
+      next(data.batches(data.load(args.offline), nanolm.B, nanolm.T, seed=args.seed)
            ).astype(np.int32), jax.P('data', None))
 
   grads = {}
