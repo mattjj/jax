@@ -47,13 +47,17 @@ def tiny_shakespeare(url: str = _TINY_SHAKESPEARE) -> np.ndarray:
 def synthetic(num_bytes: int = 1 << 20, seed: int = 0) -> np.ndarray:
   """Offline stand-in for `tiny_shakespeare`: a learnable byte sequence.
 
-  A random walk over a small alphabet, so that the next byte is predictable
-  from the previous one and the loss visibly goes down without any network
-  access.
+  A random walk over the alphabet, so the next byte is largely predictable
+  from the previous one and the loss visibly goes down with no network access.
+  Spaces and capitals are sprinkled in deterministically so that byte-level
+  transforms like upper-casing are not no-ops here (see `lora.py`).
   """
   rng = np.random.RandomState(seed)
-  steps = rng.randint(-2, 3, size=num_bytes).cumsum() % 64
-  return (steps + ord(" ")).astype(np.uint8)
+  steps = rng.randint(-2, 3, size=num_bytes).cumsum() % 26
+  out = (steps + ord("a")).astype(np.uint8)
+  out[::16] = ord(" ")     # word separators
+  out[1::16] -= 32         # capitalize the letter after each space
+  return out
 
 
 def load(offline: bool = False) -> np.ndarray:

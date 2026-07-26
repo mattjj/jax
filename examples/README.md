@@ -10,6 +10,7 @@ library — because they are here to teach JAX, not a framework.
 |---|---|---|
 | [`nanolm.py`](nanolm.py) | explicit sharding, tensor parallelism, ZeRO-2, `reduced`/`unreduced`, `jit`, `grad`, `scan`, `remat` | ~1 min |
 | [`fsdp_pipeline.py`](fsdp_pipeline.py) | FSDP, `custom_vjp`, software-pipelined collectives | ~1 min |
+| [`lora.py`](lora.py) | `vmap` over a sharded axis, multi-adapter training and serving | ~2 min |
 | [`sample.py`](sample.py) | refs (mutable arrays), sharded KV cache, dynamic slices | ~6 min |
 | [`moe.py`](moe.py) | `shard_map`, `all_to_all`, expert parallelism | ~1 min |
 | [`differentially_private_sgd.py`](differentially_private_sgd.py) | `vmap` for per-example gradients | ~5 min |
@@ -59,6 +60,7 @@ an unsharded reference:
 python examples/nanolm.py --check
 python examples/moe.py --check
 python examples/sample.py --check
+python examples/lora.py --check
 ```
 
 To run on real hardware instead of simulated devices, pass `--devices 0` and a
@@ -77,10 +79,11 @@ loop over simulated devices and it hangs in an all-gather, that is why.
 
 `nanolm.py` first: it is the smallest complete thing, and the two spec tables
 at the top of it are the only place its parallelism is expressed. Then
-`sample.py`, which reuses that model for inference; `fsdp_pipeline.py`, which
-shards the parameters too and shows what it costs to keep the resulting
-collectives off the critical path; and `moe.py`, which is where automatic
-partitioning stops being enough and `shard_map` takes over.
+`sample.py`, which reuses that model for inference; `lora.py`, which fine-tunes
+it four different ways at once; `fsdp_pipeline.py`, which shards the parameters
+too and shows what it costs to keep the resulting collectives off the critical
+path; and `moe.py`, which is where automatic partitioning stops being enough and
+`shard_map` takes over.
 
 The documentation these are meant to accompany is
 [Distributed arrays and automatic parallelization](https://docs.jax.dev/en/latest/notebooks/Distributed_arrays_and_automatic_parallelization.html)

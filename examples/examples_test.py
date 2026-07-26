@@ -47,6 +47,8 @@ class ExamplesTest(parameterized.TestCase):
       ('sample.py', ('--check', '--offline', '--devices', DEVICES, '--mesh', '2,1',
                      '--train-steps', '2')),
       ('fsdp_pipeline.py', ('--check', '--offline', '--devices', DEVICES)),
+      ('lora.py', ('--check', '--offline', '--devices', DEVICES, '--mesh', '2,1',
+                   '--base-steps', '120', '--steps', '120')),
   )
   def test_check(self, script, args):
     p = run(script, *args)

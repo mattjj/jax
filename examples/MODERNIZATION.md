@@ -53,9 +53,20 @@ Second, terse-and-complete beats broad-and-shallow.
 
 ## 3. Design principles for the replacement set
 
-1. **Every example must be a bad example if you delete the sharding.** If the
-   file reads the same with one device and eight, it belongs in `docs/`, not
-   `examples/`.
+1. **Prefer examples that show something JAX does that the alternatives
+   don't** — and give sharding pride of place, because it is the thing JAX is
+   most distinctively good at. But this is a preference, not a gate. Sharding
+   is not the only interesting thing about JAX: `jit`, the autodiff APIs,
+   `vmap`, and Pallas all earn their own examples, and a plain good
+   demonstration of how to use JAX is worth having even where another library
+   would do the job equally well. What the directory should avoid is the
+   *2018* failure mode — a set of examples that would read identically if the
+   last eight years of JAX had not happened.
+
+   (Originally stated as "every example must be a bad example if you delete
+   the sharding." That was too strong: it would have excluded `diffsim.py` and
+   `flash_attention.py`, which teach `remat` and kernel authoring
+   respectively, and neither is improved by bolting a mesh onto it.)
 2. **Runs on a laptop CPU, unchanged on a pod.** Start each file with
    `jax.config.update('jax_num_cpu_devices', 8)`. The sharding is then real,
    inspectable, and reviewable in CI with no accelerator. Swapping in a real
@@ -140,9 +151,9 @@ kernel-authoring layer, which `examples/` says nothing about today.
 |---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
 | `nanolm.py` | ✅ | ✅ | | ✅ | ✅ TP + ZeRO-2 | | ✅ | |
 | `fsdp_pipeline.py` | ✅ | ✅ | | ✅ | ✅ FSDP | | ✅ | |
+| `lora.py` | ✅ | ✅ | ✅ | ✅ | ✅ | | ✅ | |
 | `sample.py` | ✅ | | ✅ | ✅ | ✅ | | | ✅ |
 | `moe.py` | ✅ | ✅ | | | ✅ | ✅ | | |
-| `lora.py` | ✅ | ✅ | ✅ | ✅ | ✅ | | ✅ | |
 | `flow_matching.py` | ✅ | ✅ | ✅ | | ✅ | | | |
 | `hmc.py` | ✅ | ✅ | ✅ | ✅ | ✅ | | | |
 | `diffsim.py` | ✅ | ✅ | ✅ | ✅ | | | ✅ | |
@@ -158,6 +169,7 @@ Landed (see [`README.md`](README.md)):
 |---|---|---|
 | `nanolm.py` | new | transformer with tensor parallelism and a ZeRO-2 optimizer |
 | `fsdp_pipeline.py` | new | FSDP with explicitly pipelined collectives |
+| `lora.py` | new | many LoRA adapters trained and served with one `vmap` |
 | `sample.py` | new | KV-cache decoding on `jax.new_ref` mutable arrays |
 | `moe.py` | new | expert parallelism with `shard_map` + `all_to_all` |
 | `data.py` | new | byte-level text, replacing the MNIST downloader |
@@ -178,7 +190,7 @@ parameter ordering to overlap its optimizer collectives. So `nanolm.py` now
 does what they do, and FSDP moved to `fsdp_pipeline.py`, where the pipelining
 it requires is the lesson rather than a distraction.
 
-Still to do, in the order proposed above: `lora.py`, then `flow_matching.py`
+Still to do, in the order proposed above: `flow_matching.py`
 (retiring `mnist_vae.py`), `hmc.py` (absorbing `advi.py`), `diffsim.py`,
 `flash_attention.py`, and modernizing `differentially_private_sgd.py` off
 `jax.example_libraries`. `datasets.py` stays until the last MNIST consumer is

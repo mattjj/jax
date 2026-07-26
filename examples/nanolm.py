@@ -165,15 +165,19 @@ def rmsnorm(x):
   return x * jax.lax.rsqrt(jnp.mean(jnp.square(x), -1, keepdims=True) + 1e-6)
 
 
-def layer(x, p):
+def layer(x, p, acts=ACTS):
+  # `acts` is the activation sharding to ask for. It is a parameter only
+  # because `lora.py` calls this under a `vmap` whose mapped axis is itself
+  # sharded over 'data', and the two would collide; everything else uses the
+  # default.
   q, k, v = jnp.split(jnp.einsum('btd,dnh->btnh', rmsnorm(x), p['qkv']), 3, -1)
   a = jax.nn.dot_product_attention(q, k, v, is_causal=True)
   # Both `x` and `proj` are sharded over 'model' along the contracted head
   # axis, so the output sharding is ambiguous and JAX makes us say what we
   # want. Asking for a batch-sharded result is what turns into an all-reduce.
-  x += jnp.einsum('btnh,nhd->btd', a, p['proj'], out_sharding=ACTS)
+  x += jnp.einsum('btnh,nhd->btd', a, p['proj'], out_sharding=acts)
   h = jax.nn.gelu(jnp.einsum('btd,df->btf', rmsnorm(x), p['up']))
-  x += jnp.einsum('btf,fd->btd', h, p['down'], out_sharding=ACTS)
+  x += jnp.einsum('btf,fd->btd', h, p['down'], out_sharding=acts)
   return x, None
 
 
