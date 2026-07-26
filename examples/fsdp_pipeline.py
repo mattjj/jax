@@ -140,9 +140,19 @@ def pipelined(ws, x, specs):
 
 
 def pipelined_fwd(ws, x, specs):
-  # Save each layer's *input*. The backward pass rebuilds its vjp from that,
-  # so no gathered weight has to stay alive between the passes -- the same
-  # trade `jax.remat` makes, spelled out.
+  # Note what this does *not* do: it never calls `jax.vjp`. It just runs the
+  # forward pass and saves each layer's input, and `pipelined_bwd` calls
+  # `jax.vjp` fresh from that input. So every layer is recomputed on the
+  # backward pass and nothing from the forward is kept alive -- in particular
+  # no gathered weight, which is the point, but also no attention
+  # intermediates, which for a transformer are the expensive residuals
+  # anyway. This is per-layer `jax.remat`, written out.
+  #
+  # The alternative is to call `jax.vjp` here and keep its residuals, dropping
+  # only the gathered weights so they can be re-gathered in the backward pass.
+  # That trades memory for recompute and generalizes to layers you would
+  # rather not run twice; it needs surgery on the residuals that `jax.vjp`
+  # saved. See `tests/pjit_test.py::ShardingInTypesTest::test_fsdp_pipeline_grad`.
   def body(carry, w_next):
     x, w = carry
     return (layer(x, w), gather(w_next)), x
