@@ -151,8 +151,12 @@ def pipelined_fwd(ws, x, specs):
   # The alternative is to call `jax.vjp` here and keep its residuals, dropping
   # only the gathered weights so they can be re-gathered in the backward pass.
   # That trades memory for recompute and generalizes to layers you would
-  # rather not run twice; it needs surgery on the residuals that `jax.vjp`
-  # saved. See `tests/pjit_test.py::ShardingInTypesTest::test_fsdp_pipeline_grad`.
+  # rather not run twice. `jax.vjp` supports it directly:
+  # `jax.vjp(layer, x, w, saveable_args=(True, False))` leaves `w` out of the
+  # saved state, and the backward pass restores it before applying the vjp.
+  # See docs/new_docs/301/vjp-objects.md, and
+  # `tests/pjit_test.py::ShardingInTypesTest::test_fsdp_pipeline_grad` for this
+  # exact pipeline built that way.
   def body(carry, w_next):
     x, w = carry
     return (layer(x, w), gather(w_next)), x

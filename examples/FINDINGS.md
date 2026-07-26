@@ -10,6 +10,8 @@ relevant area.
 Append new entries at the top. Strike through or delete entries once they're
 resolved upstream.
 
+Re-validated against jax-ml/jax main at `704b65fe` (2026-07-25) on 2026-07-26.
+
 ---
 
 ## 2026-07-26 — from the ZeRO-2 rewrite of `nanolm.py` and from `fsdp_pipeline.py`
@@ -27,7 +29,8 @@ np.asarray(g['up'])
 # Please file a bug at https://github.com/jax-ml/jax/issues
 ```
 
-Filing that bug here. The natural reading of `np.asarray` on an unreduced array
+Still present at `704b65fe` (`jax/_src/sharding.py:51`). Filing that bug here.
+The natural reading of `np.asarray` on an unreduced array
 is "perform the pending reduction, then give me the value", which is what
 `jax.reshard(g, ...)` would have done anyway. Failing is defensible, but the
 message should then say *"unreduced arrays must be resharded before their value
@@ -48,6 +51,12 @@ x = jnp.zeros((8, 4, 2))                 # rank 3
 spec = jax.P(None, None, None, 'data')   # rank 4
 jax.reshard(x, spec)
 # AssertionError: (3, P(None, None, None, 'data'))
+```
+
+The assertion is `jax/_src/core.py:2266` (still present at `704b65fe`):
+
+```python
+assert all(s is None for s in pspec.partitions[ndim:]), (ndim, pspec)
 ```
 
 The tuple in the message is `(ndim, spec)` — the right information with none of
@@ -147,17 +156,13 @@ The `TracerBoolConversionError` from `canonicalize_slice` is also worth a
 look — it surfaces an internal function name for what is really "slice bounds
 must be static; use `jax.ds` for a dynamic offset".
 
-### 3. `jax.get_mesh()` doesn't exist
+### 3. ~~`jax.get_mesh()` doesn't exist~~ — RESOLVED upstream
 
-`docs/new_docs/201/sharding.md` says:
-
-> At the top level only, the concrete mesh can be queried using `jax.get_mesh()
-> -> jax.sharding.Mesh`.
-
-`jax.get_mesh` raises `AttributeError`. The accessor is
-`jax.sharding.get_mesh()`. Either the doc or the export should change; given
-that `jax.set_mesh`, `jax.make_mesh`, `jax.P`, and `jax.typeof` are all
-top-level, exporting `jax.get_mesh` seems more consistent than fixing the doc.
+`docs/new_docs/201/sharding.md` documented `jax.get_mesh()`, but the name
+raised `AttributeError`; only `jax.sharding.get_mesh()` worked. As of
+`704b65fe`, `jax/__init__.py` exports `get_mesh`, so the doc is now correct and
+the top-level spelling matches `jax.set_mesh` / `jax.make_mesh` / `jax.P`.
+`jax.sharding.get_mesh` still exists too, so both spellings work. Nothing to do.
 
 ### 4. Async dispatch can deadlock CPU collectives, and the failure is an abort
 
