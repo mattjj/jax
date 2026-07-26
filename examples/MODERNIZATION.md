@@ -1,215 +1,147 @@
 # Modernizing `examples/`
 
-A plan to replace the current `examples/` directory. Sections 1–4 are the
-original proposal, left as written; §5 tracks what has actually landed. Rough
-edges found along the way are logged separately in [`FINDINGS.md`](FINDINGS.md).
+The plan and running status for replacing the 2018-era `examples/` directory.
+[`README.md`](README.md) indexes what exists today; rough edges found while
+building it are logged in [`FINDINGS.md`](FINDINGS.md). This document is the
+*why*: the audit that started it, the design principles, the decisions made
+along the way (including two reversals), and what remains.
 
-## 1. Where we are
+## 1. Where we started
 
-`examples/` is nine Python files, 1109 lines, essentially frozen since 2018–19.
+As of mid-2026, `examples/` was nine Python files, 1109 lines, essentially
+frozen since 2018–19:
 
-| File | Lines | What it shows | Verdict |
-|---|---|---|---|
-| `mnist_classifier.py` | 97 | MLP on MNIST via `stax` + `optimizers` | **Delete.** Depends on `jax.example_libraries`, whose own docstring says "You likely do not mean to import this module!" |
-| `mnist_classifier_fromscratch.py` | 95 | Same, hand-rolled | **Delete.** Subsumed by the new flagship. |
-| `spmd_mnist_classifier_fromscratch.py` | 145 | Data parallelism on MNIST | **Delete.** Already partially modernized (uses `AxisType`/`reshard`), but 8-way DP on an MLP is not a parallelism story worth telling in 2026. |
-| `mnist_vae.py` | 137 | VAE, reparameterization trick | **Replace** with flow matching. |
-| `advi.py` | 139 | Black-box VI on a 2-D posterior | **Keep the idea, rewrite.** Best non-DL demo we have; `vmap`+`grad` shine. |
-| `differentially_private_sgd.py` | 256 | Per-example grads via `vmap` | **Keep, modernize.** Per-example gradients remain the canonical "why `vmap`" argument. Drop `stax`/`optimizers`. |
-| `onnx2xla.py` | 134 | ONNX graph → XLA | **Delete.** Dead path; hardcodes an ONNX opset from 2018. |
-| `datasets.py` | 93 | MNIST downloader | **Replace** with a byte-level text loader. |
-| `ffi/`, `jax_cpp/`, `k8s/` | — | FFI, AOT-to-C++, multi-host on k8s | **Keep.** These are current and load-bearing. |
+| File | What it showed | Outcome |
+|---|---|---|
+| `mnist_classifier.py` | MLP on MNIST via `stax` + `optimizers` | deleted — built on `jax.example_libraries`, whose own docstring says "You likely do not mean to import this module!" |
+| `mnist_classifier_fromscratch.py` | same, hand-rolled | deleted — subsumed by `nanolm.py` |
+| `spmd_mnist_classifier_fromscratch.py` | data parallelism on MNIST | deleted — 8-way DP on an MLP is not a parallelism story worth telling now |
+| `mnist_vae.py` | VAE, reparameterization | deleted — replaced by `flow_matching.py` |
+| `advi.py` | black-box VI on a 2-D posterior | deleted — absorbed into `hmc.py` |
+| `onnx2xla.py` | ONNX graph → XLA | deleted — dead path, 2018 opset |
+| `differentially_private_sgd.py` | per-example grads via `vmap` | kept — being modernized off `example_libraries` |
+| `datasets.py` | MNIST downloader | kept until its last consumer (dp-sgd) is modernized |
+| `ffi/`, `jax_cpp/`, `k8s/` | FFI, AOT-to-C++, multi-host k8s | kept — current and load-bearing |
 
-The common thread: every one of these predates `jit`-of-`grad` being boring,
-predates `shard_map`, predates sharding-in-types entirely. None of them would
-change if `jax.set_mesh` had never been written.
+The common thread: every deleted file predated `jit`-of-`grad` being boring,
+predated `shard_map`, predated sharding-in-types entirely. None would have
+changed if `jax.set_mesh` had never been written.
 
 ## 2. What other projects do
 
-Surveying the neighbors:
-
-- **[pytorch/examples](https://github.com/pytorch/examples)** is a museum in the
-  same way ours is: MNIST, DCGAN, VAE, word-level RNN LM, SNLI, actor-critic on
-  CartPole. The distributed story is a thin `ddp/` and an `rpc/` directory. Not
-  a model to copy — but instructive, because it shows the failure mode of an
-  examples directory that accretes rather than gets curated.
+- **[pytorch/examples](https://github.com/pytorch/examples)** is a museum in
+  the same way ours was: MNIST, DCGAN, VAE, word-level RNN LM, CartPole. Not a
+  model to copy — but instructive as the failure mode of an examples directory
+  that accretes rather than gets curated.
 - **[ml-explore/mlx-examples](https://github.com/ml-explore/mlx-examples)** is
-  much healthier: `llms/` (LLaMA/Mistral/Mixtral generation), `lora/`,
-  `transformer_lm/`, `flux/` and `stable_diffusion/`, `whisper/`, `encodec/`,
-  `musicgen/`, `clip/`, `llava/`, `segment_anything/`, `normalizing_flow/`,
-  `gcn/`. MNIST is present but explicitly framed as the beginner on-ramp, not the
-  centerpiece. Their examples are organized by *what you'd want to build*.
-- **[karpathy/nanoGPT](https://github.com/karpathy/nanogpt)**,
-  **[nanochat](https://github.com/karpathy/nanochat)**, and
+  much healthier: `llms/`, `lora/`, `stable_diffusion/`, `whisper/`, organized
+  by *what you'd want to build*, with MNIST explicitly demoted to on-ramp.
+- **[karpathy/nanoGPT](https://github.com/karpathy/nanogpt)** and
   **[KellerJordan/modded-nanogpt](https://github.com/kellerjordan/modded-nanogpt)**
-  set the current bar for what a reference implementation feels like: single
-  file or near it, no framework dependency, readable top to bottom in one
-  sitting, and a real result at the end.
+  set the bar for what a reference implementation feels like: near-single-file,
+  no framework dependency, readable top to bottom, a real result at the end.
 
-Two lessons. First, the interesting axis moved from *architecture* to *scale and
-systems* — mlx's differentiator is unified memory, ours is the compiler and the
-sharding system, and examples should be built around the differentiator.
-Second, terse-and-complete beats broad-and-shallow.
+Two lessons. The interesting axis moved from *architecture* to *scale and
+systems* — mlx's differentiator is unified memory, ours is the compiler and
+the sharding system, and examples should be built around the differentiator.
+And terse-and-complete beats broad-and-shallow.
 
-## 3. Design principles for the replacement set
+## 3. Design principles
 
 1. **Prefer examples that show something JAX does that the alternatives
-   don't** — and give sharding pride of place, because it is the thing JAX is
-   most distinctively good at. But this is a preference, not a gate. Sharding
-   is not the only interesting thing about JAX: `jit`, the autodiff APIs,
-   `vmap`, and Pallas all earn their own examples, and a plain good
-   demonstration of how to use JAX is worth having even where another library
-   would do the job equally well. What the directory should avoid is the
-   *2018* failure mode — a set of examples that would read identically if the
-   last eight years of JAX had not happened.
+   don't**, and give sharding pride of place — it is the thing JAX is most
+   distinctively good at. But this is a preference, not a gate: `jit`, the
+   autodiff APIs, `vmap`, hijax, and Pallas earn their own examples, and a
+   plain good demonstration of how to use JAX is worth having even where
+   another library would do as well. What the directory must avoid is the
+   2018 failure mode — a set of examples that would read identically if the
+   last eight years had not happened.
+2. **Runs on a laptop CPU, unchanged on a pod.** Simulated CPU devices by
+   default (as many as the machine has cores, capped at 8 — see `util.py`),
+   so the sharding is real, inspectable, and testable with no accelerator.
+3. **The interesting thing is visible in the output, not just the comments.**
+   `jax.typeof` for the key arrays, HLO collective counts, the scan carry, an
+   adapter-by-task loss grid, ASCII samples — every file prints the evidence
+   for its own claim.
+4. **No dependencies beyond `jax` + `numpy`.** Adam is six lines. These
+   examples teach JAX, not a framework.
+5. **≤ 250 lines of code, one file, readable top to bottom.** Comments and
+   the header docstring don't count against the budget — in a teaching
+   example they are the product.
+6. **A `--check` mode** asserting a falsifiable claim — parity with an
+   unsharded reference, exact moments, "each adapter wins its own task",
+   "QAT beats PTQ" — wired into `examples_test.py` so the directory cannot
+   rot silently again.
+7. **A header docstring saying which JAX features the file demonstrates and
+   how long it takes to run.**
 
-   (Originally stated as "every example must be a bad example if you delete
-   the sharding." That was too strong: it would have excluded `diffsim.py` and
-   `flash_attention.py`, which teach `remat` and kernel authoring
-   respectively, and neither is improved by bolting a mesh onto it.)
-2. **Runs on a laptop CPU, unchanged on a pod.** Start each file with
-   `jax.config.update('jax_num_cpu_devices', 8)`. The sharding is then real,
-   inspectable, and reviewable in CI with no accelerator. Swapping in a real
-   mesh is a one-line diff, and *that one-line diff is the pedagogy*.
-3. **Sharding is visible in the output, not just the comments.** Print
-   `jax.typeof(x)` for the key arrays (`float32[128@data,512@model]`), and grep
-   the compiled HLO for `all-gather(` / `all-reduce(` so the reader sees which
-   collectives their annotations bought them.
-4. **No dependencies beyond `jax` + `numpy`.** No Flax, no Optax, no
-   `jax.example_libraries`. Adam is six lines. These examples teach JAX, not a
-   framework; anyone who wants a framework will find one.
-5. **≤ 250 lines of code, one file, readable top to bottom.** Comments and the
-   header docstring don't count against it — in a teaching example they are the
-   product, not overhead.
-6. **A `--check` mode** that asserts parity against an unsharded reference
-   computation, in the style of `docs/new_docs/201/shard-map.md`. It doubles as
-   the test, so `examples/` stops rotting silently.
-7. **A header docstring stating which JAX features the file demonstrates and
-   how long it takes to run.** Makes the directory browsable as an index.
+## 4. The examples
 
-## 4. Proposed examples
+Landed, in suggested reading order:
 
-### Tier 1 — the core set
-
-**`nanolm.py` — decoder-only transformer, FSDP + tensor parallel.**
-The flagship, replacing all three MNIST classifiers. Byte-level LM on
-TinyShakespeare. Stacked layer params scanned over with `jax.lax.scan`, params
-sharded on a 2-D `('data', 'model')` mesh so that FSDP and TP fall out of the
-sharding annotations alone — no collectives written by hand, the compiler
-inserts them and the example prints the count. Changing `(4, 2)` to `(8, 1)`
-turns it into pure FSDP; `(1, 8)` into pure TP. Demonstrates: **explicit
-sharding, FSDP, TP, `jit`, `grad`, `scan`, `remat`, donation.**
-
-**`sample.py` — autoregressive decoding with a KV cache.**
-The natural sequel, and something no JAX example currently covers. Demonstrates
-`jax.lax.while_loop` decoding, buffer donation, and the new **mutable-array
-refs** (`jax.new_ref`, per `docs/new_docs/101/state.md`) for the cache — which is
-the honest way to write a cache and a good advertisement for a new API. Add
-`vmap` over sampling temperatures to get a batched sweep for free.
-
-**`moe.py` — mixture of experts with expert parallelism.**
-The best real-world motivation for `shard_map` that exists: experts sharded over
-a mesh axis, top-k routing, and an `all_to_all` to dispatch tokens to their
-expert and gather results back. Demonstrates **`shard_map`, `all_to_all`,
-`psum_scatter`, and mixing manual and automatic modes in one program** — which
-is precisely the composition story `docs/new_docs/201/shard-map.md` develops but
-that no runnable example currently exercises.
-
-**`lora.py` — LoRA fine-tuning, and batched multi-adapter serving.**
-Demonstrates pytree surgery (differentiating w.r.t. a subset of a pytree),
-`remat`, and — the fun part — **`vmap` over a stack of adapters** to serve N
-fine-tunes in a single batched forward pass. That is a genuinely JAX-shaped
-trick that is awkward in every other framework, and it makes the case for `vmap`
-far better than per-example gradients do.
-
-### Tier 2 — JAX is not only a deep learning framework
-
-This is where we differentiate from mlx and PyTorch, and where the old `advi.py`
-was pointing before it aged out.
-
-**`flow_matching.py`** — rectified flow / flow matching on a small image set,
-replacing `mnist_vae.py`. Same "generative model in 100 lines" slot, current
-paradigm. `vmap` over timesteps, `grad`, classifier-free guidance.
-
-**`hmc.py`** — Hamiltonian Monte Carlo, replacing/absorbing `advi.py`.
-`grad` for the leapfrog integrator, `vmap` over chains, `scan` over steps,
-sharding the chains across devices. Roughly 60 lines and it makes JAX look like
-what it actually is.
-
-**`diffsim.py`** — gradients through an ODE/physics integrator: optimize a
-control input by differentiating a `scan`-based simulation. This is the example
-where **`jax.remat` is not optional**, so it's the only honest way to teach
-rematerialization.
-
-**`flash_attention.py`** — a Pallas attention kernel with a correctness check
-against `jax.nn.dot_product_attention` and a benchmark. Covers the
-kernel-authoring layer, which `examples/` says nothing about today.
-
-### Feature coverage
-
-| | jit | grad | vmap | scan | explicit sharding | shard_map | remat | refs |
-|---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
-| `nanolm.py` | ✅ | ✅ | | ✅ | ✅ TP + ZeRO-2 | | ✅ | |
-| `fsdp_pipeline.py` | ✅ | ✅ | | ✅ | ✅ FSDP | | ✅ | |
-| `lora.py` | ✅ | ✅ | ✅ | ✅ | ✅ | | ✅ | |
-| `quantized.py` | ✅ | ✅ | | | | | | ✅ |
-| `sample.py` | ✅ | | ✅ | ✅ | ✅ | | | ✅ |
-| `moe.py` | ✅ | ✅ | | | ✅ | ✅ | | |
-| `flow_matching.py` | ✅ | ✅ | ✅ | | ✅ | | | |
-| `hmc.py` | ✅ | ✅ | ✅ | ✅ | ✅ | | | |
-| `diffsim.py` | ✅ | ✅ | ✅ | ✅ | | | ✅ | |
-| `flash_attention.py` | ✅ | ✅ | | | | | | |
-| `dpsgd.py` (kept) | ✅ | ✅ | ✅ | | ✅ | | | |
-
-
-## 5. Status
-
-Landed (see [`README.md`](README.md)):
-
-| | | |
+| | demonstrates | claim `--check` verifies |
 |---|---|---|
-| `nanolm.py` | new | transformer with tensor parallelism and a ZeRO-2 optimizer |
-| `fsdp_pipeline.py` | new | FSDP with explicitly pipelined collectives |
-| `lora.py` | new | many LoRA adapters trained and served with one `vmap` |
-| `quantized.py` | new | a quantized array type via hijax, used for QAT |
-| `flow_matching.py` | new | generative model with classifier-free guidance |
-| `hmc.py` | new | HMC with vmapped, sharded chains |
-| `sample.py` | new | KV-cache decoding on `jax.new_ref` mutable arrays |
-| `moe.py` | new | expert parallelism with `shard_map` + `all_to_all` |
-| `data.py` | new | byte-level text, replacing the MNIST downloader |
-| `util.py` | new | simulated-device defaults |
-| `examples_test.py` | new | runs every `--check` mode |
-| `mnist_classifier.py` | deleted | |
-| `mnist_classifier_fromscratch.py` | deleted | |
-| `spmd_mnist_classifier_fromscratch.py` | deleted | |
-| `onnx2xla.py` | deleted | |
-| `mnist_vae.py` | deleted | replaced by `flow_matching.py` |
-| `advi.py` | deleted | absorbed into `hmc.py` |
+| `nanolm.py` | tensor parallelism + ZeRO-2 via `reduced`/`unreduced` types; `jit`, `grad`, `scan`, `remat` | sharded loss/grads match a replicated run, on every mesh factorization |
+| `sample.py` | refs (mutable arrays) as a sharded KV cache; `jax.ds` dynamic slices | cached greedy decoding ≡ the uncached model |
+| `lora.py` | `vmap` over a *sharded* adapter axis: train and serve N fine-tunes in one call | each adapter beats the others on its own task |
+| `fsdp_pipeline.py` | FSDP with explicit software pipelining: `custom_vjp` as the backward hook, `unroll=2` as the double buffer | naive and pipelined schedules compute the same gradients |
+| `moe.py` | `shard_map` + `all_to_all` expert parallelism, GShard-style fixed-capacity routing | matches a sequential reference when nothing is dropped |
+| `quantized.py` | a new array type via hijax (`VJPHiPrimitive`), whose *tangent type* is f32; refs for the train loop | PTQ degrades as bits shrink; QAT recovers (int2: 2.1×) |
+| `flow_matching.py` | flow matching + classifier-free guidance; sampler `vmap`ed over guidance strengths | unconditional covers all modes; guidance hits its target |
+| `hmc.py` | `grad` in the integrator, `vmap` over sharded chains, `scan` twice | sampled moments match closed-form moments |
 
-`nanolm.py` originally did FSDP by sharding parameters over the 'data' axis and
-letting the compiler all-gather them. That is memory-correct, but the gather
-for layer *i* sits in the same `scan` iteration as the matmul that consumes it,
-so nothing can hide the communication — and a survey of the PyTorch references
-found that none of them shard parameters in the forward pass at that scale
-either. nanoGPT is plain DDP; modded-nanogpt is ZeRO-2 with a hand-written
-parameter ordering to overlap its optimizer collectives. So `nanolm.py` now
-does what they do, and FSDP moved to `fsdp_pipeline.py`, where the pipelining
-it requires is the lesson rather than a distraction.
+Still to build:
 
-Added beyond the original list: `quantized.py`, demonstrating hijax custom
-types through quantization-aware training -- the tangent type of a quantized
-array is a plain f32 array, which no pytree can express, and QAT is the
-application that needs exactly that.
+- **`diffsim.py`** — gradients through a `scan`-based simulator, optimizing a
+  control sequence; the file where gradient checkpointing is load-bearing,
+  with the residual footprint printed rather than asserted.
+- **`flash_attention.py`** — a minimal Pallas attention kernel, checked
+  against `jax.nn.dot_product_attention` (interpreter mode on CPU; compiled
+  on GPU/TPU).
+- **`differentially_private_sgd.py`** — modernize off
+  `jax.example_libraries`; per-example gradients via `vmap` over a sharded
+  batch remain the canonical "why `vmap`" argument. `datasets.py` retires
+  when this lands.
+- **CI**: run `examples_test.py` in `.github/workflows/ci-build.yaml` next to
+  the existing `examples/ffi` step.
 
-Still to do: `diffsim.py`, `flash_attention.py`, and modernizing
-`differentially_private_sgd.py` off `jax.example_libraries`. `datasets.py`
-stays until that last MNIST consumer is gone. Nothing in CI runs
-`examples_test.py` yet; wiring it into `.github/workflows/ci-build.yaml` next
-to the existing `examples/ffi` step is the obvious follow-up.
+## 5. Decisions and reversals
 
-## 6. What writing these turned up
+Recorded because they changed the plan, and would otherwise look like drift.
 
-Writing complete programs against the public API surfaced four things worth a
-closer look — one of them a hard abort you reach by writing an ordinary
-training loop. They're logged in [`FINDINGS.md`](FINDINGS.md), which is meant
-to keep accumulating as the rest of these examples get written.
+**FSDP moved out of `nanolm.py` (2026-07-26).** The original flagship sharded
+parameters over 'data' and let the compiler all-gather them. Memory-correct,
+but the gather for layer *i* sits in the same `scan` iteration as the matmul
+consuming it, so nothing can hide the communication — and a survey of the
+references found none of them shard parameters in the forward pass at this
+scale (nanoGPT is DDP; modded-nanogpt is ZeRO-2 with hand-ordered optimizer
+collectives; FSDP2 prefetches from runtime hooks, which a `scan` doesn't
+have). `nanolm.py` now does TP + ZeRO-2 — the gradient reduce-scatter falling
+out of the `reduced` type is its headline — and FSDP lives in
+`fsdp_pipeline.py`, where the pipelining it requires is the lesson.
+
+**Design principle 1 was relaxed (2026-07-26).** Originally "every example
+must be a bad example if you delete the sharding." Too strong: it would have
+excluded `diffsim.py`, `flash_attention.py`, and `quantized.py`, none of
+which is improved by bolting a mesh on.
+
+**QAT is fine-tuning, not training from scratch (2026-07-26).** The first
+version of `quantized.py` trained with fake-quant from initialization and
+*lost to PTQ* at every bit width once the float baseline was trained long
+enough. The vetted recipe (torchao) fine-tunes a pretrained model, which wins
+as published. Both results are kept in the file — the negative one is a
+comment, and is arguably the more instructive of the two.
+
+**Refs over donation where state branches.** `nanolm.py` and `lora.py` use
+`donate_argnums` in the classic linear-training-loop shape. `quantized.py`
+branches fine-tunes off a float model that must survive, which is exactly
+where donation bites; its loop holds params and Adam state in refs, updated
+in place, with `jax.new_ref(r[...])` as the explicit copy. The directory
+deliberately shows both idioms.
+
+## 6. What building these turned up
+
+Every file surfaced something — genuine sharp edges, missing docs, one
+already-fixed-upstream bug, and one hard abort reachable from an ordinary
+training loop. They live in [`FINDINGS.md`](FINDINGS.md), which should keep
+accumulating as the remaining examples get written.
