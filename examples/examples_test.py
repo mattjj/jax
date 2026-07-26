@@ -53,6 +53,9 @@ class ExamplesTest(parameterized.TestCase):
                         '--finetune-steps', '250')),
       ('flow_matching.py', ('--check', '--devices', DEVICES, '--steps', '800')),
       ('hmc.py', ('--check', '--devices', DEVICES)),
+      ('diffsim.py', ('--check', '--devices', DEVICES, '--iters', '500')),
+      ('differentially_private_sgd.py',
+       ('--check', '--offline', '--devices', DEVICES, '--steps', '120')),
   )
   def test_check(self, script, args):
     p = run(script, *args)

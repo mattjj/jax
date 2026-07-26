@@ -14,6 +14,42 @@ Re-validated against jax-ml/jax main at `704b65fe` (2026-07-25) on 2026-07-26.
 
 ---
 
+## 2026-07-26 (later still) — from `diffsim.py`
+
+### 9. Scalar accumulators in a scan carry break grad-of-vmap over a sharded axis
+
+Differentiating a `vmap`-over-a-sharded-axis of a `scan` whose carry contains
+a scalar accumulator fails while stamping the batch sharding onto an aval
+whose mesh is empty:
+
+```python
+jax.set_mesh(jax.make_mesh((4,), ('data',)))
+gs = jax.device_put(jnp.arange(8.), jax.P('data'))
+
+def roll(g):
+  def body(c, _):
+    x, acc = c
+    x = jnp.tanh(x + g)
+    return (x, acc + x * x), None
+  (x, acc), _ = jax.lax.scan(body, (0.0 * g, 0.0), None, length=5)
+  return x + acc
+
+jax.grad(lambda gs: jnp.sum(jax.vmap(roll)(gs)))(gs)
+# ValueError: Resource axis: data of P('data',) is not found in mesh: ().
+# (raised from batching.py batch_jaxpr_axes -> NamedSharding.update)
+```
+
+In this 12-line form, replacing the Python `0.0` with `jnp.zeros(())` fixes
+it, implicating the weak-typed literal's empty-mesh aval. But the minimal fix
+is not sufficient in general: `diffsim.py`'s fuel accumulator triggered the
+same error *with* an array-typed init once the body was a full physics step
+(unminimized; the extra ingredient was not isolated). The robust workaround
+used there is structural — keep per-step scalars out of the carry, emit them
+as scan outputs, and sum afterwards. Forward-only vmap-of-scan is fine; it
+needs `grad` around it.
+
+---
+
 ## 2026-07-26 (later) — from `hmc.py` and `flow_matching.py`
 
 ### 8. `jax.random.split` has no `out_sharding`, unlike its siblings

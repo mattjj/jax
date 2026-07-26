@@ -14,15 +14,15 @@ library — because they are here to teach JAX, not a framework.
 | [`quantized.py`](quantized.py) | hijax custom array types, tangent types, quantization-aware training | ~30 s |
 | [`flow_matching.py`](flow_matching.py) | a generative model with classifier-free guidance; `grad`, `vmap`, `scan` | ~1 min |
 | [`hmc.py`](hmc.py) | Hamiltonian Monte Carlo: `grad` in the integrator, `vmap`ed sharded chains | ~10 s |
+| [`diffsim.py`](diffsim.py) | a neural controller trained through a differentiable simulator; `remat`, measured | ~1 min |
 | [`sample.py`](sample.py) | refs (mutable arrays), sharded KV cache, dynamic slices | ~6 min |
 | [`moe.py`](moe.py) | `shard_map`, `all_to_all`, expert parallelism | ~1 min |
-| [`differentially_private_sgd.py`](differentially_private_sgd.py) | `vmap` for per-example gradients | ~5 min |
+| [`differentially_private_sgd.py`](differentially_private_sgd.py) | `vmap` of `grad`: per-example gradients over a sharded batch | ~2 min |
 | [`ffi/`](ffi) | calling custom C++ and CUDA kernels from JAX | |
 | [`jax_cpp/`](jax_cpp) | ahead-of-time lowering and running from C++ | |
 | [`k8s/`](k8s) | multi-host JAX on Kubernetes | |
 
-`differentially_private_sgd.py` is older and still being modernized; see
-[`MODERNIZATION.md`](MODERNIZATION.md) for the plan, and
+See [`MODERNIZATION.md`](MODERNIZATION.md) for the plan and its history, and
 [`FINDINGS.md`](FINDINGS.md) for a running log of JAX rough edges these
 examples have turned up.
 
@@ -65,6 +65,8 @@ python examples/lora.py --check
 python examples/quantized.py --check
 python examples/flow_matching.py --check
 python examples/hmc.py --check
+python examples/diffsim.py --check
+python examples/differentially_private_sgd.py --check --offline
 ```
 
 To run on real hardware instead of simulated devices, pass `--devices 0` and a

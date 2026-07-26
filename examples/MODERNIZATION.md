@@ -19,8 +19,8 @@ frozen since 2018–19:
 | `mnist_vae.py` | VAE, reparameterization | deleted — replaced by `flow_matching.py` |
 | `advi.py` | black-box VI on a 2-D posterior | deleted — absorbed into `hmc.py` |
 | `onnx2xla.py` | ONNX graph → XLA | deleted — dead path, 2018 opset |
-| `differentially_private_sgd.py` | per-example grads via `vmap` | kept — being modernized off `example_libraries` |
-| `datasets.py` | MNIST downloader | kept until its last consumer (dp-sgd) is modernized |
+| `differentially_private_sgd.py` | per-example grads via `vmap` | rewritten — same DP recipe, no `example_libraries`, sharded example axis |
+| `datasets.py` | MNIST downloader | kept — still the MNIST loader for dp-sgd |
 | `ffi/`, `jax_cpp/`, `k8s/` | FFI, AOT-to-C++, multi-host k8s | kept — current and load-bearing |
 
 The common thread: every deleted file predated `jit`-of-`grad` being boring,
@@ -89,21 +89,28 @@ Landed, in suggested reading order:
 | `quantized.py` | a new array type via hijax (`VJPHiPrimitive`), whose *tangent type* is f32; refs for the train loop | PTQ degrades as bits shrink; QAT recovers (int2: 2.1×) |
 | `flow_matching.py` | flow matching + classifier-free guidance; sampler `vmap`ed over guidance strengths | unconditional covers all modes; guidance hits its target |
 | `hmc.py` | `grad` in the integrator, `vmap` over sharded chains, `scan` twice | sampled moments match closed-form moments |
+| `diffsim.py` | `grad` through a `scan` simulator; `remat` with its memory saving *measured* by XLA (18×) | goals reached; remat leaves gradients unchanged |
+| `differentially_private_sgd.py` | `vmap` of `grad` for per-example gradients, sharded example axis | clipping bound holds; the private model learns |
 
 Still to build:
 
-- **`diffsim.py`** — gradients through a `scan`-based simulator, optimizing a
-  control sequence; the file where gradient checkpointing is load-bearing,
-  with the residual footprint printed rather than asserted.
 - **`flash_attention.py`** — a minimal Pallas attention kernel, checked
-  against `jax.nn.dot_product_attention` (interpreter mode on CPU; compiled
-  on GPU/TPU).
-- **`differentially_private_sgd.py`** — modernize off
-  `jax.example_libraries`; per-example gradients via `vmap` over a sharded
-  batch remain the canonical "why `vmap`" argument. `datasets.py` retires
-  when this lands.
-- **CI**: run `examples_test.py` in `.github/workflows/ci-build.yaml` next to
-  the existing `examples/ffi` step.
+  against `jax.nn.dot_product_attention`. Deferred, not dropped: Pallas
+  interpreter mode requires Python 3.12+ (PEP 695 generics in
+  `pallas/mosaic/interpret`), and the development environment this directory
+  was built in runs 3.11 with no accelerator — so the file could not be run,
+  and unverified examples are against the house rules. CI's Python 3.12
+  runners can.
+
+Notes:
+
+- `datasets.py` survives as the MNIST loader for
+  `differentially_private_sgd.py`, which falls back to synthetic data
+  offline.
+- **CI is already wired**: the main build job runs
+  `pytest ... tests examples`, and `examples_test.py` matches pytest's
+  `*_test.py` pattern, so the `--check` suite runs on every PR with no
+  workflow change.
 
 ## 5. Decisions and reversals
 
