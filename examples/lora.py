@@ -18,7 +18,7 @@ Demonstrates: `vmap` over a *sharded* axis, explicit sharding, `jit`, `grad`
 with respect to part of a model, `scan`, `remat`.
 
 LoRA freezes a pretrained model and learns a low-rank correction `a @ b` to a
-few of its weight matrices. The adapters are tiny -- about 1.5% of the base
+few of its weight matrices. The adapters are tiny -- about 1.4% of the base
 model here -- so a whole stack of them fits alongside one copy of the base.
 That is the interesting part, and it is what this file is about:
 
@@ -33,9 +33,8 @@ awkward to express in a framework without `vmap`.
 
 Each adapter learns a different byte-level transform of Shakespeare (leave it
 alone, upper-case it, lower-case it, replace its spaces), so afterwards you
-can check
-that adapter i really is the best one at task i. `--check` asserts exactly
-that.
+can check that adapter i really is the best one at task i. `--check` asserts
+exactly that.
 
     python examples/lora.py            # train the base, then four adapters
     python examples/lora.py --check    # assert each adapter wins its own task

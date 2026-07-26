@@ -164,6 +164,9 @@ def main(args):
     ys = jax.device_put(jnp.asarray(train_y[i]), jax.P('data'))
     key, subkey = jax.random.split(key)
     params, grads = private_step(params, subkey, xs, ys)
+    # Waiting each step bounds the work in flight; see the note in
+    # nanolm.train (and README.md) on why that matters on simulated devices.
+    jax.block_until_ready(params)
     if step % max(1, args.steps // 6) == 0 or step == args.steps - 1:
       acc = accuracy(params, jnp.asarray(test_x), jnp.asarray(test_y))
       print(f'  step {step:4d}  test accuracy {acc:.3f}')

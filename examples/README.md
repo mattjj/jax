@@ -45,17 +45,21 @@ python examples/nanolm.py --steps 1200 --save /tmp/nanolm.npz
 python examples/sample.py --params /tmp/nanolm.npz
 ```
 
-Each takes a `--mesh` argument, so the same file demonstrates different
-parallelization strategies:
+The transformer-family files (`nanolm.py`, `sample.py`, `lora.py`) take a
+`"data,model"` `--mesh` argument, so the same file demonstrates different
+parallelization strategies (`moe.py`'s `--mesh` is a single integer, the
+number of devices to spread experts over); the single-axis files just take
+`--devices`:
 
 ```
-python examples/nanolm.py --mesh 8,1   # pure FSDP
+python examples/nanolm.py --mesh 8,1   # pure data parallelism (ZeRO-2)
 python examples/nanolm.py --mesh 1,8   # pure tensor parallelism
 python examples/nanolm.py --mesh 4,2   # both
 ```
 
-and each has a `--check` mode that verifies the parallel computation against
-an unsharded reference:
+and every example has a `--check` mode that asserts a falsifiable claim --
+parity with an unsharded reference, exact closed-form moments, "each adapter
+wins its own task":
 
 ```
 python examples/nanolm.py --check
@@ -77,9 +81,10 @@ mesh axis shards must divide evenly, which is why these examples pick sizes
 like 8 attention heads — it lets every factorization of an 8-device mesh work.
 And every simulated device is backed by the same CPU thread pool, so a program
 that runs far ahead of the device — JAX dispatches asynchronously — can queue
-more concurrent collectives than the pool has threads and stall. The training
-loops here wait on each step's loss to keep that bounded; if you write your own
-loop over simulated devices and it hangs in an all-gather, that is why.
+more concurrent collectives than the pool has threads and stall. Every training
+loop here that runs collectives therefore waits on something small each step to
+bound the work in flight; if you write your own loop over simulated devices and
+it hangs in an all-gather, that is why.
 
 ## Reading order
 
@@ -89,12 +94,17 @@ at the top of it are the only place its parallelism is expressed. Then
 it four different ways at once; `fsdp_pipeline.py`, which shards the parameters
 too and shows what it costs to keep the resulting collectives off the critical
 path; and `moe.py`, which is where automatic partitioning stops being enough and
-`shard_map` takes over. The remaining three stand alone: `quantized.py` defines
-a new array type and trains through it, and `flow_matching.py` and `hmc.py` are
-the "JAX is not only for transformers" corner of the directory.
+`shard_map` takes over. The rest stand alone: `quantized.py` defines a new
+array type and trains through it; `flow_matching.py`, `hmc.py`, and
+`diffsim.py` are the "JAX is not only for transformers" corner of the
+directory; and `differentially_private_sgd.py` is the classic per-example
+`vmap`-of-`grad` argument, modernized.
 
-The documentation these are meant to accompany is
-[Distributed arrays and automatic parallelization](https://docs.jax.dev/en/latest/notebooks/Distributed_arrays_and_automatic_parallelization.html)
-and [`shard_map`](https://docs.jax.dev/en/latest/notebooks/shard_map.html).
+The documentation these are meant to accompany lives in
+[`docs/new_docs`](../docs/new_docs): notably
+[sharding](../docs/new_docs/201/sharding.md),
+[`shard_map`](../docs/new_docs/201/shard-map.md),
+[autodiff and sharding](../docs/new_docs/301/sharding-ad.md), and
+[hijax types](../docs/new_docs/301/hijax-types.md).
 For full-scale, performance-tuned implementations of real open-weights models,
 see [jax-llm-examples](https://github.com/jax-ml/jax-llm-examples).

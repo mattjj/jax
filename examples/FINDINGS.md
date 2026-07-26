@@ -48,6 +48,10 @@ used there is structural — keep per-step scalars out of the carry, emit them
 as scan outputs, and sum afterwards. Forward-only vmap-of-scan is fine; it
 needs `grad` around it.
 
+Found on `0.11.0.dev20260711` (`4f484c50`), the newest tree this environment
+can execute; not yet checked against current main, which needs a jaxlib this
+environment cannot reach.
+
 ---
 
 ## 2026-07-26 (later) — from `hmc.py` and `flow_matching.py`
