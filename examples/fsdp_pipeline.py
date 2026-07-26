@@ -206,17 +206,27 @@ def init(key):
 SPEC_TUPLE = tuple(LAYER_SPECS[k] for k in nanolm.LAYER_KEYS)
 
 
-def make_loss(stack):
-  def loss(params, batch):
-    tokens = batch[:, :-1]
-    x = params['embed'].at[tokens].get(out_sharding=nanolm.ACTS)
-    ws = tuple(params[k] for k in nanolm.LAYER_KEYS)
-    x = stack(ws, x, SPEC_TUPLE)
-    lg = jnp.einsum('btd,dv->btv', nanolm.rmsnorm(x), params['unemb'],
-                    out_sharding=nanolm.ACTS)
-    lp = jax.nn.log_softmax(lg)
-    return -jnp.mean(jnp.take_along_axis(lp, batch[:, 1:, None], -1))
-  return loss
+# The two losses are identical apart from which layer stack they call, and are
+# written out rather than shared so that each reads top to bottom.
+
+def loss_naive(params, batch):
+  x = params['embed'].at[batch[:, :-1]].get(out_sharding=nanolm.ACTS)
+  ws = tuple(params[k] for k in nanolm.LAYER_KEYS)
+  x = naive(ws, x, SPEC_TUPLE)
+  lg = jnp.einsum('btd,dv->btv', nanolm.rmsnorm(x), params['unemb'],
+                  out_sharding=nanolm.ACTS)
+  lp = jax.nn.log_softmax(lg)
+  return -jnp.mean(jnp.take_along_axis(lp, batch[:, 1:, None], -1))
+
+
+def loss_pipelined(params, batch):
+  x = params['embed'].at[batch[:, :-1]].get(out_sharding=nanolm.ACTS)
+  ws = tuple(params[k] for k in nanolm.LAYER_KEYS)
+  x = pipelined(ws, x, SPEC_TUPLE)
+  lg = jnp.einsum('btd,dv->btv', nanolm.rmsnorm(x), params['unemb'],
+                  out_sharding=nanolm.ACTS)
+  lp = jax.nn.log_softmax(lg)
+  return -jnp.mean(jnp.take_along_axis(lp, batch[:, 1:, None], -1))
 
 
 def scan_carry(fn, *args):
@@ -245,16 +255,12 @@ def main(args):
       next(data.batches(data.load(args.offline), B, T, seed=args.seed)
            ).astype(np.int32), jax.P('data', None))
 
-  ws = tuple(params[k] for k in nanolm.LAYER_KEYS)
-  x = params['embed'].at[batch[:, :-1]].get(out_sharding=nanolm.ACTS)
-
   grads = {}
-  for name, stack in (('naive', naive), ('pipelined', pipelined)):
-    loss = make_loss(stack)
+  for name, loss in (('naive', loss_naive), ('pipelined', loss_pipelined)):
     grads[name] = jax.jit(jax.grad(loss))(params, batch)
     print(f'\n  {name} (loss {jax.jit(loss)(params, batch):.4f}), '
           'values carried across the layer loop:')
-    for aval in scan_carry(lambda w, y: stack(w, y, SPEC_TUPLE), ws, x):
+    for aval in scan_carry(loss, params, batch):
       print(f'    {aval}')
 
   # Exactly equal on more than one device; on a single device the two
