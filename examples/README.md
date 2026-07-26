@@ -11,16 +11,17 @@ library — because they are here to teach JAX, not a framework.
 | [`nanolm.py`](nanolm.py) | explicit sharding, tensor parallelism, ZeRO-2, `reduced`/`unreduced`, `jit`, `grad`, `scan`, `remat` | ~1 min |
 | [`fsdp_pipeline.py`](fsdp_pipeline.py) | FSDP, `custom_vjp`, software-pipelined collectives | ~1 min |
 | [`lora.py`](lora.py) | `vmap` over a sharded axis, multi-adapter training and serving | ~2 min |
+| [`quantized.py`](quantized.py) | hijax custom array types, tangent types, quantization-aware training | ~1 min |
+| [`flow_matching.py`](flow_matching.py) | a generative model with classifier-free guidance; `grad`, `vmap`, `scan` | ~1 min |
+| [`hmc.py`](hmc.py) | Hamiltonian Monte Carlo: `grad` in the integrator, `vmap`ed sharded chains | ~30 s |
 | [`sample.py`](sample.py) | refs (mutable arrays), sharded KV cache, dynamic slices | ~6 min |
 | [`moe.py`](moe.py) | `shard_map`, `all_to_all`, expert parallelism | ~1 min |
 | [`differentially_private_sgd.py`](differentially_private_sgd.py) | `vmap` for per-example gradients | ~5 min |
-| [`advi.py`](advi.py) | `grad` and `vmap` for variational inference | ~1 min |
-| [`mnist_vae.py`](mnist_vae.py) | a variational autoencoder | ~2 min |
 | [`ffi/`](ffi) | calling custom C++ and CUDA kernels from JAX | |
 | [`jax_cpp/`](jax_cpp) | ahead-of-time lowering and running from C++ | |
 | [`k8s/`](k8s) | multi-host JAX on Kubernetes | |
 
-The last three files in the first group are older and are being replaced; see
+`differentially_private_sgd.py` is older and still being modernized; see
 [`MODERNIZATION.md`](MODERNIZATION.md) for the plan, and
 [`FINDINGS.md`](FINDINGS.md) for a running log of JAX rough edges these
 examples have turned up.
@@ -61,6 +62,9 @@ python examples/nanolm.py --check
 python examples/moe.py --check
 python examples/sample.py --check
 python examples/lora.py --check
+python examples/quantized.py --check
+python examples/flow_matching.py --check
+python examples/hmc.py --check
 ```
 
 To run on real hardware instead of simulated devices, pass `--devices 0` and a

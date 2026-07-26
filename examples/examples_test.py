@@ -49,6 +49,10 @@ class ExamplesTest(parameterized.TestCase):
       ('fsdp_pipeline.py', ('--check', '--offline', '--devices', DEVICES)),
       ('lora.py', ('--check', '--offline', '--devices', DEVICES, '--mesh', '2,1',
                    '--base-steps', '120', '--steps', '120')),
+      ('quantized.py', ('--check', '--devices', DEVICES, '--steps', '800',
+                        '--finetune-steps', '250')),
+      ('flow_matching.py', ('--check', '--devices', DEVICES, '--steps', '800')),
+      ('hmc.py', ('--check', '--devices', DEVICES)),
   )
   def test_check(self, script, args):
     p = run(script, *args)

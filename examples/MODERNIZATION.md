@@ -152,6 +152,7 @@ kernel-authoring layer, which `examples/` says nothing about today.
 | `nanolm.py` | ✅ | ✅ | | ✅ | ✅ TP + ZeRO-2 | | ✅ | |
 | `fsdp_pipeline.py` | ✅ | ✅ | | ✅ | ✅ FSDP | | ✅ | |
 | `lora.py` | ✅ | ✅ | ✅ | ✅ | ✅ | | ✅ | |
+| `quantized.py` | ✅ | ✅ | | | | | | ✅ |
 | `sample.py` | ✅ | | ✅ | ✅ | ✅ | | | ✅ |
 | `moe.py` | ✅ | ✅ | | | ✅ | ✅ | | |
 | `flow_matching.py` | ✅ | ✅ | ✅ | | ✅ | | | |
@@ -170,6 +171,9 @@ Landed (see [`README.md`](README.md)):
 | `nanolm.py` | new | transformer with tensor parallelism and a ZeRO-2 optimizer |
 | `fsdp_pipeline.py` | new | FSDP with explicitly pipelined collectives |
 | `lora.py` | new | many LoRA adapters trained and served with one `vmap` |
+| `quantized.py` | new | a quantized array type via hijax, used for QAT |
+| `flow_matching.py` | new | generative model with classifier-free guidance |
+| `hmc.py` | new | HMC with vmapped, sharded chains |
 | `sample.py` | new | KV-cache decoding on `jax.new_ref` mutable arrays |
 | `moe.py` | new | expert parallelism with `shard_map` + `all_to_all` |
 | `data.py` | new | byte-level text, replacing the MNIST downloader |
@@ -179,6 +183,8 @@ Landed (see [`README.md`](README.md)):
 | `mnist_classifier_fromscratch.py` | deleted | |
 | `spmd_mnist_classifier_fromscratch.py` | deleted | |
 | `onnx2xla.py` | deleted | |
+| `mnist_vae.py` | deleted | replaced by `flow_matching.py` |
+| `advi.py` | deleted | absorbed into `hmc.py` |
 
 `nanolm.py` originally did FSDP by sharding parameters over the 'data' axis and
 letting the compiler all-gather them. That is memory-correct, but the gather
@@ -190,13 +196,16 @@ parameter ordering to overlap its optimizer collectives. So `nanolm.py` now
 does what they do, and FSDP moved to `fsdp_pipeline.py`, where the pipelining
 it requires is the lesson rather than a distraction.
 
-Still to do, in the order proposed above: `flow_matching.py`
-(retiring `mnist_vae.py`), `hmc.py` (absorbing `advi.py`), `diffsim.py`,
-`flash_attention.py`, and modernizing `differentially_private_sgd.py` off
-`jax.example_libraries`. `datasets.py` stays until the last MNIST consumer is
-gone. Nothing in CI runs `examples_test.py` yet; wiring it into
-`.github/workflows/ci-build.yaml` next to the existing `examples/ffi` step is
-the obvious follow-up.
+Added beyond the original list: `quantized.py`, demonstrating hijax custom
+types through quantization-aware training -- the tangent type of a quantized
+array is a plain f32 array, which no pytree can express, and QAT is the
+application that needs exactly that.
+
+Still to do: `diffsim.py`, `flash_attention.py`, and modernizing
+`differentially_private_sgd.py` off `jax.example_libraries`. `datasets.py`
+stays until that last MNIST consumer is gone. Nothing in CI runs
+`examples_test.py` yet; wiring it into `.github/workflows/ci-build.yaml` next
+to the existing `examples/ffi` step is the obvious follow-up.
 
 ## 6. What writing these turned up
 
