@@ -34,13 +34,22 @@ device stores and updates only 1/N of the Adam state, so the memory that
 actually dominates at this scale is sharded without touching the forward pass.
 It is what modded-nanogpt does, and it is a good default.
 
-The trick that makes it fall out of the type system is `reduced`: parameters
-are stored with a `reduced={'data'}` sharding, which is bit-identical to
-replicated but tells autodiff to hand back *unreduced* gradients -- per-device
-partial sums with the cross-device reduction still pending. Resharding those
-to `OPT_SPECS` is then a reduce-scatter rather than an all-reduce, and the
-optimizer runs on shards. See `train_step`, and
-docs/new_docs/301/sharding-ad.md for the full story.
+THE TRICK: the ZeRO-2 gradient reduction falls out of the *type system*, not
+out of any collective anyone writes. Parameters are stored with a
+`reduced={'data'}` sharding -- bit-identical to replicated, no data moves --
+and the only thing that changes is what autodiff does with them:
+
+    param    float32[4,128,512@model]{R:data}   stored `reduced`, so...
+    grad     float32[4,128,512@model]{U:data}   ...`grad` leaves it unreduced,
+    sharded  float32[4,128@data,512@model]      ...so this reshard is a
+                                                   reduce-scatter, not an
+                                                   all-reduce we then discard
+                                                   7/8ths of.
+
+A one-word change to a type moves a collective and cuts its cost by a factor
+of N. The program prints those three lines when you run it; `train_step` is
+where the middle one becomes the bottom one, and
+docs/new_docs/301/sharding-ad.md has the full story.
 
 What this file deliberately does *not* do is shard parameters during the
 forward pass (FSDP / ZeRO-3). Doing that well needs the all-gather for layer
@@ -289,6 +298,20 @@ def main(args):
   print('\n'.join(f'  {k:6s} {jax.typeof(p)}' for k, p in params.items()))
   nparams = sum(np.prod(s) for s in SHAPES.values())
   print(f'  {nparams / 1e6:.2f}M parameters, batch {jax.typeof(batch)}')
+
+  # The point of the file, in three types. `.trace(...)` stops after tracing,
+  # so `out_avals` costs nothing to look at.
+  g = jax.jit(jax.grad(loss)).trace(params, batch).out_avals
+  g_sharded = jax.jit(
+      lambda p, b: {k: jax.reshard(v, OPT_SPECS[k])
+                    for k, v in jax.grad(loss)(p, b).items()}
+      ).trace(params, batch).out_avals
+  k = 'up'
+  print(f'\n  the ZeRO-2 reduction, as types:\n'
+        f'    parameter        {jax.typeof(params[k])}   stored `reduced`, so...\n'
+        f'    its gradient     {g[k]}   ...`grad` leaves it unreduced,\n'
+        f'    after resharding {g_sharded[k]}      ...so this is a '
+        f'reduce-scatter\n')
 
   fwd = collectives(loss, params, batch)
   print('  forward+backward: '

@@ -224,7 +224,7 @@ def scan_carry(fn, *args):
         if hasattr(inner, 'eqns') and (found := find(inner)) is not None:
           return found
     return None
-  return [str(v.aval) for v in find(jax.make_jaxpr(fn)(*args).jaxpr).outvars]
+  return [str(v.aval) for v in find(jax.jit(fn).trace(*args).jaxpr).outvars]
 
 
 def main(args):
