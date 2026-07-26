@@ -12,27 +12,50 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Training a byte-level transformer with FSDP and tensor parallelism.
+"""Training a byte-level transformer with tensor and data parallelism.
 
-Demonstrates: explicit sharding, `jit`, `grad`, `scan`, `remat`, donation.
+Demonstrates: explicit sharding, `reduced`/`unreduced` types, `jit`, `grad`,
+`scan`, `remat`, donation.
 
 The model is a small decoder-only transformer trained on Shakespeare. The
-interesting part is the `SPECS` table below: it is the *only* place
-parallelism is expressed. There are no collectives in the model code. Sharding
-the parameters over the 'data' mesh axis gives fully sharded data parallelism
-(FSDP), because the compiler all-gathers each parameter just before it is
-used; sharding them over the 'model' axis gives tensor parallelism, because
-the compiler all-reduces the partial sums. The example prints the collectives
-it ended up with so you can see which annotation bought which.
+interesting part is the two tables below, `PARAM_SPECS` and `OPT_SPECS`: they
+are the *only* place parallelism is expressed. There are no collectives in the
+model code.
+
+`PARAM_SPECS` shards the parameters over the 'model' mesh axis, which is
+textbook tensor parallelism: each layer's two "row-parallel" matmuls contract
+a sharded axis and the compiler all-reduces the partial sums. Over the 'data'
+axis the parameters are *replicated*, so the forward pass needs no
+communication for them at all.
+
+`OPT_SPECS` additionally shards the gradients and the optimizer state over
+'data'. This is the ZeRO-2 arrangement: full parameters everywhere, but each
+device stores and updates only 1/N of the Adam state, so the memory that
+actually dominates at this scale is sharded without touching the forward pass.
+It is what modded-nanogpt does, and it is a good default.
+
+The trick that makes it fall out of the type system is `reduced`: parameters
+are stored with a `reduced={'data'}` sharding, which is bit-identical to
+replicated but tells autodiff to hand back *unreduced* gradients -- per-device
+partial sums with the cross-device reduction still pending. Resharding those
+to `OPT_SPECS` is then a reduce-scatter rather than an all-reduce, and the
+optimizer runs on shards. See `train_step`, and
+docs/new_docs/301/sharding-ad.md for the full story.
+
+What this file deliberately does *not* do is shard parameters during the
+forward pass (FSDP / ZeRO-3). Doing that well needs the all-gather for layer
+i+1 to overlap the matmuls of layer i, which a `scan` will not give you for
+free -- it needs explicit software pipelining. That is its own lesson, and it
+lives in `fsdp_pipeline.py`.
 
 By default this runs on *simulated* CPU devices -- as many as the machine has
 cores, up to eight -- so the sharding is real and inspectable on a laptop. To
 run it on real hardware, pass `--devices 0` and a mesh matching your machine.
 
-    python examples/nanolm.py                        # ~1 min on CPU
-    python examples/nanolm.py --devices 8 --mesh 8,1  # pure FSDP
+    python examples/nanolm.py                         # ~1 min on CPU
+    python examples/nanolm.py --devices 8 --mesh 8,1  # pure data parallelism
     python examples/nanolm.py --devices 8 --mesh 1,8  # pure tensor parallelism
-    python examples/nanolm.py --check                # verify against replicated
+    python examples/nanolm.py --check                 # verify against replicated
 
 The 200 steps this runs by default are enough to watch the loss fall, not to
 train a model. `--steps 1200 --save params.npz` takes about six minutes on a
@@ -73,18 +96,32 @@ SHAPES = dict(
     unemb=(D, V),
 )
 
-# The whole parallelization strategy. 'data' shards give FSDP, 'model' shards
-# give tensor parallelism, and every parameter is sharded over both. Note that
-# every array axis mentioned here (V, D, N, F) must be divisible by the
-# corresponding mesh axis size, which is why N == 8 rather than something
-# smaller: it lets `--mesh 1,8` work.
-SPECS = dict(
-    embed=jax.P('data', 'model'),              # [V, D]
+# How the parameters are laid out during the forward and backward passes.
+# Only the 'model' axis appears: this is tensor parallelism, and over 'data'
+# every parameter is replicated. `qkv` and `up` are "column parallel" (their
+# output axis is sharded, so no communication is needed); `proj` and `down`
+# are "row parallel" (they contract a sharded axis, so their partial sums have
+# to be all-reduced). Every axis a mesh axis shards must divide evenly, which
+# is why N == 8 rather than something smaller: it lets `--mesh 1,8` work.
+PARAM_SPECS = dict(
+    embed=jax.P(),                             # [V, D]
+    qkv=jax.P(None, None, 'model', None),      # [L, D, N, 3H]  column parallel
+    proj=jax.P(None, 'model', None, None),     # [L, N, H, D]   row parallel
+    up=jax.P(None, None, 'model'),             # [L, D, F]      column parallel
+    down=jax.P(None, 'model', None),           # [L, F, D]      row parallel
+    unemb=jax.P(),                             # [D, V]
+)
+
+# How the gradients and the Adam state are laid out: the same, plus a shard
+# over 'data'. This is the only place 'data' shards a parameter-shaped array,
+# and it is what makes this ZeRO-2 rather than plain data parallelism.
+OPT_SPECS = dict(
+    embed=jax.P('data', None),                 # [V, D]
     qkv=jax.P(None, 'data', 'model', None),    # [L, D, N, 3H]
     proj=jax.P(None, 'model', None, 'data'),   # [L, N, H, D]
     up=jax.P(None, 'data', 'model'),           # [L, D, F]
     down=jax.P(None, 'model', 'data'),         # [L, F, D]
-    unemb=jax.P('data', 'model'),              # [D, V]
+    unemb=jax.P('data', None),                 # [D, V]
 )
 
 # Activations keep the batch sharded over 'data' and everything else replicated.
@@ -93,12 +130,26 @@ ACTS = jax.P('data', None, None)
 LAYER_KEYS = ('qkv', 'proj', 'up', 'down')
 
 
+def reduced(spec):
+  """Same layout, but autodiff hands back *unreduced* gradients.
+
+  `reduced={'data'}` is physically identical to replicated over 'data' -- the
+  cast below moves no data. It only changes the cotangent type, so that
+  `jax.grad` stops before the cross-device sum and leaves per-device partial
+  sums for `train_step` to reduce-scatter where it wants to.
+  """
+  return jax.P(*spec, reduced={'data'})
+
+
 # -- model -------------------------------------------------------------------
 
-def init(key, specs=SPECS):
+def init(key, specs=PARAM_SPECS, as_reduced=True):
   keys = jax.random.split(key, len(SHAPES))
-  return {k: jax.random.normal(kk, s, out_sharding=specs[k]) * (s[-2] ** -0.5)
-          for kk, (k, s) in zip(keys, SHAPES.items())}
+  params = {k: jax.random.normal(kk, s, out_sharding=specs[k]) * (s[-2] ** -0.5)
+            for kk, (k, s) in zip(keys, SHAPES.items())}
+  if not as_reduced:  # for the unsharded reference in `check`
+    return params
+  return {k: jax.reshard(v, reduced(specs[k])) for k, v in params.items()}
 
 
 def rmsnorm(x):
@@ -133,8 +184,10 @@ def loss(params, batch):
 # -- optimizer ---------------------------------------------------------------
 
 def adam_init(params):
-  return dict(m=jax.tree.map(jnp.zeros_like, params),
-              v=jax.tree.map(jnp.zeros_like, params), t=jnp.zeros((), jnp.int32))
+  """Adam state lives sharded over 'data' -- 1/N of it per device."""
+  shards = {k: jax.reshard(v, OPT_SPECS[k]) for k, v in params.items()}
+  return dict(m=jax.tree.map(jnp.zeros_like, shards),
+              v=jax.tree.map(jnp.zeros_like, shards), t=jnp.zeros((), jnp.int32))
 
 
 def schedule(t, steps, peak=3e-3, warmup=50):
@@ -146,12 +199,26 @@ def schedule(t, steps, peak=3e-3, warmup=50):
 def train_step(params, opt, batch, steps, b1=0.9, b2=0.99, eps=1e-8):
   l, g = jax.value_and_grad(loss)(params, batch)
   t = opt['t'] + 1
+
+  # `g` is unreduced over 'data': each device holds a partial sum, and the
+  # cross-device reduction has not happened yet. Resharding it to a
+  # 'data'-sharded layout does that reduction *and* the split in one step --
+  # a reduce-scatter, where a replicated gradient would have cost a full
+  # all-reduce followed by throwing away all but 1/N of the result.
+  g = {k: jax.reshard(v, OPT_SPECS[k]) for k, v in g.items()}
+  # Slicing the replicated parameters down to this device's shard is free.
+  shards = {k: jax.reshard(v, OPT_SPECS[k]) for k, v in params.items()}
+
   m = jax.tree.map(lambda m, g: b1 * m + (1 - b1) * g, opt['m'], g)
   v = jax.tree.map(lambda v, g: b2 * v + (1 - b2) * g * g, opt['v'], g)
   lr = schedule(t, steps)
-  params = jax.tree.map(
+  shards = jax.tree.map(
       lambda p, m, v: p - lr * (m / (1 - b1 ** t)) / (jnp.sqrt(v / (1 - b2 ** t)) + eps),
-      params, m, v)
+      shards, m, v)
+
+  # Each device updated its own slice; all-gather them back into full
+  # parameters for the next forward pass.
+  params = {k: jax.reshard(v, reduced(PARAM_SPECS[k])) for k, v in shards.items()}
   return params, dict(m=m, v=v, t=t), l
 
 
@@ -183,13 +250,16 @@ def train(params, batch_iter, steps, log=print):
 
 def check(key, batch):
   """Asserts the sharded computation matches a fully replicated one."""
-  replicated = {k: jax.P() for k in SPECS}
-  ref_params = init(key, replicated)
-  params = jax.tree.map(lambda x, s: jax.device_put(x, s), ref_params, SPECS)
+  replicated = {k: jax.P() for k in PARAM_SPECS}
+  ref_params = init(key, replicated, as_reduced=False)
+  params = {k: jax.reshard(v, reduced(PARAM_SPECS[k]))
+            for k, v in ref_params.items()}
   ref_batch = jax.device_put(batch, jax.P())
   np.testing.assert_allclose(jax.jit(loss)(params, batch),
                              jax.jit(loss)(ref_params, ref_batch), rtol=1e-4)
-  g = jax.jit(jax.grad(loss))(params, batch)
+  # Reduce the unreduced gradients so they are comparable to the reference.
+  g = jax.jit(lambda p, b: {k: jax.reshard(v, OPT_SPECS[k])
+                            for k, v in jax.grad(loss)(p, b).items()})(params, batch)
   ref_g = jax.jit(jax.grad(loss))(ref_params, ref_batch)
   # Compared against the magnitude of the gradient rather than elementwise:
   # partitioning reassociates the reductions, so the two computations agree in
@@ -220,8 +290,19 @@ def main(args):
   nparams = sum(np.prod(s) for s in SHAPES.values())
   print(f'  {nparams / 1e6:.2f}M parameters, batch {jax.typeof(batch)}')
 
-  counts = collectives(loss, params, batch)
-  print('  collectives: ' + ', '.join(f'{k}={v}' for k, v in counts.items() if v))
+  fwd = collectives(loss, params, batch)
+  print('  forward+backward: '
+        + ', '.join(f'{k}={v}' for k, v in fwd.items() if v)
+        + '   (tensor parallelism only; no parameter gathers)')
+  step = collectives(functools.partial(train_step, steps=args.steps),
+                     params, adam_init(params), batch)
+  print('  whole step:       '
+        + ', '.join(f'{k}={v}' for k, v in step.items() if v)
+        + '   (plus the optimizer gradient reduction and gather)')
+  if jax.devices()[0].platform == 'cpu':
+    print('  note: the gradient reduce-scatters show up above as all-reduce +'
+          ' dynamic-slice;\n        XLA rewrites that pair into a'
+          ' reduce-scatter on TPU and GPU, but not on CPU.')
 
   params = train(params, batch_iter, args.steps)
 

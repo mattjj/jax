@@ -12,6 +12,72 @@ resolved upstream.
 
 ---
 
+## 2026-07-26 — from the ZeRO-2 rewrite of `nanolm.py` and from `fsdp_pipeline.py`
+
+### 5. Converting an unreduced array to NumPy fails, and the error asks for a bug report
+
+`reduced`/`unreduced` works beautifully — a one-line cast in the forward pass
+really does move the reduction to where you want it in the backward pass. But
+an unreduced array can't leave the device:
+
+```python
+g = jax.grad(loss)(params, batch)   # f32[...]{U:data}
+np.asarray(g['up'])
+# NotImplementedError: device_indices_map doesn't work with unreduced.
+# Please file a bug at https://github.com/jax-ml/jax/issues
+```
+
+Filing that bug here. The natural reading of `np.asarray` on an unreduced array
+is "perform the pending reduction, then give me the value", which is what
+`jax.reshard(g, ...)` would have done anyway. Failing is defensible, but the
+message should then say *"unreduced arrays must be resharded before their value
+can be read; use `jax.reshard`"* rather than pointing at an internal helper and
+asking for a bug report. This is easy to hit: it's what happens the first time
+you print or assert on a gradient.
+
+### 6. `jax.reshard` with a wrong-rank spec raises a bare `AssertionError`
+
+Passing a spec whose rank doesn't match the array's:
+
+```python
+jax.reshard(x, jax.P(None, None, None, 'data'))   # x has rank 3
+# AssertionError: (3, P(None, None, None, 'data'))
+```
+
+The tuple in the message is `(ndim, spec)`, which is the right information with
+none of the words. This is a very easy mistake to make when a stacked parameter
+`[L, ...]` and a single layer's slice share a spec table, which is exactly the
+situation in `fsdp_pipeline.py`. A `TypeError` naming both ranks would have
+saved a debugging cycle.
+
+### 7. `PartitionSpec` is a tuple subclass, so `tree.map` silently destructures it
+
+```python
+jax.tree.map(lambda x, s: jax.reshard(x, s), weights, specs)
+```
+
+does not do what it looks like: `PartitionSpec` subclasses `tuple`, so
+`tree.map` treats each spec as a container and pairs array leaves with
+individual *axis names*. There's no error at the tree level — you get a
+confusing failure further in, from whatever receives a string where it wanted a
+spec. Registering `PartitionSpec` as a leaf, or documenting the hazard next to
+`jax.P`, would help; specs and pytrees-of-arrays are natural to zip together.
+
+### 8. XLA:CPU doesn't fuse all-reduce + dynamic-slice into reduce-scatter
+
+`jax.reshard(unreduced_grad, P('data', ...))` should be a reduce-scatter, and on
+TPU/GPU the all-reduce + dynamic-slice pair it lowers to gets rewritten into
+one. On CPU it doesn't, so the optimized HLO shows `all-reduce` followed by
+`dynamic-slice` and `reduce-scatter(` never appears.
+
+Not a correctness problem, and CPU performance isn't the point. It matters here
+only because these examples *print their collective counts as output* — so the
+CPU run under-reports the pattern the reader is meant to see, and `nanolm.py`
+has to spend three lines explaining that. Worth knowing if anyone else builds
+teaching material around inspecting CPU HLO.
+
+---
+
 ## 2026-07-25 — from `nanolm.py`, `sample.py`, `moe.py`
 
 ### 1. Explicit sharding catches genuine ambiguities in ordinary model code

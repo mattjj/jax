@@ -46,6 +46,7 @@ class ExamplesTest(parameterized.TestCase):
       ('moe.py', ('--check', '--devices', DEVICES, '--mesh', '2')),
       ('sample.py', ('--check', '--offline', '--devices', DEVICES, '--mesh', '2,1',
                      '--train-steps', '2')),
+      ('fsdp_pipeline.py', ('--check', '--offline', '--devices', DEVICES)),
   )
   def test_check(self, script, args):
     p = run(script, *args)

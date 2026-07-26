@@ -67,7 +67,9 @@ Second, terse-and-complete beats broad-and-shallow.
 4. **No dependencies beyond `jax` + `numpy`.** No Flax, no Optax, no
    `jax.example_libraries`. Adam is six lines. These examples teach JAX, not a
    framework; anyone who wants a framework will find one.
-5. **≤ 250 lines, one file, readable top to bottom.**
+5. **≤ 250 lines of code, one file, readable top to bottom.** Comments and the
+   header docstring don't count against it — in a teaching example they are the
+   product, not overhead.
 6. **A `--check` mode** that asserts parity against an unsharded reference
    computation, in the style of `docs/new_docs/201/shard-map.md`. It doubles as
    the test, so `examples/` stops rotting silently.
@@ -136,7 +138,8 @@ kernel-authoring layer, which `examples/` says nothing about today.
 
 | | jit | grad | vmap | scan | explicit sharding | shard_map | remat | refs |
 |---|:-:|:-:|:-:|:-:|:-:|:-:|:-:|:-:|
-| `nanolm.py` | ✅ | ✅ | | ✅ | ✅ FSDP+TP | | ✅ | |
+| `nanolm.py` | ✅ | ✅ | | ✅ | ✅ TP + ZeRO-2 | | ✅ | |
+| `fsdp_pipeline.py` | ✅ | ✅ | | ✅ | ✅ FSDP | | ✅ | |
 | `sample.py` | ✅ | | ✅ | ✅ | ✅ | | | ✅ |
 | `moe.py` | ✅ | ✅ | | | ✅ | ✅ | | |
 | `lora.py` | ✅ | ✅ | ✅ | ✅ | ✅ | | ✅ | |
@@ -153,7 +156,8 @@ Landed (see [`README.md`](README.md)):
 
 | | | |
 |---|---|---|
-| `nanolm.py` | new | transformer with FSDP + TP from sharding annotations alone |
+| `nanolm.py` | new | transformer with tensor parallelism and a ZeRO-2 optimizer |
+| `fsdp_pipeline.py` | new | FSDP with explicitly pipelined collectives |
 | `sample.py` | new | KV-cache decoding on `jax.new_ref` mutable arrays |
 | `moe.py` | new | expert parallelism with `shard_map` + `all_to_all` |
 | `data.py` | new | byte-level text, replacing the MNIST downloader |
@@ -163,6 +167,16 @@ Landed (see [`README.md`](README.md)):
 | `mnist_classifier_fromscratch.py` | deleted | |
 | `spmd_mnist_classifier_fromscratch.py` | deleted | |
 | `onnx2xla.py` | deleted | |
+
+`nanolm.py` originally did FSDP by sharding parameters over the 'data' axis and
+letting the compiler all-gather them. That is memory-correct, but the gather
+for layer *i* sits in the same `scan` iteration as the matmul that consumes it,
+so nothing can hide the communication — and a survey of the PyTorch references
+found that none of them shard parameters in the forward pass at that scale
+either. nanoGPT is plain DDP; modded-nanogpt is ZeRO-2 with a hand-written
+parameter ordering to overlap its optimizer collectives. So `nanolm.py` now
+does what they do, and FSDP moved to `fsdp_pipeline.py`, where the pipelining
+it requires is the lesson rather than a distraction.
 
 Still to do, in the order proposed above: `lora.py`, then `flow_matching.py`
 (retiring `mnist_vae.py`), `hmc.py` (absorbing `advi.py`), `diffsim.py`,

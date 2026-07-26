@@ -143,7 +143,9 @@ def main(args):
   key = jax.random.key(args.seed)
 
   if args.params:
-    params = {k: jax.device_put(jnp.asarray(v), nanolm.SPECS[k])
+    # Inference needs no gradients, so the parameters go back to their plain
+    # tensor-parallel layout -- no `reduced` cast.
+    params = {k: jax.device_put(jnp.asarray(v), nanolm.PARAM_SPECS[k])
               for k, v in np.load(args.params).items()}
   else:
     print(f'no --params given; training for {args.train_steps} steps first')

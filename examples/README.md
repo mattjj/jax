@@ -8,7 +8,8 @@ library — because they are here to teach JAX, not a framework.
 
 | File | Demonstrates | Runtime |
 |---|---|---|
-| [`nanolm.py`](nanolm.py) | explicit sharding, FSDP, tensor parallelism, `jit`, `grad`, `scan`, `remat` | ~1 min |
+| [`nanolm.py`](nanolm.py) | explicit sharding, tensor parallelism, ZeRO-2, `reduced`/`unreduced`, `jit`, `grad`, `scan`, `remat` | ~1 min |
+| [`fsdp_pipeline.py`](fsdp_pipeline.py) | FSDP, `custom_vjp`, software-pipelined collectives | ~1 min |
 | [`sample.py`](sample.py) | refs (mutable arrays), sharded KV cache, dynamic slices | ~6 min |
 | [`moe.py`](moe.py) | `shard_map`, `all_to_all`, expert parallelism | ~1 min |
 | [`differentially_private_sgd.py`](differentially_private_sgd.py) | `vmap` for per-example gradients | ~5 min |
@@ -74,9 +75,11 @@ loop over simulated devices and it hangs in an all-gather, that is why.
 
 ## Reading order
 
-`nanolm.py` first: it is the smallest complete thing, and the `SPECS` table at
-the top of it is the only place its parallelism is expressed. Then `sample.py`,
-which reuses that model for inference, and `moe.py`, which is where automatic
+`nanolm.py` first: it is the smallest complete thing, and the two spec tables
+at the top of it are the only place its parallelism is expressed. Then
+`sample.py`, which reuses that model for inference; `fsdp_pipeline.py`, which
+shards the parameters too and shows what it costs to keep the resulting
+collectives off the critical path; and `moe.py`, which is where automatic
 partitioning stops being enough and `shard_map` takes over.
 
 The documentation these are meant to accompany is
