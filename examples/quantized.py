@@ -46,7 +46,7 @@ type: `to_tangent_aval` says gradients with respect to a quantized value are
 the identity and the float master weights keep learning. The end of the file
 shows why a pytree cannot express this.
 
-    python examples/quantized.py            # ~3 min on CPU
+    python examples/quantized.py            # ~30 s on CPU
     python examples/quantized.py --check
 """
 

@@ -46,8 +46,11 @@ and the only thing that changes is what autodiff does with them:
                                                    all-reduce we then discard
                                                    7/8ths of.
 
-A one-word change to a type moves a collective and cuts its cost by a factor
-of N. The program prints those three lines when you run it; `train_step` is
+A one-word change to a type moves a collective: the reduction lands where the
+optimizer wants it, as a reduce-scatter (half the communication of a ring
+all-reduce), and the optimizer's memory and arithmetic shrink by the factor
+of N that ZeRO-2 promises. The program prints those three types when you run
+it; `train_step` is
 where the middle one becomes the bottom one, and
 docs/new_docs/301/sharding-ad.md has the full story.
 

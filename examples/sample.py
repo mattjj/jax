@@ -81,6 +81,8 @@ def forward(params, k_cache, v_cache, tokens, start):
     # slice, which is what makes this a fixed-shape write.
     k_cache[i:i+1, :, jax.ds(start, seq)] = k[None]
     v_cache[i:i+1, :, jax.ds(start, seq)] = v[None]
+    # (Sharded refs can't be indexed by bare integers, hence the
+    # slice-then-squeeze spelling of `k_cache[i]`.)
     a = jax.nn.dot_product_attention(
         q, k_cache[i:i+1, ...][0], v_cache[i:i+1, ...][0], mask=mask)
     x += jnp.einsum('btnh,nhd->btd', a, params['proj'][i], out_sharding=ACTS)

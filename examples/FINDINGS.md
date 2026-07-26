@@ -14,6 +14,37 @@ Re-validated against jax-ml/jax main at `704b65fe` (2026-07-25) on 2026-07-26.
 
 ---
 
+## 2026-07-26 (later) — from `hmc.py` and `flow_matching.py`
+
+### 8. `jax.random.split` has no `out_sharding`, unlike its siblings
+
+`jax.random.normal`, `uniform`, etc. all take `out_sharding=`, so a sharded
+program can create sharded randomness directly. `split` does not:
+
+```python
+split sig:  (key, num=2)
+normal sig: (key, shape=(), dtype=None, *, out_sharding=None)
+```
+
+The place this bites is per-chain/per-example keys under a `vmap` over a
+sharded axis, which is exactly where you want them:
+
+```python
+x = jax.random.normal(k, (chains, DIM), out_sharding=P('data', None))
+keys = jax.random.split(key, chains)          # replicated
+jax.vmap(step)(x, keys)
+# ValueError: Mapped away dimension of inputs passed to vmap should be
+# sharded the same. Got inconsistent axis specs: data vs None
+```
+
+(The error itself is good — clear, and it points at the actual mismatch.)
+The workaround in `hmc.py` is `jax.reshard(jax.random.split(key, n), P('data'))`,
+which works but describes a *slice* of a replicated computation; an
+`out_sharding` on `split` could instead let each device compute only its own
+keys. Same asymmetry, same fix, in `flow_matching.py`'s label-dropout keys.
+
+---
+
 ## 2026-07-26 — from the ZeRO-2 rewrite of `nanolm.py` and from `fsdp_pipeline.py`
 
 ### 5. Converting an unreduced array to NumPy fails, and the error asks for a bug report

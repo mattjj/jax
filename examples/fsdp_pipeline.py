@@ -40,8 +40,8 @@ there are no hooks and no runtime, so we say it in the program instead:
     otherwise choose the placement for us. `custom_vjp` is JAX's equivalent of
     a backward hook.
 
-Both versions compute the same thing -- `--check` asserts the gradients agree
-exactly -- so this file is about *scheduling*, not semantics. It cannot show
+Both versions compute the same thing -- `--check` asserts the gradients
+agree -- so this file is about *scheduling*, not semantics. It cannot show
 you the win: XLA:CPU has no asynchronous collectives, so measuring the overlap
 needs a TPU or GPU.
 

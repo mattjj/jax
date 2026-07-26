@@ -18,8 +18,8 @@ Demonstrates: `vmap` over a *sharded* axis, explicit sharding, `jit`, `grad`
 with respect to part of a model, `scan`, `remat`.
 
 LoRA freezes a pretrained model and learns a low-rank correction `a @ b` to a
-few of its weight matrices. The adapters are tiny -- about 2% of the base model
-here -- which means a whole stack of them fits alongside one copy of the base.
+few of its weight matrices. The adapters are tiny -- about 1.5% of the base
+model here -- so a whole stack of them fits alongside one copy of the base.
 That is the interesting part, and it is what this file is about:
 
     jax.vmap(step, in_axes=(0, None, 0))(adapters, base, batches)

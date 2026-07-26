@@ -34,7 +34,7 @@ sampler and its moments are known exactly:
 so E[x] = 0, Var(x1) = s2, Var(x2) = 1 + 2 b^2 s2^2, Cov(x1, x2) = 0.
 `--check` compares the sampler's moments against those closed forms.
 
-    python examples/hmc.py            # ~30 s on CPU
+    python examples/hmc.py            # a few seconds on CPU
     python examples/hmc.py --check
 """
 
@@ -91,8 +91,13 @@ def hmc_step(x, key, eps, steps):
   return jnp.where(accept, x_new, x), accept
 
 
-def sample(key, chains, iters, eps=0.25, steps=16):
-  """All chains, all iterations: `vmap` inside, `scan` outside."""
+def sample(key, chains, iters, eps=0.5, steps=8):
+  """All chains, all iterations: `vmap` inside, `scan` outside.
+
+  The step size is tuned for this target: it gives ~0.9 acceptance, in the
+  healthy range. (Much closer to 1.0 means the steps are too timid and the
+  chain is wasting gradient evaluations -- an earlier eps=0.25 accepted 99%.)
+  """
   k_init, k_iter = jax.random.split(key)
   # The chain axis is sharded over 'data': every per-chain computation below
   # -- integrator, gradients, accept -- runs where its chain lives.
@@ -130,7 +135,8 @@ def ascii_scatter(pts, w=57, h=19, xr=(-4.5, 4.5), yr=(-3, 6)):
 
 def main(args):
   jax.set_mesh(jax.make_mesh((jax.device_count(),), ('data',)))
-  assert args.chains % jax.device_count() == 0, 'chains must divide devices'
+  assert args.chains % jax.device_count() == 0, (
+      f'{args.chains} chains do not divide over {jax.device_count()} devices')
   print(f'{args.chains} chains over {jax.device_count()} devices, '
         f'{args.iters} iterations each')
 
