@@ -211,7 +211,6 @@ class BatchedError(JaxException):
 
 # Error Value
 
-_PLACEHOLDER_CODE = -1
 _INACTIVE_CODE = -2
 
 @jtu.register_pytree_node_class
@@ -947,8 +946,11 @@ def while_loop_error_check(ctx: CheckifyContext, error, enabled_errors,
 
   cond_in_flat = [*err_vals, *c_consts, *carry]
   cond_in_flat = map(core.typeof, cond_in_flat)
-  checked_cond_jaxpr, _, _ = jaxpr_to_checkify_jaxpr(ctx, cond_jaxpr, enabled_errors,
-                                                     err_tree, *cond_in_flat)
+  # The checked cond jaxpr's error outputs are dropped just below, so its codes
+  # never escape: use a throwaway context rather than burning codes in ctx.
+  checked_cond_jaxpr, _, _ = jaxpr_to_checkify_jaxpr(CheckifyContext(), cond_jaxpr,
+                                                     enabled_errors, err_tree,
+                                                     *cond_in_flat)
   compat_cond_jaxpr_ = ignore_error_output_jaxpr(checked_cond_jaxpr, num_error_vals)
   to_move = [False] * num_error_vals + [True] * cond_nconsts + [False] * len(carry)
   compat_cond_jaxpr = pe.move_binders_to_front(compat_cond_jaxpr_, to_move)
@@ -1205,21 +1207,17 @@ def check_discharge_rule(ctx: CheckifyContext, error, enabled_errors, *args,
   # it's not included (=recharged_error)
   discharged_error = error
   recharged_error = init_error
-  if _PLACEHOLDER_CODE in new_error._metadata:
-    # Fresh check from checkify.check: allocate a single code from the context.
-    assert len(new_error._metadata) == 1
-    code = ctx.next_code()
-    new_error = new_error._replace(
-        _code={eff: code for eff in new_error._code},
-        _metadata={code: new_error._metadata[_PLACEHOLDER_CODE]},
-    )
-  else:
-    # Inner checkify (e.g. from check_error). Inner codes are contiguous [0..N-1].
-    # Remap the inner namespace to a disjoint slice [start_code..start_code + N - 1]
-    # in the outer checkify context.
-    num_codes = len(new_error._metadata)
-    offset = ctx.current_code
-    ctx.advance(num_codes)
+  # new_error carries codes in its own local namespace: a fresh check from
+  # checkify.check is a unit namespace (one check, code 0), and an inner
+  # checkify (e.g. via check_error) numbers its checks from 0. Remap that
+  # namespace to a disjoint slice of the outer context's namespace. Any code
+  # value whose pred can be True has a metadata entry, but not every allocated
+  # code does (e.g. checks under a non-enabled error category are dropped), so
+  # size the slice by the largest live code, not by the entry count.
+  num_codes = max(new_error._metadata, default=-1) + 1
+  offset = ctx.current_code
+  ctx.advance(num_codes)
+  if offset:
     new_codes = {
         eff: lax.add(c, np.asarray(offset, dtype=c.dtype))
         for eff, c in new_error._code.items()
@@ -1385,8 +1383,8 @@ def _check(pred, msg, debug, *fmt_args, **fmt_kwargs):
   new_payload, new_metadata = tree_flatten(new_error)
   effect_type = new_error.get_effect_type()
   error = Error({effect_type: jnp.logical_not(pred)},
-                {effect_type: _PLACEHOLDER_CODE},
-                {_PLACEHOLDER_CODE: new_metadata},
+                {effect_type: 0},
+                {0: new_metadata},
                 {effect_type: new_payload})
   _check_error(error, debug=debug)
 
