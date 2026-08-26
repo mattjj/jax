@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import concurrent.futures
 from functools import partial
 import unittest
 
@@ -1426,6 +1427,71 @@ class AssertPrimitiveTests(jtu.JaxTestCase):
   def test_check_pp_rule(self):
     jaxpr = jax.make_jaxpr(lambda: checkify.check(False, "hi"))()
     jaxpr.pretty_print(source_info=True, name_stack=True)  # Does not crash.
+
+  def test_checkify_trace_determinism(self):
+    x = jnp.array(5.0)
+
+    def make_fn():
+      def f(y):
+        checkify.check(y > 0.0, "Value must be positive!")
+        return y * 2.0
+      return checkify.checkify(f)
+
+    lowered_1 = jax.jit(make_fn()).lower(x)
+    lowered_2 = jax.jit(make_fn()).lower(x)
+    self.assertEqual(lowered_1.as_text(), lowered_2.as_text())
+
+  def test_checkify_multithreaded_determinism(self):
+    x = jnp.array(5.0)
+
+    def trace_and_lower():
+      def f(y):
+        checkify.check(y > 0.0, "Value must be positive!")
+        checkify.check(y < 100.0, "Value must be less than 100!")
+        return y * 2.0
+      return jax.jit(checkify.checkify(f)).lower(x).as_text()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+      futures = [executor.submit(trace_and_lower) for _ in range(16)]
+      results = [f.result() for f in futures]
+
+    for res in results[1:]:
+      self.assertEqual(results[0], res)
+
+  def test_checkify_inner_jit(self):
+    @checkify.checkify
+    def f(x):
+      @jax.jit
+      def inner(y):
+        checkify.check(y > 0.0, "Inner check failed!")
+        return y + 1.0
+      return inner(x)
+
+    err, out = f(jnp.array(3.0))
+    self.assertEqual(out, 4.0)
+
+    err, _ = f(jnp.array(-1.0))
+    with self.assertRaisesRegex(JaxRuntimeError, "Inner check failed!"):
+      err.throw()
+
+  def test_nested_checkify_namespace_collision(self):
+    def g(y):
+      checkify.check(y > 0, "inner check failed")
+      return y
+
+    def f(x, y):
+      checkify.check(x > 0, "outer check failed")
+      err, out = checkify.checkify(g)(y)
+      checkify.check_error(err)
+      return out
+
+    checked_f = checkify.checkify(f)
+
+    err, _ = checked_f(-1, 1)
+    self.assertStartsWith(err.get(), "outer check failed")
+
+    err, _ = checked_f(1, -1)
+    self.assertStartsWith(err.get(), "inner check failed")
 
 
 if __name__ == "__main__":
