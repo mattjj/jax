@@ -289,7 +289,10 @@ class Error:
     new_err = self._pred.copy()
     new_code = self._code.copy()
     new_payload = self._payload.copy()
-    for effect in effects:
+    # Iterate in sorted order: set order varies across processes (class-object
+    # hashes), which would make the staged-out constants, and hence the lowered
+    # module text, nondeterministic across processes.
+    for effect in sorted(effects):
       if effect not in self._pred.keys():
         new_err[effect] = False
         new_payload[effect] = list(
