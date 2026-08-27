@@ -8366,10 +8366,9 @@ class Remat3Test(RematTest):
     with assertEvals(3):
       vjp(v)
 
-  @unittest.skip("custom_vjp applications are opaque to remat3 policies; "
-                 "use custom_remat for policy-controlled saving")
   @config.custom_vjp3(True)
   def test_custom_vjp_with_checkpoint_name_in_fwd(self):
+    assert jax.config.jax_custom_vjp3
     sin = jax.custom_vjp(jnp.sin)
     def fwd(x):
       return jnp.sin(x), checkpoint_name(jnp.cos(x), 'cos')
@@ -8394,6 +8393,12 @@ class Remat3Test(RematTest):
     fwd_str, bwd_str = fwd_bwd_jaxpr_strs(f, jnp.arange(3.))
     self.assertIn('cos ', fwd_str)
     self.assertNotIn('cos ', bwd_str)
+    jtu.check_grads(f, (3.,), order=2, modes=['rev'])
+
+    f = jax.remat(sin)
+    fwd_str, bwd_str = fwd_bwd_jaxpr_strs(f, jnp.arange(3.))
+    self.assertNotIn('cos', fwd_str)
+    self.assertIn('cos ', bwd_str)
     jtu.check_grads(f, (3.,), order=2, modes=['rev'])
 
   @config.custom_vjp3(True)
@@ -8437,10 +8442,10 @@ class Remat3Test(RematTest):
     self.assertIn('cos ', bwd_str)
     jtu.check_grads(f, (3.,), order=2, modes=['rev'])
 
-  @unittest.skip("custom_vjp applications are opaque to remat3 policies; "
-                 "use custom_remat for policy-controlled saving")
   @config.custom_vjp3(True)
   def test_custom_vjp_with_checkpoint_name_in_fwd_static_argnums(self):
+    # Like the above test, but exercises nondiff_argnums
+    assert jax.config.jax_custom_vjp3
     sin = jax.custom_vjp(lambda _, x: jnp.sin(x), nondiff_argnums=(0,))
     def fwd(_, x):
       return jnp.sin(x), checkpoint_name(jnp.cos(x), 'cos')
@@ -8448,12 +8453,29 @@ class Remat3Test(RematTest):
       return cos_x * g,
     sin.defvjp(fwd, bwd)
 
+    def fwd_bwd_jaxpr_strs(f, *args):
+      fwd_jaxpr = jax.jit(partial(jax.vjp, f)).trace(*args).lojax.jaxpr
+      fwd_jaxpr, _ = pe.dce_jaxpr(fwd_jaxpr, True)
+      fwd_str = fwd_jaxpr.pretty_print(use_color=False)
+
+      y, f_vjp = jax.vjp(f, *args)
+      bwd_jaxpr = jax.jit(f_vjp).trace(y).lojax.jaxpr
+      bwd_jaxpr, _ = pe.dce_jaxpr(bwd_jaxpr, True)
+      bwd_str = bwd_jaxpr.pretty_print(use_color=False)
+
+      return fwd_str, bwd_str
+
     policy = jax.checkpoint_policies.save_only_these_names('cos')
     f = jax.remat(partial(sin, 'hi'), policy=policy)
-    y, f_vjp = jax.vjp(f, jnp.arange(3.))
-    bwd_jaxpr = jax.jit(f_vjp).trace(y).lojax.jaxpr
-    bwd_jaxpr, _ = pe.dce_jaxpr(bwd_jaxpr, True)
-    self.assertNotIn('cos ', bwd_jaxpr.pretty_print(use_color=False))
+    fwd_str, bwd_str = fwd_bwd_jaxpr_strs(f, jnp.arange(3.))
+    self.assertIn('cos ', fwd_str)
+    self.assertNotIn('cos ', bwd_str)
+    jtu.check_grads(f, (3.,), order=2, modes=['rev'])
+
+    f = jax.remat(partial(sin, 'hi'))
+    fwd_str, bwd_str = fwd_bwd_jaxpr_strs(f, jnp.arange(3.))
+    self.assertNotIn('cos', fwd_str)
+    self.assertIn('cos ', bwd_str)
     jtu.check_grads(f, (3.,), order=2, modes=['rev'])
 
   @config.custom_vjp3(True)
@@ -8469,8 +8491,61 @@ class Remat3Test(RematTest):
     f = jax.remat(partial(sin, 'hi'), policy=policy)
     jtu.check_grads(f, (3.,), order=2, modes=['rev'])
 
-  @unittest.skip("custom_vjp applications are opaque to remat3 policies; "
-                 "use custom_remat for policy-controlled saving")
+  @config.custom_vjp3(True)
+  def test_custom_vjp_offload_names_in_fwd_jaxpr(self):
+    # Jaxpr-level check like test_remat_offload_names_jaxpr, but with the
+    # named values inside a custom_vjp fwd rule: the offloaded residual is
+    # device_put to the offload destination on the fwd pass and saved there,
+    # then device_put back on the bwd pass.
+    policy = jax.checkpoint_policies.save_and_offload_only_these_names(
+        names_which_can_be_saved=['cos'], names_which_can_be_offloaded=['sin2'],
+        offload_src='device', offload_dst='pinned_host')
+
+    sin = jax.custom_vjp(jnp.sin)
+    def fwd(x):
+      return jnp.sin(x), (checkpoint_name(jnp.cos(x), 'cos'),
+                          checkpoint_name(jnp.sin(x * 2), 'sin2'))
+    def bwd(res, g):
+      cos_x, sin_2x = res
+      return (cos_x + 0 * sin_2x) * g,
+    sin.defvjp(fwd, bwd)
+
+    f = jax.remat(sin, policy=policy)
+    jaxpr_text = str(api.make_jaxpr(api.grad(lambda x: f(x).sum()))(jnp.arange(16.)))
+    self.assertEqual(jaxpr_text.count('MemorySpace.Host'), 1)
+    self.assertEqual(jaxpr_text.count('MemorySpace.Device'), 1)
+
+  @config.custom_vjp3(True)
+  def test_custom_vjp_remat_policy_symbolic_zeros_error(self):
+    # Policy-driven saving inside fwd rules is unsupported for symbolic_zeros
+    # and defvjp_with_logs: raise rather than silently not saving, but only
+    # when the policy actually matches a name in the fwd rule.
+    policy = jax.checkpoint_policies.save_only_these_names('cos')
+    def bwd(c, g):
+      return c * g,
+
+    sin = jax.custom_vjp(jnp.sin)
+    def fwd(x):
+      return jnp.sin(x.value), checkpoint_name(jnp.cos(x.value), 'cos')
+    sin.defvjp(fwd, bwd, symbolic_zeros=True)
+    with self.assertRaisesRegex(NotImplementedError, 'symbolic_zeros'):
+      jax.vjp(jax.remat(sin, policy=policy), jnp.arange(3.))
+
+    sin2 = jax.custom_vjp(jnp.sin)
+    def fwd2(x):
+      return jnp.sin(x.value), jnp.cos(x.value)
+    sin2.defvjp(fwd2, bwd, symbolic_zeros=True)
+    jtu.check_grads(jax.remat(sin2, policy=policy), (3.,), order=2, modes=['rev'])
+
+    sin3 = jax.custom_vjp(jnp.sin)
+    def fwd3(x):
+      return jnp.sin(x), checkpoint_name(jnp.cos(x), 'cos')
+    def bwd3(c, g):
+      return (c * g,), None
+    sin3.defvjp_with_logs(fwd3, bwd3)
+    with self.assertRaisesRegex(NotImplementedError, 'defvjp_with_logs'):
+      jax.vjp(jax.remat(sin3, policy=policy), jnp.arange(3.))
+
   @config.custom_vjp3(True)
   def test_custom_vjp_saved_residual_is_vjp_pytree_leaf(self):
     sin = jax.custom_vjp(jnp.sin)
