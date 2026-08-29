@@ -1187,11 +1187,11 @@ class RematTraced(HiPrim):
 
   def remat(self, trace, *args):  # pyrefly: ignore[bad-param-name-override]
     traced = core.jaxpr_as_fun(self.jaxpr)
-    out, rem_ = remat_transform(self.policy, traced, *args)
+    out, rem_ = remat_transform(trace.policy, traced, *args)
     (jaxpr, in_tree, out_tree), (res,) = rem_.func.args, rem_.args
     def rem(*args_):
       args_flat = tree_leaves_checked(in_tree, args_)
-      out_flat = RematTraced(jaxpr, self.policy)(*res, *args_flat)
+      out_flat = RematTraced(jaxpr, trace.policy)(*res, *args_flat)
       return tree_unflatten(out_tree, out_flat)
     return out, rem
 

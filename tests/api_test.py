@@ -8612,7 +8612,7 @@ class Remat3Test(RematTest):
     g2 = jax.grad(lambda x: jax.grad(g)(x).sum())(x)
     self.assertArraysAllClose(g2, 2 * jnp.cos(pos * 2.0))
 
-  def test_custom_remat_layered_innermost_policy_wins(self):
+  def test_custom_remat_layered_outermost_policy_wins(self):
     def f_fwd(policy, x):
       saveable = (isinstance(policy, SaveOnlyTheseNames) and
                   'cos' in policy.saveable_names)
@@ -8631,10 +8631,34 @@ class Remat3Test(RematTest):
       jaxpr, _ = pe.dce_jaxpr(jaxpr, True)
       return '= cos' in jaxpr.pretty_print(use_color=False)
 
-    self.assertTrue(bwd_recomputes_cos(
-        jax.remat(jax.remat(sin), policy=policy)))
     self.assertFalse(bwd_recomputes_cos(
+        jax.remat(jax.remat(sin), policy=policy)))
+    self.assertTrue(bwd_recomputes_cos(
         jax.remat(jax.remat(sin, policy=policy))))
+
+  @config.custom_vjp3(True)
+  def test_custom_vjp_layered_outermost_policy_wins(self):
+    sin = jax.custom_vjp(jnp.sin)
+    def fwd(x):
+      return jnp.sin(x), checkpoint_name(jnp.cos(x), 'cos')
+    def bwd(cos_x, g):
+      return cos_x * g,
+    sin.defvjp(fwd, bwd)
+    policy = jax.checkpoint_policies.save_only_these_names('cos')
+    x = jnp.arange(3.)
+
+    def bwd_recomputes_cos(f):
+      y, f_vjp = jax.vjp(f, x)
+      jaxpr = jax.jit(f_vjp).trace(y).lojax.jaxpr
+      jaxpr, _ = pe.dce_jaxpr(jaxpr, True)
+      return '= cos' in jaxpr.pretty_print(use_color=False)
+
+    self.assertFalse(bwd_recomputes_cos(
+        jax.remat(jax.remat(sin), policy=policy)))
+    self.assertTrue(bwd_recomputes_cos(
+        jax.remat(jax.remat(sin, policy=policy))))
+    jtu.check_grads(jax.remat(jax.remat(sin), policy=policy), (3.,),
+                    order=2, modes=['rev'])
 
   def test_custom_remat_saving_through_shard_map(self):
     def f_fwd(policy, x):
