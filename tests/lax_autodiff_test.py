@@ -30,6 +30,7 @@ import jax.numpy as jnp
 from jax import dtypes
 from jax import lax
 from jax._src import test_util as jtu
+from jax.sharding import NamedSharding, PartitionSpec as P
 from jax.test_util import check_grads
 
 jax.config.parse_flags_with_absl()
@@ -1329,15 +1330,93 @@ class LaxAutodiffTest(jtu.JaxTestCase):
       expected_gy = np.array([1.0, 0.5, 0.0, 0.0, 0.0])
 
     # Reverse-mode (vjp / grad)
-    gx, gy = jax.grad(lambda a, b: jnp.sum(op(a, b)), argnums=(0, 1))(x, y)
-    self.assertAllClose(gx, expected_gx)
-    self.assertAllClose(gy, expected_gy)
+    grad_fn = jax.grad(lambda a, b: jnp.sum(op(a, b)), argnums=(0, 1))
+    for fn in (grad_fn, jax.jit(grad_fn)):
+      gx, gy = fn(x, y)
+      self.assertAllClose(gx, expected_gx)
+      self.assertAllClose(gy, expected_gy)
 
     # Forward-mode (jvp)
     _, tx = jax.jvp(op, (x, y), (jnp.ones_like(x), jnp.zeros_like(y)))
     _, ty = jax.jvp(op, (x, y), (jnp.zeros_like(x), jnp.ones_like(y)))
     self.assertAllClose(tx, expected_gx)
     self.assertAllClose(ty, expected_gy)
+
+  @parameterized.named_parameters(
+      {"testcase_name": f"_{op.__name__}", "op": op}
+      for op in [lax.max, lax.min]
+  )
+  def test_max_min_jvp_python_scalar_primals(self, op):
+    # jax.jvp (unlike jax.vjp) passes Python scalar primals into JVP rules
+    # unconverted, so the rule can't rely on array attributes like x.dtype.
+    _, t = jax.jvp(op, (1.0, 2.0), (1.0, 1.0))
+    self.assertAllClose(t, 1.0, check_dtypes=False)
+
+    x = jnp.array([1.0, 2.0, 3.0])
+    expected = [1.0, 0.5, 0.0] if op is lax.max else [0.0, 0.5, 1.0]
+    expected = np.array(expected, dtype=x.dtype)
+    _, t = jax.jvp(lambda y: op(x, y), (2.0,), (1.0,))
+    self.assertAllClose(t, expected)
+    self.assertAllClose(jax.jacfwd(lambda y: op(x, y))(2.0), expected)
+
+  @parameterized.named_parameters(
+      {"testcase_name": f"_{op.__name__}", "op": op}
+      for op in [lax.max, lax.min]
+  )
+  def test_max_min_grad_weak_type(self, op):
+    # Tangents and cotangents are weakly typed iff both primal inputs are,
+    # matching the primal output.
+    g = jax.grad(lambda x: op(x, 0.))(1.)
+    self.assertTrue(g.aval.weak_type)
+    g = jax.grad(lambda x: jnp.sum(op(x, 0.)))(jnp.full((3,), 1.))
+    self.assertTrue(g.aval.weak_type)
+    _, t = jax.jvp(op, (1., 2.), (1., 1.))
+    self.assertTrue(t.aval.weak_type)
+    g = jax.grad(lambda x: op(x, jnp.float32(0.)))(jnp.float32(1.))
+    self.assertFalse(g.aval.weak_type)
+
+  @parameterized.named_parameters(
+      {"testcase_name": f"_{op.__name__}", "op": op}
+      for op in [lax.max, lax.min]
+  )
+  def test_max_min_complex_grad(self, op):
+    # lax.max/lax.min order complex values lexicographically on (real, imag);
+    # the JVP must use the same order and split exact ties evenly.
+    x = jnp.array([1+1j, 2+0j, 2+1j, 2+2j], dtype=jnp.complex64)
+    y = jnp.array([2+0j, 2+0j, 1+5j, 2+2j], dtype=jnp.complex64)
+    # Elementwise, x is <, ==, >, == y.
+    if op is lax.max:
+      expected_gx = np.array([0.0, 0.5, 1.0, 0.5], dtype=np.complex64)
+    else:
+      expected_gx = np.array([1.0, 0.5, 0.0, 0.5], dtype=np.complex64)
+    expected_gy = 1.0 - expected_gx
+    self.assertArraysEqual(op(x, y), jnp.where(expected_gx == 1.0, x, y))
+
+    _, tx = jax.jvp(op, (x, y), (jnp.ones_like(x), jnp.zeros_like(y)))
+    _, ty = jax.jvp(op, (x, y), (jnp.zeros_like(x), jnp.ones_like(y)))
+    self.assertAllClose(tx, expected_gx)
+    self.assertAllClose(ty, expected_gy)
+
+    gx, gy = jax.grad(lambda a, b: jnp.sum(jnp.real(op(a, b))),
+                      argnums=(0, 1))(x, y)
+    self.assertAllClose(gx, expected_gx)
+    self.assertAllClose(gy, expected_gy)
+
+  @jtu.with_explicit_mesh((1,), 'x')
+  def test_max_min_grad_eager_explicit_sharding(self, mesh):
+    # Eager reverse mode under an explicit mesh: the constants the JVP rule
+    # builds must carry the mask's sharding, otherwise select/mul raise a
+    # ShardingTypeError.
+    x_np = np.arange(8., dtype=np.float32)
+    x = jax.device_put(x_np, NamedSharding(mesh, P('x')))
+    y = jax.device_put(np.full((8,), 3., dtype=np.float32),
+                       NamedSharding(mesh, P()))
+    for op, expected_gx in ((lax.max, (x_np > 3.) + 0.5 * (x_np == 3.)),
+                            (lax.min, (x_np < 3.) + 0.5 * (x_np == 3.))):
+      gx, gy = jax.grad(lambda a, b: jnp.sum(op(a, b)), argnums=(0, 1))(x, y)
+      self.assertAllClose(gx, expected_gx.astype(np.float32))
+      self.assertAllClose(gy, (1.0 - expected_gx).astype(np.float32))
+      self.assertEqual(gx.sharding.spec, P('x'))
 
 
 if __name__ == '__main__':

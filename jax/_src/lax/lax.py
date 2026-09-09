@@ -9719,13 +9719,27 @@ def canonicalize_precision(precision: PrecisionLike) -> CanonicalPrecision:
 
 
 def _balanced_cmp(x, y):
-  # 1.0 if x > y, 0.5 if x == y, 0.0 if x < y or NaN
-  gt_mask = gt(x, y)
-  eq_mask = eq(x, y)
-  ones = full_like(gt_mask, 1, dtype=x.dtype)
-  zeros = full_like(gt_mask, 0, dtype=x.dtype)
-  half = full_like(gt_mask, 0.5, dtype=x.dtype)
-  return select(gt_mask, ones, select(eq_mask, half, zeros))
+  # 1.0 if x > y, 0.5 if x == y, 0.0 if x < y or if either is NaN. This
+  # compares x against y directly rather than against max(x, y), so the result
+  # doesn't depend on the forward and backward passes computing bitwise
+  # identical values (https://github.com/jax-ml/jax/issues/40564).
+  dtype = _dtype(x)  # unlike x.dtype, also works for Python scalar primals
+  # The mask is weakly typed iff both inputs are, like the primal output.
+  weak_type = dtypes.is_weakly_typed(x) and dtypes.is_weakly_typed(y)
+  if dtypes.issubdtype(dtype, np.complexfloating):
+    # Lexicographic (real, imag) order, matching the max/min lowering rules.
+    xr, yr = real(x), real(y)
+    gt_mask = bitwise_or(gt(xr, yr),
+                         bitwise_and(eq(xr, yr), gt(imag(x), imag(y))))
+  else:
+    gt_mask = gt(x, y)
+  gt_f = _convert_element_type(gt_mask, dtype, weak_type=weak_type)
+  eq_f = _convert_element_type(eq(x, y), dtype, weak_type=weak_type)
+  # Use a rank-0 constant rather than full_like(eq_f, 0.5): in eager mode under
+  # an explicit mesh, a full-shape float fill value can come back replicated
+  # while eq_f is sharded.
+  half = full_like(eq_f, 0.5, shape=())
+  return add(gt_f, mul(eq_f, half))
 
 
 def _eq_meet(a, b):
