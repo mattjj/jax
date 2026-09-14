@@ -692,6 +692,14 @@ jax_multiplatform_test(
 )
 
 jax_multiplatform_test(
+    name = "custom_root_hlo_test",
+    srcs = ["custom_root_hlo_test.py"],
+    deps = py_deps([
+        "absl/testing",
+    ]),
+)
+
+jax_multiplatform_test(
     name = "custom_linear_solve_test",
     srcs = ["custom_linear_solve_test.py"],
     deps = py_deps([
